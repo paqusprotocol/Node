@@ -10,11 +10,14 @@ use paqus::block::Block;
 use paqus::consensus::Consensus;
 use paqus::crypto::{address_to_string, derive_public_key};
 use paqus::genesis::GENESIS_PREMINE_ADDRESS;
-use paqus::network::{NetworkMessage, PeerInfo, handle_message, read_message, write_message};
+use paqus::network::{
+    NetworkMessage, PeerInfo, TipInfo, VersionInfo, handle_message, read_message, write_message,
+};
 use paqus::node::Node;
 use paqus::params::{
-    BASE_FEE, BLOCK_TIME, CHAIN_NAME, COIN_NAME, DIFFICULTY_START, FINALITY_DEPTH, MAX_BLOCK_TXS,
-    PROTOCOL_STAGE, PROTOCOL_VERSION,
+    BASE_FEE, BLOCK_REWARD_MATURITY, BLOCK_TIME, CHAIN_ID, CHAIN_NAME, COIN_NAME,
+    DIFFICULTY_ADJUSTMENT_INTERVAL, DIFFICULTY_START, FINALITY_DEPTH, MAX_BLOCK_TXS, NETWORK_MAGIC,
+    PROTOCOL_STAGE, PROTOCOL_VERSION, STORAGE_VERSION,
 };
 use paqus::transaction::{SignedTransaction, Transaction};
 use paqus::types::{Address, Amount, Height, Nonce, SecretKey};
@@ -366,6 +369,18 @@ struct AddressResponse {
 }
 
 #[derive(Serialize)]
+struct AccountResponse {
+    address: String,
+    confirmed: u32,
+    available: u32,
+    unspendable: u32,
+    pending_incoming: u32,
+    pending_outgoing: u32,
+    nonce: u64,
+    credits: usize,
+}
+
+#[derive(Serialize)]
 struct MempoolResponse {
     size: usize,
     transactions: Vec<TxResponse>,
@@ -454,6 +469,100 @@ impl NodeService {
             last_mine: Instant::now(),
             last_status: Instant::now(),
         }
+    }
+
+    fn preflight(&mut self) -> Result<(), String> {
+        if fs::metadata(&self.config.shutdown_file).is_ok() {
+            return Err(format!(
+                "shutdown file `{}` exists; remove it before starting the node",
+                self.config.shutdown_file
+            ));
+        }
+
+        {
+            let node = self
+                .node
+                .lock()
+                .map_err(|_| "node state lock poisoned".to_string())?;
+            node.next_difficulty()
+                .map_err(|error| format!("failed to calculate next difficulty: {error}"))?;
+        }
+
+        if self.config.mine {
+            let secret_key = self.config.miner_secret_key.ok_or_else(|| {
+                "mining requires --wallet or --miner-secret-key so the miner identity is explicit"
+                    .to_string()
+            })?;
+            let public_key = derive_public_key(&secret_key);
+            let derived_address = paqus::crypto::address_from_public_key(&public_key);
+            if derived_address != self.config.miner_address {
+                return Err(format!(
+                    "miner secret key does not match miner address {}",
+                    address_to_string(&self.config.miner_address)
+                ));
+            }
+        }
+
+        let peers = self
+            .peers
+            .lock()
+            .map_err(|_| "peer state lock poisoned".to_string())?
+            .keys()
+            .copied()
+            .collect::<Vec<_>>();
+        if !peers.is_empty() {
+            println!(
+                "preflight peers={} checking handshake and catch-up",
+                peers.len()
+            );
+        }
+
+        for peer in peers {
+            let result = {
+                let mut node = self
+                    .node
+                    .lock()
+                    .map_err(|_| "node state lock poisoned".to_string())?;
+                poll_peer(peer, &mut node)
+            };
+            match result {
+                Ok(PeerPoll::Idle) | Ok(PeerPoll::Synced) => {
+                    let tip = self
+                        .node
+                        .lock()
+                        .map_err(|_| "node state lock poisoned".to_string())?
+                        .tip_height();
+                    if let Ok(mut peers) = self.peers.lock() {
+                        if let Some(state) = peers.get_mut(&peer) {
+                            state.mark_ok(tip);
+                        }
+                    }
+                }
+                Err(error) => {
+                    if let Ok(mut peers) = self.peers.lock() {
+                        if let Some(state) = peers.get_mut(&peer) {
+                            state.mark_failed();
+                        }
+                    }
+                    eprintln!("preflight peer {peer} failed: {error}");
+                }
+            }
+        }
+
+        let node = self
+            .node
+            .lock()
+            .map_err(|_| "node state lock poisoned".to_string())?;
+        println!(
+            "preflight ok height={} tip={} difficulty={} mempool={} mining={}",
+            node.tip_height().unwrap_or(Height(0)).0,
+            short_hash(node.tip_hash()),
+            format_difficulty(node.next_difficulty()),
+            node.mempool.len(),
+            self.config.mine
+        );
+
+        Ok(())
     }
 
     fn run(&mut self) -> Result<(), String> {
@@ -723,6 +832,7 @@ fn start_rpc_server(state: RpcState, addr: SocketAddr) -> Result<thread::JoinHan
         .route("/blocks/hash/:hash", get(rpc_block_by_hash))
         .route("/tx/:hash", get(rpc_tx))
         .route("/address/:address", get(rpc_address))
+        .route("/accounts", get(rpc_accounts))
         .route("/mempool", get(rpc_mempool))
         .route("/tx", post(rpc_submit_tx))
         .route("/transaction", post(rpc_submit_tx))
@@ -927,6 +1037,34 @@ async fn rpc_address(
             }
             Err(error) => rpc_error(StatusCode::INTERNAL_SERVER_ERROR, error),
         },
+        Err(_) => rpc_error(StatusCode::INTERNAL_SERVER_ERROR, "state_lock_failed"),
+    }
+}
+
+async fn rpc_accounts(State(state): State<RpcState>) -> impl IntoResponse {
+    match state.node.lock() {
+        Ok(node) => {
+            let height = node.tip_height().unwrap_or(Height(0));
+            let accounts = node
+                .ledger
+                .accounts
+                .values()
+                .map(|account| {
+                    let pending = node.pending_balance(&account.address);
+                    AccountResponse {
+                        address: address_to_string(&account.address),
+                        confirmed: account.balance.0,
+                        available: account.available_balance_at(height).0,
+                        unspendable: account.unspendable_balance_at(height).0,
+                        pending_incoming: pending.incoming.0,
+                        pending_outgoing: pending.outgoing.0,
+                        nonce: account.nonce.0,
+                        credits: account.credits.len(),
+                    }
+                })
+                .collect::<Vec<_>>();
+            Json(accounts).into_response()
+        }
         Err(_) => rpc_error(StatusCode::INTERNAL_SERVER_ERROR, "state_lock_failed"),
     }
 }
@@ -1136,6 +1274,7 @@ fn address_transactions(node: &Node, address: &Address) -> Result<Vec<TxResponse
 
 fn run_node(args: &[String]) -> Result<(), String> {
     let mut config = parse_run_config(args)?;
+    print_core_startup_info();
     if let Some(path) = &config.peers_file {
         config.peers.extend(load_peers_file(path)?);
     }
@@ -1149,6 +1288,10 @@ fn run_node(args: &[String]) -> Result<(), String> {
         .local_addr()
         .map_err(|error| format!("failed to read listener address: {error}"))?;
     let node = Arc::new(Mutex::new(node));
+
+    let mut service = NodeService::new(node.clone(), config, listener);
+    service.preflight()?;
+
     let (height, tip_hash, difficulty) = {
         let node = node
             .lock()
@@ -1162,17 +1305,16 @@ fn run_node(args: &[String]) -> Result<(), String> {
 
     println!(
         "paqus node running db={} p2p={} rpc={} height={} tip={} difficulty={} peers={} mining={}",
-        config.db_path,
+        service.config.db_path,
         listen_addr,
-        config.rpc_addr,
+        service.config.rpc_addr,
         height,
         tip_hash,
         difficulty,
-        config.peers.len(),
-        config.mine
+        service.config.peers.len(),
+        service.config.mine
     );
 
-    let mut service = NodeService::new(node.clone(), config, listener);
     let rpc_state = RpcState {
         node,
         peers: service.peers.clone(),
@@ -1180,6 +1322,27 @@ fn run_node(args: &[String]) -> Result<(), String> {
     };
     let _rpc_handle = start_rpc_server(rpc_state, service.config.rpc_addr)?;
     service.run()
+}
+
+fn print_core_startup_info() {
+    println!(
+        "core chain={} chain_id={} coin={} stage={} protocol={} storage={} magic={}",
+        CHAIN_NAME,
+        CHAIN_ID,
+        COIN_NAME,
+        PROTOCOL_STAGE,
+        PROTOCOL_VERSION,
+        STORAGE_VERSION,
+        hex::encode(NETWORK_MAGIC)
+    );
+    println!(
+        "consensus block_time={}s finality={} reward_maturity={} difficulty_start={} retarget_window={}",
+        BLOCK_TIME,
+        FINALITY_DEPTH,
+        BLOCK_REWARD_MATURITY,
+        DIFFICULTY_START,
+        DIFFICULTY_ADJUSTMENT_INTERVAL
+    );
 }
 
 fn bind_nonblocking(addr: SocketAddr, label: &str) -> Result<TcpListener, String> {
@@ -1360,6 +1523,7 @@ enum PeerPoll {
 }
 
 fn poll_peer(peer: SocketAddr, node: &mut Node) -> Result<PeerPoll, String> {
+    handshake_peer(peer, node)?;
     let tip = request_tip(peer)?;
     let local_height = node.tip_height().unwrap_or(Height(0)).0;
     if tip.0 <= local_height {
@@ -1371,6 +1535,23 @@ fn poll_peer(peer: SocketAddr, node: &mut Node) -> Result<PeerPoll, String> {
         request_block(peer, node, Height(height))?;
     }
     Ok(PeerPoll::Synced)
+}
+
+fn handshake_peer(peer: SocketAddr, node: &Node) -> Result<(), String> {
+    let version = VersionInfo::local(
+        node.tip_height()
+            .zip(node.tip_hash())
+            .map(|(height, hash)| TipInfo { height, hash }),
+    );
+    match roundtrip(peer, NetworkMessage::Version(version))? {
+        NetworkMessage::VerAck(remote) => remote
+            .validate_compatibility()
+            .map_err(|reason| format!("peer returned incompatible version: {reason:?}")),
+        NetworkMessage::Reject { reason, message } => {
+            Err(format!("peer rejected handshake: {reason:?}: {message}"))
+        }
+        _ => Err("peer returned unexpected handshake response".to_string()),
+    }
 }
 
 fn request_tip(peer: SocketAddr) -> Result<Height, String> {

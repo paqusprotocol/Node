@@ -598,9 +598,8 @@ checksum = "9f7c3e4beb33f85d45ae3e3a1792185706c8e16d043238c593331cc7cd313b50"
 
 [[package]]
 name = "paqus"
-version = "0.1.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "91b130d072c1322756868b554d1d3d3e9119935bbb1ec2e4a745cdece4dacd77"
+version = "0.1.4"
+source = "git+https://github.com/paqusprotocol/paqus.git?branch=main#2965642824383abe8b44c887fd3644df9f230fa6"
 dependencies = [
  "argon2",
  "borsh",

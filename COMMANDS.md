@@ -199,6 +199,12 @@ Address page data:
 curl http://127.0.0.1:9933/address/<address-hex>
 ```
 
+All accounts and balances:
+
+```bash
+curl http://127.0.0.1:9933/accounts
+```
+
 Mempool:
 
 ```bash
