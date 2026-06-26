@@ -1,3 +1,4 @@
+mod gateway;
 mod gossip;
 mod libp2p_node;
 mod mempool;
@@ -14,6 +15,7 @@ use axum::{
     routing::{get, post},
 };
 use borsh::BorshDeserialize;
+use gateway::{heartbeat_peer, register_peer, request_gateway_peers};
 use gossip::broadcast_to_peers;
 use mempool::resolve_wallet_nonce;
 use network::{bind_nonblocking, configure_stream, http_get, http_post_json, send_message};
@@ -48,6 +50,7 @@ const DEFAULT_CONFIG_FILE: &str = "./data/paqus/node.json";
 const DEFAULT_MINING_INTERVAL: Duration = Duration::from_secs(BLOCK_TIME as u64);
 const DEFAULT_MAX_PEERS: usize = 128;
 const DEFAULT_SHUTDOWN_FILE: &str = "./data/paqus/STOP";
+const DEFAULT_GATEWAY_HEARTBEAT: Duration = Duration::from_secs(60);
 
 fn main() -> ExitCode {
     match run(env::args().skip(1).collect()) {
@@ -540,6 +543,9 @@ struct RunConfig {
     rpc_addr: SocketAddr,
     peers: Vec<SocketAddr>,
     peers_file: Option<String>,
+    gateway_url: Option<String>,
+    public_addr: Option<SocketAddr>,
+    gateway_heartbeat: Duration,
     shutdown_file: String,
     max_peers: usize,
     miner_address: Address,
@@ -556,6 +562,9 @@ struct RunConfigFile {
     rpc_addr: String,
     peers: Vec<String>,
     peers_file: Option<String>,
+    gateway_url: Option<String>,
+    public_addr: Option<String>,
+    gateway_heartbeat_secs: u64,
     shutdown_file: String,
     max_peers: usize,
     wallet: Option<String>,
@@ -712,6 +721,9 @@ impl Default for RunConfig {
                 .expect("default rpc address must be valid"),
             peers: Vec::new(),
             peers_file: None,
+            gateway_url: None,
+            public_addr: None,
+            gateway_heartbeat: DEFAULT_GATEWAY_HEARTBEAT,
             shutdown_file: DEFAULT_SHUTDOWN_FILE.to_string(),
             max_peers: DEFAULT_MAX_PEERS,
             miner_address: Address([9; 20]),
@@ -732,6 +744,9 @@ impl Default for RunConfigFile {
             rpc_addr: defaults.rpc_addr.to_string(),
             peers: Vec::new(),
             peers_file: Some("./data/paqus/peers.txt".to_string()),
+            gateway_url: None,
+            public_addr: None,
+            gateway_heartbeat_secs: defaults.gateway_heartbeat.as_secs(),
             shutdown_file: defaults.shutdown_file,
             max_peers: defaults.max_peers,
             wallet: None,
@@ -751,6 +766,7 @@ struct NodeService {
     peers: Arc<Mutex<HashMap<SocketAddr, PeerState>>>,
     last_mine: Instant,
     last_status: Instant,
+    last_gateway_heartbeat: Instant,
 }
 
 impl NodeService {
@@ -761,6 +777,9 @@ impl NodeService {
             .copied()
             .map(|peer| (peer, PeerState::new(peer)))
             .collect();
+        let last_gateway_heartbeat = Instant::now()
+            .checked_sub(config.gateway_heartbeat)
+            .unwrap_or_else(Instant::now);
         Self {
             node,
             config,
@@ -768,6 +787,7 @@ impl NodeService {
             peers: Arc::new(Mutex::new(peers)),
             last_mine: Instant::now(),
             last_status: Instant::now(),
+            last_gateway_heartbeat,
         }
     }
 
@@ -802,6 +822,8 @@ impl NodeService {
                 ));
             }
         }
+
+        self.refresh_gateway_peers(true);
 
         let peers = self
             .peers
@@ -874,6 +896,9 @@ impl NodeService {
 
             self.accept_p2p()?;
             self.sync_peers();
+            if self.last_gateway_heartbeat.elapsed() >= self.config.gateway_heartbeat {
+                self.refresh_gateway_peers(false);
+            }
 
             if self.config.mine && self.last_mine.elapsed() >= self.config.mine_interval {
                 let block = {
@@ -1047,6 +1072,62 @@ impl NodeService {
             }
             current.entry(addr).or_insert_with(|| PeerState::new(addr));
         }
+    }
+
+    fn refresh_gateway_peers(&mut self, register: bool) {
+        let Some(gateway_url) = self.config.gateway_url.clone() else {
+            return;
+        };
+
+        let (best_height, tip_hash) = match self.node.lock() {
+            Ok(node) => (
+                node.tip_height().map(|height| height.0),
+                node.tip_hash().map(|hash| hex::encode(hash.0)),
+            ),
+            Err(_) => {
+                eprintln!("node state lock poisoned");
+                return;
+            }
+        };
+
+        if let Some(public_addr) = self.config.public_addr {
+            let result = if register {
+                register_peer(&gateway_url, public_addr, best_height, tip_hash.clone())
+            } else {
+                heartbeat_peer(&gateway_url, public_addr, best_height, tip_hash.clone())
+            };
+            if let Err(error) = result {
+                eprintln!("gateway update failed: {error}");
+            }
+        } else if register {
+            eprintln!("gateway configured without --public-addr; querying peers only");
+        }
+
+        let available = match self.peers.lock() {
+            Ok(peers) => self.config.max_peers.saturating_sub(peers.len()),
+            Err(_) => {
+                eprintln!("peer state lock poisoned");
+                return;
+            }
+        };
+        if available > 0 {
+            match request_gateway_peers(
+                &gateway_url,
+                available.min(32),
+                self.config.public_addr.or(Some(self.config.listen_addr)),
+            ) {
+                Ok(peers) => {
+                    if !peers.is_empty() {
+                        println!("gateway discovered {} peer(s)", peers.len());
+                        self.add_peer_infos(peers);
+                        let _ = self.save_peers();
+                    }
+                }
+                Err(error) => eprintln!("gateway peer query failed: {error}"),
+            }
+        }
+
+        self.last_gateway_heartbeat = Instant::now();
     }
 
     fn save_peers(&self) -> Result<(), String> {
@@ -1561,6 +1642,7 @@ fn address_transactions(node: &Node, address: &Address) -> Result<Vec<TxResponse
 fn run_node(args: &[String]) -> Result<(), String> {
     let mut config = parse_run_config(args)?;
     print_core_startup_info();
+    warn_if_public_rpc(&config);
     if let Some(path) = &config.peers_file {
         config.peers.extend(load_peers_file(path)?);
     }
@@ -1608,6 +1690,17 @@ fn run_node(args: &[String]) -> Result<(), String> {
     };
     let _rpc_handle = start_rpc_server(rpc_state, service.config.rpc_addr)?;
     service.run()
+}
+
+fn warn_if_public_rpc(config: &RunConfig) {
+    let ip = config.rpc_addr.ip();
+    if ip.is_loopback() {
+        return;
+    }
+    eprintln!(
+        "warning: rpc is listening on {}; keep fullnode rpc internal and expose public traffic through paqus-gateway",
+        config.rpc_addr
+    );
 }
 
 fn print_core_startup_info() {
@@ -1672,6 +1765,27 @@ fn parse_run_config(args: &[String]) -> Result<RunConfig, String> {
                         .ok_or_else(|| "missing value for --peers-file".to_string())?
                         .clone(),
                 );
+            }
+            "--gateway" | "--gateway-url" => {
+                index += 1;
+                config.gateway_url = Some(
+                    args.get(index)
+                        .ok_or_else(|| "missing value for --gateway".to_string())?
+                        .clone(),
+                );
+            }
+            "--public-addr" => {
+                index += 1;
+                config.public_addr = Some(parse_socket(args.get(index), "--public-addr")?);
+            }
+            "--gateway-heartbeat-secs" => {
+                index += 1;
+                let secs = args
+                    .get(index)
+                    .ok_or_else(|| "missing value for --gateway-heartbeat-secs".to_string())?
+                    .parse::<u64>()
+                    .map_err(|error| format!("invalid gateway heartbeat interval: {error}"))?;
+                config.gateway_heartbeat = Duration::from_secs(secs.max(1));
             }
             "--shutdown-file" => {
                 index += 1;
@@ -1780,6 +1894,15 @@ fn apply_run_config_file(config: &mut RunConfig, file: RunConfigFile) -> Result<
         })
         .collect::<Result<Vec<_>, _>>()?;
     config.peers_file = file.peers_file;
+    config.gateway_url = file.gateway_url;
+    config.public_addr = file
+        .public_addr
+        .map(|addr| {
+            addr.parse()
+                .map_err(|error| format!("invalid public_addr in config: {error}"))
+        })
+        .transpose()?;
+    config.gateway_heartbeat = Duration::from_secs(file.gateway_heartbeat_secs.max(1));
     config.shutdown_file = file.shutdown_file;
     config.max_peers = file.max_peers.max(1);
     config.mine = file.mine;
@@ -1967,7 +2090,7 @@ Usage:
   paqus node libp2p-info
   paqus node config [config-path]
   paqus node init [db-path] [miner-address-hex]
-  paqus node run [db-path] [--config path] [--listen addr] [--rpc-listen addr] [--peer addr] [--peers-file path] [--wallet path] [--miner address-hex] [--miner-secret-key key-hex] [--mine]
+  paqus node run [db-path] [--config path] [--listen addr] [--rpc-listen addr] [--peer addr] [--peers-file path] [--gateway host:port] [--public-addr host:port] [--wallet path] [--miner address-hex] [--miner-secret-key key-hex] [--mine]
   paqus wallet new [--show-secret]
   paqus wallet address <secret-key-hex>
   paqus wallet balance <address-hex> [db-path]
