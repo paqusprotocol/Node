@@ -133,8 +133,9 @@ fn request_block(peer: SocketAddr, node: &mut Node, height: Height) -> Result<()
     node.flush_to_storage()
         .map_err(|error| format!("failed to flush synced block: {error}"))?;
     println!(
-        "synced height={} tip={}",
-        node.tip_height().unwrap_or(Height(0)).0,
+        "synced block height {} from {} |tip::{}|",
+        height.0,
+        peer,
         node.tip_hash()
             .map(|hash| hex::encode(hash.0))
             .unwrap_or_else(|| "none".to_string())

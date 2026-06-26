@@ -16,7 +16,7 @@ use axum::{
 };
 use borsh::BorshDeserialize;
 use gateway::{heartbeat_peer, register_peer, request_gateway_peers};
-use gossip::broadcast_to_peers;
+use gossip::{BroadcastReport, broadcast_to_peers};
 use mempool::resolve_wallet_nonce;
 use network::{bind_nonblocking, configure_stream, http_get, http_post_json, send_message};
 use p2p::{PeerPoll, PeerState, dedupe_peers, load_peers_file, poll_peer, request_peers};
@@ -52,6 +52,7 @@ const DEFAULT_MAX_PEERS: usize = 128;
 const DEFAULT_SHUTDOWN_FILE: &str = "./data/paqus/STOP";
 const DEFAULT_GATEWAY_HEARTBEAT: Duration = Duration::from_secs(60);
 const MAX_PEER_FAILURES: u32 = 3;
+const ACTIVITY_LOG_INTERVAL: Duration = Duration::from_secs(15);
 
 fn main() -> ExitCode {
     match run(env::args().skip(1).collect()) {
@@ -768,6 +769,18 @@ struct NodeService {
     last_mine: Instant,
     last_status: Instant,
     last_gateway_heartbeat: Instant,
+    last_activity_log: Instant,
+    last_activity: NodeActivity,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NodeActivity {
+    Starting,
+    WaitingForPeers,
+    WaitingForTransactions,
+    Mining,
+    Syncing,
+    ServingPeers,
 }
 
 impl NodeService {
@@ -789,6 +802,10 @@ impl NodeService {
             last_mine: Instant::now(),
             last_status: Instant::now(),
             last_gateway_heartbeat,
+            last_activity_log: Instant::now()
+                .checked_sub(ACTIVITY_LOG_INTERVAL)
+                .unwrap_or_else(Instant::now),
+            last_activity: NodeActivity::Starting,
         }
     }
 
@@ -901,7 +918,10 @@ impl NodeService {
                 self.refresh_gateway_peers(false);
             }
 
+            self.log_activity()?;
+
             if self.config.mine && self.last_mine.elapsed() >= self.config.mine_interval {
+                self.set_activity(NodeActivity::Mining)?;
                 let block = {
                     let mut node = self
                         .node
@@ -910,7 +930,14 @@ impl NodeService {
                     mine_once(&mut node, &self.config)?
                 };
                 if let Some(block) = block {
-                    self.broadcast(NetworkMessage::Block(block));
+                    let height = block.height().0;
+                    let hash = short_hash(Some(block.hash()));
+                    let tx_count = block.transactions.len();
+                    let report = self.broadcast(NetworkMessage::Block(block));
+                    println!(
+                        "broadcasting block height {} |hash::{}|txs::{}|peers::{}|sent::{}|failed::{}|",
+                        height, hash, tx_count, report.attempted, report.sent, report.failed
+                    );
                 }
                 self.last_mine = Instant::now();
             }
@@ -964,10 +991,90 @@ impl NodeService {
         Ok(())
     }
 
+    fn log_activity(&mut self) -> Result<(), String> {
+        let (height, tip, mempool_len, mining) = {
+            let node = self
+                .node
+                .lock()
+                .map_err(|_| "node state lock poisoned".to_string())?;
+            (
+                node.tip_height().unwrap_or(Height(0)).0,
+                short_hash(node.tip_hash()),
+                node.mempool.len(),
+                self.config.mine,
+            )
+        };
+        let peer_count = self
+            .peers
+            .lock()
+            .map_err(|_| "peer state lock poisoned".to_string())?
+            .len();
+
+        let activity = if peer_count == 0 && self.config.gateway_url.is_some() {
+            NodeActivity::WaitingForPeers
+        } else if mining && mempool_len == 0 {
+            NodeActivity::WaitingForTransactions
+        } else if mining {
+            NodeActivity::Mining
+        } else if peer_count > 0 {
+            NodeActivity::Syncing
+        } else {
+            NodeActivity::ServingPeers
+        };
+
+        if activity != self.last_activity
+            || self.last_activity_log.elapsed() >= ACTIVITY_LOG_INTERVAL
+        {
+            println!(
+                "node activity:: |state::{:?}|height::{}|tip::{}|mempool::{}|peers::{}|mining::{}|",
+                activity, height, tip, mempool_len, peer_count, mining
+            );
+            self.last_activity = activity;
+            self.last_activity_log = Instant::now();
+        }
+
+        Ok(())
+    }
+
+    fn set_activity(&mut self, activity: NodeActivity) -> Result<(), String> {
+        if activity == self.last_activity
+            && self.last_activity_log.elapsed() < ACTIVITY_LOG_INTERVAL
+        {
+            return Ok(());
+        }
+        let (height, tip, mempool_len) = {
+            let node = self
+                .node
+                .lock()
+                .map_err(|_| "node state lock poisoned".to_string())?;
+            (
+                node.tip_height().unwrap_or(Height(0)).0,
+                short_hash(node.tip_hash()),
+                node.mempool.len(),
+            )
+        };
+        let peer_count = self
+            .peers
+            .lock()
+            .map_err(|_| "peer state lock poisoned".to_string())?
+            .len();
+        println!(
+            "node activity:: |state::{:?}|height::{}|tip::{}|mempool::{}|peers::{}|mining::{}|",
+            activity, height, tip, mempool_len, peer_count, self.config.mine
+        );
+        self.last_activity = activity;
+        self.last_activity_log = Instant::now();
+        Ok(())
+    }
+
     fn accept_p2p(&mut self) -> Result<(), String> {
         loop {
             match self.listener.accept() {
-                Ok((stream, peer)) => self.handle_p2p_stream(stream, peer)?,
+                Ok((stream, peer)) => {
+                    self.set_activity(NodeActivity::ServingPeers)?;
+                    println!("p2p inbound:: |peer::{}|event::accepted|", peer);
+                    self.handle_p2p_stream(stream, peer)?;
+                }
                 Err(error) if error.kind() == io::ErrorKind::WouldBlock => return Ok(()),
                 Err(error) => return Err(format!("failed to accept peer: {error}")),
             }
@@ -985,13 +1092,18 @@ impl NodeService {
                         None
                     }
                     message => {
+                        let inbound_log = inbound_message_log(&message, peer);
                         let mut node = self
                             .node
                             .lock()
                             .map_err(|_| "node state lock poisoned".to_string())?;
-                        handle_message(&mut node, message).map_err(|error| {
+                        let response = handle_message(&mut node, message).map_err(|error| {
                             format!("failed to handle message from {peer}: {error}")
-                        })?
+                        })?;
+                        if let Some(log) = inbound_log {
+                            println!("{log}");
+                        }
+                        response
                     }
                 };
                 if let Some(response) = response {
@@ -1177,19 +1289,49 @@ impl NodeService {
             .collect()
     }
 
-    fn broadcast(&mut self, message: NetworkMessage) {
+    fn broadcast(&mut self, message: NetworkMessage) -> BroadcastReport {
         let peers = match self.peers.lock() {
             Ok(peers) => peers.keys().copied().collect::<Vec<_>>(),
             Err(_) => {
                 eprintln!("peer state lock poisoned");
-                return;
+                return BroadcastReport::default();
             }
+        };
+        let mut report = BroadcastReport {
+            attempted: peers.len(),
+            sent: 0,
+            failed: 0,
         };
         for peer in peers {
             if let Err(error) = send_message(peer, message.clone()) {
+                report.failed += 1;
                 eprintln!("broadcast to {peer} failed: {error}");
+            } else {
+                report.sent += 1;
             }
         }
+        report
+    }
+}
+
+fn inbound_message_log(message: &NetworkMessage, peer: SocketAddr) -> Option<String> {
+    match message {
+        NetworkMessage::Block(block) => Some(format!(
+            "received block height {} from {} |hash::{}|txs::{}|",
+            block.height().0,
+            peer,
+            short_hash(Some(block.hash())),
+            block.transactions.len()
+        )),
+        NetworkMessage::Transaction(transaction) => Some(format!(
+            "received tx:: |from::{}|hash::{}|amount::{}|fee::{}|nonce::{}|",
+            peer,
+            short_hash(Some(transaction.hash())),
+            transaction.payload.amount.0,
+            transaction.payload.fee.0,
+            transaction.payload.nonce.0
+        )),
+        _ => None,
     }
 }
 
@@ -1511,7 +1653,21 @@ async fn rpc_submit_tx(
         }
         Err(_) => return rpc_error(StatusCode::INTERNAL_SERVER_ERROR, "state_lock_failed"),
     }
-    broadcast_to_peers(&state.peers, NetworkMessage::Transaction(transaction));
+    println!(
+        "accepted tx:: |hash::{}|amount::{}|fee::{}|nonce::{}|",
+        short_hash(Some(hash)),
+        transaction.payload.amount.0,
+        transaction.payload.fee.0,
+        transaction.payload.nonce.0
+    );
+    let report = broadcast_to_peers(&state.peers, NetworkMessage::Transaction(transaction));
+    println!(
+        "broadcast tx:: |hash::{}|peers::{}|sent::{}|failed::{}|",
+        short_hash(Some(hash)),
+        report.attempted,
+        report.sent,
+        report.failed
+    );
     Json(SubmitTxResponse {
         accepted: true,
         hash: hex::encode(hash.0),
@@ -1992,7 +2148,11 @@ fn mine_once(node: &mut Node, _config: &RunConfig) -> Result<Option<Block>, Stri
             Ok(Some(result.block))
         }
         Err(error) => {
-            eprintln!("mining skipped: {error}");
+            if node.mempool.is_empty() {
+                println!("mining waiting:: |reason::empty_mempool|");
+            } else {
+                eprintln!("mining skipped: {error}");
+            }
             Ok(None)
         }
     }
