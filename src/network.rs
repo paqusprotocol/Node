@@ -14,6 +14,9 @@ pub fn bind_nonblocking(addr: SocketAddr, label: &str) -> Result<TcpListener, St
 
 pub fn configure_stream(stream: &TcpStream, timeout: Duration) -> Result<(), String> {
     stream
+        .set_nonblocking(false)
+        .map_err(|error| format!("failed to set stream blocking mode: {error}"))?;
+    stream
         .set_read_timeout(Some(timeout))
         .map_err(|error| format!("failed to set read timeout: {error}"))?;
     stream
