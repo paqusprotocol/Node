@@ -14,5 +14,5 @@ lmdb = "0.8"
 tokio = { version = "1", features = ["full"] }
 tracing = "0.1"
 tracing-subscriber = "0.3"
-paqus = { path = "../../paqus-core" }
+paqus = "0.1.6"
 sled = "0.34.7"

@@ -51,6 +51,7 @@ const DEFAULT_MINING_INTERVAL: Duration = Duration::from_secs(BLOCK_TIME as u64)
 const DEFAULT_MAX_PEERS: usize = 128;
 const DEFAULT_SHUTDOWN_FILE: &str = "./data/paqus/STOP";
 const DEFAULT_GATEWAY_HEARTBEAT: Duration = Duration::from_secs(60);
+const MAX_PEER_FAILURES: u32 = 3;
 
 fn main() -> ExitCode {
     match run(env::args().skip(1).collect()) {
@@ -1043,12 +1044,24 @@ impl NodeService {
                     }
                 }
                 Err(error) => {
+                    let mut dropped = false;
                     if let Ok(mut peers) = self.peers.lock() {
                         if let Some(state) = peers.get_mut(&peer) {
                             state.mark_failed();
+                            if state.failures >= MAX_PEER_FAILURES {
+                                peers.remove(&peer);
+                                dropped = true;
+                            }
                         }
                     }
-                    eprintln!("peer {peer} sync failed: {error}");
+                    if dropped {
+                        let _ = self.save_peers();
+                        eprintln!(
+                            "peer {peer} sync failed {MAX_PEER_FAILURES} times; dropped: {error}"
+                        );
+                    } else {
+                        eprintln!("peer {peer} sync failed: {error}");
+                    }
                 }
             }
         }
@@ -1067,6 +1080,9 @@ impl NodeService {
             let Ok(addr) = info.address.parse::<SocketAddr>() else {
                 continue;
             };
+            if Some(addr) == self.config.public_addr || addr == self.config.listen_addr {
+                continue;
+            }
             if known.contains(&addr) {
                 continue;
             }
