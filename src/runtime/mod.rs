@@ -11,10 +11,9 @@ pub mod wallet;
 pub mod params {
     pub use paqus::params::*;
 
-    pub const NETWORK_MAGIC: [u8; 4] = [0x58, 0x50, 0x51, 0x01];
     pub const STORAGE_VERSION: u8 = 1;
     pub const MEMPOOL_EXPIRY_SECS: u64 = 30 * paqus::params::MINUTE as u64;
     pub const MAX_MEMPOOL_TXS: usize = 1_000;
     pub const MAX_MEMPOOL_BYTES: usize = 10 * 1024 * 1024;
-    pub const MAX_NETWORK_MESSAGE_SIZE: usize = 4 * 1024 * 1024;
+    pub const MAX_NETWORK_MESSAGE_SIZE: usize = 8 * 1024 * 1024;
 }

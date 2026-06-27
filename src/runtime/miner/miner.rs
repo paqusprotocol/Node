@@ -25,17 +25,43 @@ pub fn mine_candidate_block(
     timestamp: u64,
     config: MiningConfig,
 ) -> Result<Option<MiningResult>, ConsensusError> {
+    let block = prepare_candidate_block(
+        mempool,
+        ledger,
+        miner_address,
+        timestamp,
+        config.transaction_limit,
+        config.difficulty,
+    )?;
+    mine_prepared_block(block, consensus, config)
+}
+
+pub fn prepare_candidate_block(
+    mempool: &Mempool,
+    ledger: &Ledger,
+    miner_address: Address,
+    timestamp: u64,
+    transaction_limit: usize,
+    difficulty: u32,
+) -> Result<Block, ConsensusError> {
     let mut block = mempool
         .create_candidate_block(
             ledger,
             miner_address,
             timestamp,
             Nonce(0),
-            config.transaction_limit,
+            transaction_limit,
         )
         .map_err(|_| ConsensusError::InvalidBlock(paqus::block::BlockError::InvalidStateRoot))?;
-    block.header.difficulty = config.difficulty;
+    block.header.difficulty = difficulty;
+    Ok(block)
+}
 
+pub fn mine_prepared_block(
+    mut block: Block,
+    consensus: &Consensus,
+    config: MiningConfig,
+) -> Result<Option<MiningResult>, ConsensusError> {
     for attempt in 0..config.max_attempts {
         block.header.nonce = Nonce(attempt);
         if config.difficulty == 0 {

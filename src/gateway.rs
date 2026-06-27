@@ -2,9 +2,11 @@ use crate::paquscore::{
     CHAIN_ID, CHAIN_NAME, NETWORK_MAGIC, PROTOCOL_STAGE, PROTOCOL_VERSION, PeerInfo,
 };
 use serde::{Deserialize, Serialize};
-use std::io::{Read, Write};
+use std::io::{ErrorKind, Read, Write};
 use std::net::{SocketAddr, TcpStream};
 use std::time::Duration;
+
+const GATEWAY_HTTP_TIMEOUT: Duration = Duration::from_secs(60);
 
 #[derive(Debug, Clone, Serialize)]
 struct RegisterRequest {
@@ -156,18 +158,38 @@ fn post_json<T: Serialize>(gateway_url: &str, path: &str, value: &T) -> Result<S
 
 fn configure_stream(stream: &TcpStream) -> Result<(), String> {
     stream
-        .set_read_timeout(Some(Duration::from_secs(5)))
+        .set_read_timeout(Some(GATEWAY_HTTP_TIMEOUT))
         .map_err(|error| format!("failed to set gateway read timeout: {error}"))?;
     stream
-        .set_write_timeout(Some(Duration::from_secs(5)))
+        .set_write_timeout(Some(GATEWAY_HTTP_TIMEOUT))
         .map_err(|error| format!("failed to set gateway write timeout: {error}"))
 }
 
 fn read_http_response(mut stream: TcpStream) -> Result<String, String> {
-    let mut response = String::new();
-    stream
-        .read_to_string(&mut response)
-        .map_err(|error| format!("failed to read gateway response: {error}"))?;
+    let mut response = Vec::new();
+    let mut buffer = [0u8; 4096];
+    loop {
+        match stream.read(&mut buffer) {
+            Ok(0) => break,
+            Ok(bytes_read) => {
+                response.extend_from_slice(&buffer[..bytes_read]);
+                if response_body_complete(&response)? {
+                    break;
+                }
+            }
+            Err(error) if matches!(error.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) => {
+                if response_body_complete(&response)? {
+                    break;
+                }
+                return Err(
+                    "failed to read gateway response: timed out waiting for response".to_string(),
+                );
+            }
+            Err(error) => return Err(format!("failed to read gateway response: {error}")),
+        }
+    }
+    let response = String::from_utf8(response)
+        .map_err(|error| format!("failed to decode gateway response: {error}"))?;
     let (head, body) = response
         .split_once("\r\n\r\n")
         .ok_or_else(|| format!("invalid gateway response: {response}"))?;
@@ -175,6 +197,25 @@ fn read_http_response(mut stream: TcpStream) -> Result<String, String> {
         return Err(format!("gateway returned error: {body}"));
     }
     Ok(body.to_string())
+}
+
+fn response_body_complete(response: &[u8]) -> Result<bool, String> {
+    let Some(header_end) = response.windows(4).position(|window| window == b"\r\n\r\n") else {
+        return Ok(false);
+    };
+    let headers = std::str::from_utf8(&response[..header_end])
+        .map_err(|error| format!("failed to decode gateway response headers: {error}"))?;
+    let Some(content_length) = headers.lines().find_map(content_length) else {
+        return Ok(false);
+    };
+    Ok(response.len() >= header_end + 4 + content_length)
+}
+
+fn content_length(line: &str) -> Option<usize> {
+    let (name, value) = line.split_once(':')?;
+    name.eq_ignore_ascii_case("content-length")
+        .then(|| value.trim().parse().ok())
+        .flatten()
 }
 
 fn network_magic_hex() -> String {

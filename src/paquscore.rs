@@ -3,12 +3,14 @@ pub use paqus::consensus::Consensus;
 pub use paqus::crypto::{address_from_public_key, address_to_string, derive_public_key};
 pub use paqus::genesis::GENESIS_PREMINE_ADDRESS;
 pub use paqus::params::{
-    BLOCK_REWARD_MATURITY, BLOCK_TIME, CHAIN_ID, CHAIN_NAME, COIN_NAME,
+    BLOCK_REWARD_MATURITY, BLOCK_TIME, CHAIN_ID, CHAIN_NAME, COIN_NAME, CONFIRMATION_DEPTH,
     DIFFICULTY_ADJUSTMENT_INTERVAL, DIFFICULTY_START, FINALITY_DEPTH, MAX_BLOCK_TXS, MIN_FEE,
     PROTOCOL_STAGE, PROTOCOL_VERSION,
 };
 pub use paqus::transaction::{SignedTransaction, Transaction};
-pub use paqus::types::{Address, Amount, BlockHash, Hash, Height, Nonce, SecretKey};
+pub use paqus::types::{
+    Address, Amount, BlockHash, Hash, Height, Nonce, SecretKey, TransactionHash,
+};
 
 pub use crate::runtime::network::{
     NetworkEnvelope, NetworkMessage, PeerInfo, TipInfo, VersionInfo, handle_message, read_message,

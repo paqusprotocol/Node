@@ -68,7 +68,7 @@ impl Mempool {
         now: u64,
     ) -> Result<TransactionHash, MempoolError> {
         self.prune_expired(now);
-        transaction.validate_signed()?;
+        transaction.validate_signed_at(now)?;
         self.insert_unchecked(transaction, now, None)
     }
 
@@ -87,7 +87,7 @@ impl Mempool {
         now: u64,
     ) -> Result<TransactionHash, MempoolError> {
         self.prune_expired(now);
-        transaction.validate_signed()?;
+        transaction.validate_signed_at(now)?;
         let replacement = self.replacement_candidate(&transaction)?;
         self.validate_against_ledger_excluding(ledger, &transaction, replacement)?;
         self.insert_unchecked(transaction, now, replacement)
@@ -145,16 +145,16 @@ impl Mempool {
             .transactions
             .iter()
             .find(|(_, entry)| {
-                entry.transaction.payload.from == transaction.payload.from
-                    && entry.transaction.payload.nonce == transaction.payload.nonce
+                entry.transaction.transaction.from == transaction.transaction.from
+                    && entry.transaction.transaction.nonce == transaction.transaction.nonce
             })
-            .map(|(hash, entry)| (*hash, entry.transaction.payload.fee));
+            .map(|(hash, entry)| (*hash, entry.transaction.transaction.fee));
 
         let Some((hash, old_fee)) = replacement else {
             return Ok(None);
         };
 
-        if transaction.payload.fee.0 <= old_fee.0 {
+        if transaction.transaction.fee.0 <= old_fee.0 {
             return Err(MempoolError::ReplacementFeeTooLow);
         }
 
@@ -178,7 +178,7 @@ impl Mempool {
     ) -> Result<(), MempoolError> {
         transaction.validate_signed()?;
 
-        let payload = &transaction.payload;
+        let payload = &transaction.transaction;
         let sender = ledger
             .account(&payload.from)
             .ok_or(LedgerError::AccountNotFound)?;
@@ -191,20 +191,20 @@ impl Mempool {
             .iter()
             .filter(|(hash, _)| Some(**hash) != excluded)
             .map(|(_, entry)| &entry.transaction)
-            .filter(|pending| pending.payload.from == payload.from)
+            .filter(|pending| pending.transaction.from == payload.from)
             .collect();
-        pending_from_sender.sort_by_key(|pending| pending.payload.nonce);
+        pending_from_sender.sort_by_key(|pending| pending.transaction.nonce);
 
         for pending in pending_from_sender {
-            if pending.payload.nonce != expected_nonce {
+            if pending.transaction.nonce != expected_nonce {
                 return Err(LedgerError::InvalidState(StateError::InvalidNonce).into());
             }
 
             let total = pending
-                .payload
+                .transaction
                 .amount
                 .0
-                .checked_add(pending.payload.fee.0)
+                .checked_add(pending.transaction.fee.0)
                 .ok_or(LedgerError::InvalidState(StateError::BalanceOverflow))?;
             if spendable.0 < total {
                 return Err(LedgerError::InvalidState(StateError::InsufficientBalance).into());
@@ -287,12 +287,13 @@ impl Mempool {
         let mut by_sender: BTreeMap<Address, Vec<SignedTransaction>> = BTreeMap::new();
         for transaction in self.transactions() {
             by_sender
-                .entry(transaction.payload.from)
+                .entry(transaction.transaction.from)
                 .or_default()
                 .push(transaction.clone());
         }
         for transactions in by_sender.values_mut() {
-            transactions.sort_by_key(|transaction| (transaction.payload.nonce, transaction.hash()));
+            transactions
+                .sort_by_key(|transaction| (transaction.transaction.nonce, transaction.hash()));
         }
 
         let mut selected = Vec::new();
@@ -303,8 +304,8 @@ impl Mempool {
                     transactions.first().map(|transaction| {
                         (
                             *sender,
-                            transaction.payload.fee.0,
-                            transaction.payload.nonce,
+                            transaction.transaction.fee.0,
+                            transaction.transaction.nonce,
                             transaction.hash(),
                         )
                     })
@@ -350,7 +351,7 @@ impl Mempool {
         let fees = paqus::types::Amount(
             transactions
                 .iter()
-                .map(|transaction| transaction.payload.fee.0)
+                .map(|transaction| transaction.transaction.fee.0)
                 .sum(),
         );
         let coinbase = if height.0 == 0 && previous_hash == Hash([0; HASH_SIZE]) {
@@ -412,12 +413,13 @@ mod tests {
         nonce: u64,
     ) -> SignedTransaction {
         let from = address_from_public_key(&public_key);
-        let payload = Transaction::new(
+        let payload = Transaction::new_at(
             from,
             to,
             Amount(amount),
             Amount(paqus::params::MIN_FEE),
             Nonce(nonce),
+            current_unix_timestamp(),
         );
         let signature = sign(secret_key, &payload.signing_bytes());
 

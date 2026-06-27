@@ -9,6 +9,7 @@ use paqus::state::Account;
 use paqus::transaction::{SignedTransaction, Transaction};
 use paqus::types::{Address, Amount, Hash, Height, Nonce, PublicKey, Signature};
 use std::collections::BTreeMap;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 fn address(byte: u8) -> Address {
     Address([byte; 20])
@@ -26,23 +27,38 @@ fn signed_transaction_from_keypair(
     nonce: u64,
 ) -> SignedTransaction {
     let from = address_from_public_key(&keypair.public_key);
-    let payload = Transaction::new(from, to, Amount(amount), Amount(BASE_FEE), Nonce(nonce));
+    let payload = Transaction::new_at(
+        from,
+        to,
+        Amount(amount),
+        Amount(BASE_FEE),
+        Nonce(nonce),
+        current_unix_timestamp(),
+    );
     let signature = sign(&keypair.secret_key, &payload.signing_bytes());
     SignedTransaction::new(payload, keypair.public_key, signature)
 }
 
 fn dummy_signed_transaction(nonce: u64) -> SignedTransaction {
     SignedTransaction::new(
-        Transaction::new(
+        Transaction::new_at(
             address(1),
             address(2),
             Amount(10),
             Amount(BASE_FEE),
             Nonce(nonce),
+            current_unix_timestamp(),
         ),
         PublicKey([1; 2592]),
         Signature([1; 4627]),
     )
+}
+
+fn current_unix_timestamp() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_secs())
+        .unwrap_or(0)
 }
 
 fn block(height: u64, previous_hash: Hash, difficulty: u32, nonce: u64) -> Block {
@@ -76,7 +92,7 @@ fn block_with_transactions(
 #[test]
 fn submits_transaction_to_mempool() {
     let transaction = signed_transaction_to(address(2), 10, 0);
-    let sender = transaction.payload.from;
+    let sender = transaction.transaction.from;
     let mut ledger = Ledger::new();
     ledger.create_account(sender, Amount(25)).unwrap();
     ledger.create_account(address(2), Amount(0)).unwrap();
@@ -97,7 +113,7 @@ fn submits_transaction_to_mempool() {
 #[test]
 fn mines_and_applies_block_from_mempool() {
     let transaction = signed_transaction_to(address(2), 10, 0);
-    let sender = transaction.payload.from;
+    let sender = transaction.transaction.from;
     let miner = address(9);
     let mut ledger = Ledger::new();
     ledger.create_account(sender, Amount(25)).unwrap();

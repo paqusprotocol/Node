@@ -1,5 +1,5 @@
 use crate::network::roundtrip;
-use crate::paquscore::{Height, NetworkMessage, Node, PeerInfo, TipInfo, VersionInfo};
+use crate::paquscore::{BlockHash, Height, NetworkMessage, Node, PeerInfo, TipInfo, VersionInfo};
 use std::collections::HashSet;
 use std::fs;
 use std::io;
@@ -82,13 +82,18 @@ pub fn poll_peer(peer: SocketAddr, node: &mut Node) -> Result<PeerPoll, String> 
     let tip = request_tip(peer)?;
     let local_height = node.tip_height().unwrap_or(Height(0)).0;
     if tip.0 <= local_height {
-        return Ok(PeerPoll::Idle);
+        return if request_missing_parent_blocks(peer, node)? {
+            Ok(PeerPoll::Synced)
+        } else {
+            Ok(PeerPoll::Idle)
+        };
     }
 
     let target = tip.0.min(local_height.saturating_add(MAX_BLOCKS_PER_SYNC));
     for height in local_height.saturating_add(1)..=target {
         request_block(peer, node, Height(height))?;
     }
+    request_missing_parent_blocks(peer, node)?;
     Ok(PeerPoll::Synced)
 }
 
@@ -135,6 +140,41 @@ fn request_block(peer: SocketAddr, node: &mut Node, height: Height) -> Result<()
     println!(
         "synced block height {} from {} |tip::{}|",
         height.0,
+        peer,
+        node.tip_hash()
+            .map(|hash| hex::encode(hash.0))
+            .unwrap_or_else(|| "none".to_string())
+    );
+    Ok(())
+}
+
+fn request_missing_parent_blocks(peer: SocketAddr, node: &mut Node) -> Result<bool, String> {
+    let mut requested = false;
+    for hash in node.drain_missing_parent_requests() {
+        requested = true;
+        if let Err(error) = request_block_by_hash(peer, node, hash) {
+            node.retry_missing_parent_request(hash);
+            return Err(error);
+        }
+    }
+    Ok(requested)
+}
+
+fn request_block_by_hash(peer: SocketAddr, node: &mut Node, hash: BlockHash) -> Result<(), String> {
+    let response = roundtrip(peer, NetworkMessage::GetBlockByHash { hash })?;
+    let NetworkMessage::Block(block) = response else {
+        return Err(format!(
+            "peer did not return block hash {}",
+            hex::encode(hash.0)
+        ));
+    };
+    node.apply_block(block)
+        .map_err(|error| format!("failed to apply missing parent from {peer}: {error}"))?;
+    node.flush_to_storage()
+        .map_err(|error| format!("failed to flush missing parent block: {error}"))?;
+    println!(
+        "synced missing parent {} from {} |tip::{}|",
+        hex::encode(hash.0),
         peer,
         node.tip_hash()
             .map(|hash| hex::encode(hash.0))

@@ -1,3 +1,5 @@
 pub mod miner;
 
-pub use miner::{MiningConfig, MiningResult, mine_candidate_block};
+pub use miner::{
+    MiningConfig, MiningResult, mine_candidate_block, mine_prepared_block, prepare_candidate_block,
+};

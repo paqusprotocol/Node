@@ -6,6 +6,7 @@ use paqus::crypto::{address_from_public_key, generate_keypair, sign};
 use paqus::ledger::Ledger;
 use paqus::transaction::{SignedTransaction, Transaction};
 use paqus::types::{Address, Amount, Nonce};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 fn address(byte: u8) -> Address {
     Address([byte; 20])
@@ -65,7 +66,14 @@ fn mines_candidate_block_until_pow_is_valid() {
     ledger.create_account(miner, Amount(0)).unwrap();
 
     let transaction = {
-        let payload = Transaction::new(sender, receiver, Amount(10), Amount(BASE_FEE), Nonce(0));
+        let payload = Transaction::new_at(
+            sender,
+            receiver,
+            Amount(10),
+            Amount(BASE_FEE),
+            Nonce(0),
+            current_unix_timestamp(),
+        );
         let signature = sign(&keypair.secret_key, &payload.signing_bytes());
         SignedTransaction::new(payload, keypair.public_key, signature)
     };
@@ -91,4 +99,11 @@ fn mines_candidate_block_until_pow_is_valid() {
     assert_eq!(result.block.difficulty(), 0);
     assert_eq!(result.block.transaction_count(), 1);
     assert_eq!(consensus.validate_proof_of_work(&result.block), Ok(()));
+}
+
+fn current_unix_timestamp() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_secs())
+        .unwrap_or(0)
 }

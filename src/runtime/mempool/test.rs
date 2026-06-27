@@ -12,9 +12,20 @@ fn address(byte: u8) -> Address {
 }
 
 fn signed_transaction(nonce: u64) -> SignedTransaction {
+    signed_transaction_at(nonce, current_unix_timestamp())
+}
+
+fn signed_transaction_at(nonce: u64, timestamp: u64) -> SignedTransaction {
     let keypair = generate_keypair();
     let from = address_from_public_key(&keypair.public_key);
-    let payload = Transaction::new(from, address(2), Amount(10), Amount(BASE_FEE), Nonce(nonce));
+    let payload = Transaction::new_at(
+        from,
+        address(2),
+        Amount(10),
+        Amount(BASE_FEE),
+        Nonce(nonce),
+        timestamp,
+    );
     let signature = sign(&keypair.secret_key, &payload.signing_bytes());
 
     SignedTransaction::new(payload, keypair.public_key, signature)
@@ -46,7 +57,14 @@ fn signed_transaction_from_with_fee(
     nonce: u64,
 ) -> SignedTransaction {
     let from = address_from_public_key(&public_key);
-    let payload = Transaction::new(from, to, Amount(amount), Amount(fee), Nonce(nonce));
+    let payload = Transaction::new_at(
+        from,
+        to,
+        Amount(amount),
+        Amount(fee),
+        Nonce(nonce),
+        current_unix_timestamp(),
+    );
     let signature = sign(secret_key, &payload.signing_bytes());
 
     SignedTransaction::new(payload, public_key, signature)
@@ -175,8 +193,8 @@ fn rejects_duplicate_transaction() {
 #[test]
 fn prunes_expired_transactions() {
     let mut mempool = Mempool::new();
-    let expired = signed_transaction(0);
-    let fresh = signed_transaction(1);
+    let expired = signed_transaction_at(0, 1_000);
+    let fresh = signed_transaction_at(1, 1_000 + MEMPOOL_EXPIRY_SECS);
     let expired_hash = expired.hash();
     let fresh_hash = fresh.hash();
 
@@ -197,8 +215,8 @@ fn insert_prunes_expired_transactions_before_capacity_check() {
         max_bytes: crate::runtime::params::MAX_MEMPOOL_BYTES,
         transaction_ttl_secs: MEMPOOL_EXPIRY_SECS,
     });
-    let expired = signed_transaction(0);
-    let replacement = signed_transaction(1);
+    let expired = signed_transaction_at(0, 1_000);
+    let replacement = signed_transaction_at(1, 1_000 + MEMPOOL_EXPIRY_SECS + 1);
     let replacement_hash = replacement.hash();
 
     mempool.insert_at(expired, 1_000).unwrap();
@@ -212,10 +230,42 @@ fn insert_prunes_expired_transactions_before_capacity_check() {
 }
 
 #[test]
+fn rejects_transaction_with_expired_timestamp() {
+    let mut mempool = Mempool::new();
+    let transaction = signed_transaction_at(0, 1_000);
+
+    assert_eq!(
+        mempool.insert_at(
+            transaction,
+            1_000 + crate::runtime::params::MAX_TRANSACTION_AGE as u64 + 1
+        ),
+        Err(MempoolError::InvalidTransaction(
+            TransactionError::Expired
+        ))
+    );
+}
+
+#[test]
+fn rejects_transaction_from_too_far_in_future() {
+    let mut mempool = Mempool::new();
+    let transaction = signed_transaction_at(
+        0,
+        1_000 + crate::runtime::params::MAX_TRANSACTION_FUTURE_TIME as u64 + 1,
+    );
+
+    assert_eq!(
+        mempool.insert_at(transaction, 1_000),
+        Err(MempoolError::InvalidTransaction(
+            TransactionError::FromFuture
+        ))
+    );
+}
+
+#[test]
 fn rejects_invalid_signed_transaction() {
     let mut mempool = Mempool::new();
     let mut transaction = signed_transaction(0);
-    transaction.payload.from = address(9);
+    transaction.transaction.from = address(9);
 
     assert_eq!(
         mempool.insert(transaction),
@@ -353,17 +403,17 @@ fn selects_transactions_by_fee_without_breaking_sender_nonce_order() {
 
     let selected = mempool.select_for_block(3);
 
-    assert_eq!(selected[0].payload.from, second_sender);
+    assert_eq!(selected[0].transaction.from, second_sender);
     assert_eq!(
-        selected[0].payload.fee,
+        selected[0].transaction.fee,
         Amount(crate::runtime::params::FAST_FEE)
     );
-    assert_eq!(selected[1].payload.from, first_sender);
-    assert_eq!(selected[1].payload.nonce, Nonce(0));
-    assert_eq!(selected[2].payload.from, first_sender);
-    assert_eq!(selected[2].payload.nonce, Nonce(1));
+    assert_eq!(selected[1].transaction.from, first_sender);
+    assert_eq!(selected[1].transaction.nonce, Nonce(0));
+    assert_eq!(selected[2].transaction.from, first_sender);
+    assert_eq!(selected[2].transaction.nonce, Nonce(1));
     assert_eq!(
-        selected[2].payload.fee,
+        selected[2].transaction.fee,
         Amount(crate::runtime::params::AGGRESSIVE_FEE)
     );
 }

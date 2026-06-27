@@ -17,6 +17,7 @@ pub enum NodeError {
     Storage(StorageError),
     MiningExhausted,
     MissingGenesisState,
+    CheckpointMismatch,
     ReorgRequired,
 }
 
@@ -32,6 +33,9 @@ impl fmt::Display for NodeError {
             NodeError::MiningExhausted => f.write_str("mining attempt budget was exhausted"),
             NodeError::MissingGenesisState => {
                 f.write_str("node cannot reorg without a genesis state snapshot")
+            }
+            NodeError::CheckpointMismatch => {
+                f.write_str("block does not match hardcoded checkpoint")
             }
             NodeError::ReorgRequired => f.write_str("fork choice selected a non-linear best tip"),
         }
@@ -49,6 +53,7 @@ impl Error for NodeError {
             NodeError::Storage(error) => Some(error),
             NodeError::MiningExhausted => None,
             NodeError::MissingGenesisState => None,
+            NodeError::CheckpointMismatch => None,
             NodeError::ReorgRequired => None,
         }
     }

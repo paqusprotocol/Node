@@ -172,6 +172,19 @@ impl Storage {
         Ok(())
     }
 
+    pub fn save_side_block(&self, block: &Block) -> Result<(), StorageError> {
+        let bytes = encode(block)?;
+        let mut txn = self.env.begin_rw_txn()?;
+        txn.put(
+            self.blocks_by_hash,
+            &block.hash().0,
+            &bytes,
+            WriteFlags::empty(),
+        )?;
+        txn.commit()?;
+        Ok(())
+    }
+
     fn index_block_transactions(
         &self,
         txn: &mut lmdb::RwTransaction<'_>,
@@ -201,7 +214,7 @@ impl Storage {
                 txn,
                 self.address_tx_index,
                 &address_tx_key(
-                    &transaction.payload.from,
+                    &transaction.transaction.from,
                     block.height(),
                     tx_index_u32,
                     true,
@@ -209,7 +222,7 @@ impl Storage {
                 &sent_location,
             )?;
 
-            if transaction.payload.to != transaction.payload.from {
+            if transaction.transaction.to != transaction.transaction.from {
                 let received_location = AddressTransactionLocation {
                     sent: false,
                     ..sent_location
@@ -217,7 +230,12 @@ impl Storage {
                 put_value(
                     txn,
                     self.address_tx_index,
-                    &address_tx_key(&transaction.payload.to, block.height(), tx_index_u32, false),
+                    &address_tx_key(
+                        &transaction.transaction.to,
+                        block.height(),
+                        tx_index_u32,
+                        false,
+                    ),
                     &received_location,
                 )?;
             }
@@ -254,6 +272,17 @@ impl Storage {
                 Ok(block)
             })
             .transpose()
+    }
+
+    pub fn load_blocks_by_hash(&self) -> Result<Vec<Block>, StorageError> {
+        let txn = self.env.begin_ro_txn()?;
+        let mut cursor = txn.open_ro_cursor(self.blocks_by_hash)?;
+        let mut blocks = Vec::new();
+        for (_key, bytes) in cursor.iter() {
+            let block: Block = decode(bytes)?;
+            blocks.push(block);
+        }
+        Ok(blocks)
     }
 
     pub fn load_transaction_location(
@@ -416,22 +445,60 @@ impl Storage {
     }
 
     pub fn save_ledger(&self, ledger: &Ledger) -> Result<(), StorageError> {
+        let mut txn = self.env.begin_rw_txn()?;
+        txn.clear_db(self.blocks_by_height)?;
+        txn.clear_db(self.accounts)?;
+        txn.clear_db(self.state_snapshots)?;
+        txn.clear_db(self.tx_index)?;
+        txn.clear_db(self.address_tx_index)?;
+
         for account in ledger.accounts.values() {
-            self.save_account(account)?;
+            put_value(&mut txn, self.accounts, &account.address.0, account)?;
         }
 
         for block in ledger.chain.blocks.values() {
-            self.save_block(block)?;
+            let bytes = encode(block)?;
+            txn.put(
+                self.blocks_by_height,
+                &height_key(block.height()),
+                &bytes,
+                WriteFlags::empty(),
+            )?;
+            txn.put(
+                self.blocks_by_hash,
+                &block.hash().0,
+                &bytes,
+                WriteFlags::empty(),
+            )?;
+            self.index_block_transactions(&mut txn, block)?;
         }
 
         if let (Some(height), Some(hash)) = (ledger.tip_height(), ledger.tip_hash()) {
-            self.save_tip(height, &hash)?;
-            self.save_state_snapshot(ledger)?;
+            put_value(&mut txn, self.meta, TIP_HEIGHT_KEY, &height)?;
+            txn.put(self.meta, &TIP_HASH_KEY, &hash.0, WriteFlags::empty())?;
+            let snapshot = StateSnapshot {
+                height,
+                block_hash: hash,
+                state_root: ledger.state_root().into(),
+                accounts: ledger.accounts.clone(),
+            };
+            put_value(
+                &mut txn,
+                self.state_snapshots,
+                &height_key(height),
+                &snapshot,
+            )?;
             if height.0 == 0 {
-                self.save_genesis_accounts(&ledger.accounts)?;
+                put_value(
+                    &mut txn,
+                    self.genesis_accounts,
+                    b"accounts",
+                    &ledger.accounts,
+                )?;
             }
         }
 
+        txn.commit()?;
         self.flush()?;
         Ok(())
     }

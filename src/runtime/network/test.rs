@@ -12,6 +12,7 @@ use paqus::ledger::Ledger;
 use paqus::transaction::{SignedTransaction, Transaction};
 use paqus::types::{Address, Amount, Hash, Height, Nonce};
 use std::io::{Cursor, Read, Write};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 fn address(byte: u8) -> Address {
     Address([byte; 20])
@@ -221,7 +222,7 @@ fn handler_returns_blocks_by_height_and_hash() {
 fn handler_submits_transaction_to_node_mempool() {
     let transaction = signed_transaction_to(address(2), 10, 0);
     let hash = transaction.hash();
-    let sender = transaction.payload.from;
+    let sender = transaction.transaction.from;
     let mut ledger = Ledger::new();
     ledger.create_account(sender, Amount(25)).unwrap();
     ledger.create_account(address(2), Amount(0)).unwrap();
@@ -281,9 +282,23 @@ fn test_node_with_genesis() -> Node {
 fn signed_transaction_to(to: Address, amount: u32, nonce: u64) -> SignedTransaction {
     let keypair = generate_keypair();
     let from = address_from_public_key(&keypair.public_key);
-    let payload = Transaction::new(from, to, Amount(amount), Amount(BASE_FEE), Nonce(nonce));
+    let payload = Transaction::new_at(
+        from,
+        to,
+        Amount(amount),
+        Amount(BASE_FEE),
+        Nonce(nonce),
+        current_unix_timestamp(),
+    );
     let signature = sign(&keypair.secret_key, &payload.signing_bytes());
     SignedTransaction::new(payload, keypair.public_key, signature)
+}
+
+fn current_unix_timestamp() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_secs())
+        .unwrap_or(0)
 }
 
 impl MemoryStream {

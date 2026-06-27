@@ -27,10 +27,11 @@ use paquscore::{
     write_message,
 };
 use paquscore::{
-    BLOCK_REWARD_MATURITY, BLOCK_TIME, CHAIN_ID, CHAIN_NAME, COIN_NAME,
+    BLOCK_REWARD_MATURITY, BLOCK_TIME, CHAIN_ID, CHAIN_NAME, COIN_NAME, CONFIRMATION_DEPTH,
     DIFFICULTY_ADJUSTMENT_INTERVAL, DIFFICULTY_START, FINALITY_DEPTH, MAX_BLOCK_TXS, MIN_FEE,
     NETWORK_MAGIC, PROTOCOL_STAGE, PROTOCOL_VERSION, STORAGE_VERSION,
 };
+use runtime::miner::{MiningConfig, mine_prepared_block, prepare_candidate_block};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::env;
@@ -319,6 +320,9 @@ fn wallet_command(args: &[String]) -> Result<(), String> {
                     .map_err(|error| format!("failed to write wallet file `{path}`: {error}"))?;
                 println!("Wallet successfully saved to `{path}`");
                 println!("address: {address_str}");
+                if show_secret {
+                    println!("secret_key: {secret_key_hex}");
+                }
             } else {
                 println!("address: {address_str}");
                 println!("public_key: {public_key_hex}");
@@ -387,6 +391,48 @@ fn wallet_pay_command(args: &[String]) -> Result<(), String> {
 }
 
 fn wallet_send_command(args: &[String]) -> Result<(), String> {
+    let short_form = args.len() >= 2 && !args[0].starts_with('-') && !args[1].starts_with('-');
+    if short_form {
+        let to = parse_address(args.first())?;
+        let amount = parse_amount(args.get(1), "amount")?;
+        let mut wallet_path = "wallet.json".to_string();
+        let mut rpc_addr = DEFAULT_RPC_ADDR.to_string();
+        let mut fee = Amount(MIN_FEE);
+        let mut nonce = None;
+        let mut index = 2;
+
+        while index < args.len() {
+            match args[index].as_str() {
+                "--wallet" => {
+                    index += 1;
+                    wallet_path = args
+                        .get(index)
+                        .ok_or_else(|| "missing value for --wallet".to_string())?
+                        .clone();
+                }
+                "--rpc" | "--rpc-addr" => {
+                    index += 1;
+                    rpc_addr = args
+                        .get(index)
+                        .ok_or_else(|| "missing value for --rpc".to_string())?
+                        .clone();
+                }
+                "--fee" => {
+                    index += 1;
+                    fee = parse_amount(args.get(index), "--fee")?;
+                }
+                "--nonce" => {
+                    index += 1;
+                    nonce = Some(parse_nonce(args.get(index))?);
+                }
+                value => return Err(format!("unknown wallet send option `{value}`")),
+            }
+            index += 1;
+        }
+
+        return submit_wallet_payment(&wallet_path, to, amount, fee, nonce, &rpc_addr);
+    }
+
     let mut wallet_path = None;
     let mut to = None;
     let mut amount = None;
@@ -459,7 +505,8 @@ fn submit_wallet_transaction(
 ) -> Result<(), String> {
     let wallet = load_wallet(wallet_path)?;
     let nonce = nonce.unwrap_or(resolve_wallet_nonce(&wallet.address, rpc_addr)?);
-    let transaction = Transaction::new(wallet.address, to, amount, fee, nonce);
+    let transaction =
+        Transaction::new_at(wallet.address, to, amount, fee, nonce, unix_timestamp()?);
     let signed = wallet
         .sign_transaction(transaction)
         .map_err(|error| format!("failed to sign transaction: {error}"))?;
@@ -471,14 +518,15 @@ fn submit_wallet_transaction(
         println!("{response}");
     } else {
         println!(
-            "{{\"tx\":\"{}\",\"hash\":\"{}\",\"from\":\"{}\",\"to\":\"{}\",\"amount\":{},\"fee\":{},\"nonce\":{}}}",
+            "{{\"tx\":\"{}\",\"hash\":\"{}\",\"from\":\"{}\",\"to\":\"{}\",\"amount\":{},\"fee\":{},\"nonce\":{},\"timestamp\":{}}}",
             tx_hex,
             hex::encode(signed.hash().0),
-            address_to_string(&signed.payload.from),
-            address_to_string(&signed.payload.to),
-            signed.payload.amount.0,
-            signed.payload.fee.0,
-            signed.payload.nonce.0
+            address_to_string(&signed.transaction.from),
+            address_to_string(&signed.transaction.to),
+            signed.transaction.amount.0,
+            signed.transaction.fee.0,
+            signed.transaction.nonce.0,
+            signed.transaction.timestamp
         );
     }
 
@@ -636,6 +684,7 @@ struct ChainResponse {
     stage: &'static str,
     protocol_version: u8,
     block_time_secs: u32,
+    confirmation_depth: u32,
     finality_depth: u32,
     difficulty_start: u32,
 }
@@ -922,13 +971,7 @@ impl NodeService {
 
             if self.config.mine && self.last_mine.elapsed() >= self.config.mine_interval {
                 self.set_activity(NodeActivity::Mining)?;
-                let block = {
-                    let mut node = self
-                        .node
-                        .lock()
-                        .map_err(|_| "node state lock poisoned".to_string())?;
-                    mine_once(&mut node, &self.config)?
-                };
+                let block = mine_once_unlocked(&self.node, &self.config)?;
                 if let Some(block) = block {
                     let height = block.height().0;
                     let hash = short_hash(Some(block.hash()));
@@ -1327,9 +1370,9 @@ fn inbound_message_log(message: &NetworkMessage, peer: SocketAddr) -> Option<Str
             "received tx:: |from::{}|hash::{}|amount::{}|fee::{}|nonce::{}|",
             peer,
             short_hash(Some(transaction.hash())),
-            transaction.payload.amount.0,
-            transaction.payload.fee.0,
-            transaction.payload.nonce.0
+            transaction.transaction.amount.0,
+            transaction.transaction.fee.0,
+            transaction.transaction.nonce.0
         )),
         _ => None,
     }
@@ -1431,6 +1474,7 @@ async fn rpc_chain() -> impl IntoResponse {
         stage: PROTOCOL_STAGE,
         protocol_version: PROTOCOL_VERSION,
         block_time_secs: BLOCK_TIME,
+        confirmation_depth: CONFIRMATION_DEPTH,
         finality_depth: FINALITY_DEPTH,
         difficulty_start: DIFFICULTY_START,
     })
@@ -1656,9 +1700,9 @@ async fn rpc_submit_tx(
     println!(
         "accepted tx:: |hash::{}|amount::{}|fee::{}|nonce::{}|",
         short_hash(Some(hash)),
-        transaction.payload.amount.0,
-        transaction.payload.fee.0,
-        transaction.payload.nonce.0
+        transaction.transaction.amount.0,
+        transaction.transaction.fee.0,
+        transaction.transaction.nonce.0
     );
     let report = broadcast_to_peers(&state.peers, NetworkMessage::Transaction(transaction));
     println!(
@@ -1737,11 +1781,11 @@ fn tx_response(
 ) -> TxResponse {
     TxResponse {
         hash: hex::encode(transaction.hash().0),
-        from: address_to_string(&transaction.payload.from),
-        to: address_to_string(&transaction.payload.to),
-        amount: transaction.payload.amount.0,
-        fee: transaction.payload.fee.0,
-        nonce: transaction.payload.nonce.0,
+        from: address_to_string(&transaction.transaction.from),
+        to: address_to_string(&transaction.transaction.to),
+        amount: transaction.transaction.amount.0,
+        fee: transaction.transaction.fee.0,
+        nonce: transaction.transaction.nonce.0,
         block_height: block_height.map(|height| height.0),
         block_hash: block_hash.map(|hash| hex::encode(hash.0)),
         status,
@@ -1790,7 +1834,7 @@ fn address_transactions(node: &Node, address: &Address) -> Result<Vec<TxResponse
             continue;
         };
         for transaction in &block.transactions {
-            if transaction.payload.from == *address || transaction.payload.to == *address {
+            if transaction.transaction.from == *address || transaction.transaction.to == *address {
                 transactions.push(tx_response(
                     transaction,
                     Some(block.height()),
@@ -1802,7 +1846,7 @@ fn address_transactions(node: &Node, address: &Address) -> Result<Vec<TxResponse
     }
 
     for transaction in node.mempool.transactions() {
-        if transaction.payload.from == *address || transaction.payload.to == *address {
+        if transaction.transaction.from == *address || transaction.transaction.to == *address {
             transactions.push(tx_response(transaction, None, None, "pending"));
         }
     }
@@ -1887,8 +1931,9 @@ fn print_core_startup_info() {
         hex::encode(NETWORK_MAGIC)
     );
     println!(
-        "consensus: block_time::{}s|finality::{}|reward_maturity::{}|difficulty_start::{}|retarget_window::{}",
+        "consensus: block_time::{}s|confirmation::{}|finality::{}|reward_maturity::{}|difficulty_start::{}|retarget_window::{}",
         BLOCK_TIME,
+        CONFIRMATION_DEPTH,
         FINALITY_DEPTH,
         BLOCK_REWARD_MATURITY,
         DIFFICULTY_START,
@@ -2126,36 +2171,72 @@ fn parse_socket(value: Option<&String>, flag: &str) -> Result<SocketAddr, String
         .map_err(|error| format!("invalid socket address for {flag}: {error}"))
 }
 
-fn mine_once(node: &mut Node, _config: &RunConfig) -> Result<Option<Block>, String> {
+fn mine_once_unlocked(
+    node_state: &Arc<Mutex<Node>>,
+    config: &RunConfig,
+) -> Result<Option<Block>, String> {
     let timestamp = unix_timestamp()?;
-    match node.mine_block(
-        _config.miner_address,
-        timestamp,
-        _config.mine_attempts,
-        MAX_BLOCK_TXS,
-    ) {
-        Ok(result) => {
-            node.flush_to_storage()
-                .map_err(|error| format!("failed to flush mined block: {error}"))?;
-            println!(
-                "mined:: |height::{}|hash::{}|difficulty::{}|txs::{}|attempts::{}|",
-                result.block.height().0,
-                short_hash(Some(result.block.hash())),
-                result.block.difficulty(),
-                result.block.transactions.len(),
-                result.attempts
-            );
-            Ok(Some(result.block))
+    let (candidate, consensus, mining_config) = {
+        let mut node = node_state
+            .lock()
+            .map_err(|_| "node state lock poisoned".to_string())?;
+        node.mempool.prune_expired(timestamp);
+        let difficulty = node.next_difficulty().map_err(|error| error.to_string())?;
+        let candidate = prepare_candidate_block(
+            &node.mempool,
+            &node.ledger,
+            config.miner_address,
+            timestamp,
+            MAX_BLOCK_TXS,
+            difficulty,
+        )
+        .map_err(|error| format!("failed to prepare mining candidate: {error}"))?;
+        (
+            candidate,
+            node.consensus,
+            MiningConfig {
+                difficulty,
+                max_attempts: config.mine_attempts,
+                transaction_limit: MAX_BLOCK_TXS,
+            },
+        )
+    };
+
+    let parent_hash = BlockHash::from(candidate.previous_hash().as_hash());
+    let Some(result) = mine_prepared_block(candidate, &consensus, mining_config)
+        .map_err(|error| format!("mining failed: {error}"))?
+    else {
+        let node = node_state
+            .lock()
+            .map_err(|_| "node state lock poisoned".to_string())?;
+        if node.mempool.is_empty() {
+            println!("mining waiting:: |reason::empty_mempool|");
+        } else {
+            eprintln!("mining skipped: exhausted attempts");
         }
-        Err(error) => {
-            if node.mempool.is_empty() {
-                println!("mining waiting:: |reason::empty_mempool|");
-            } else {
-                eprintln!("mining skipped: {error}");
-            }
-            Ok(None)
-        }
+        return Ok(None);
+    };
+
+    let mut node = node_state
+        .lock()
+        .map_err(|_| "node state lock poisoned".to_string())?;
+    if node.tip_hash() != Some(parent_hash) {
+        println!("mining discarded:: |reason::tip_changed|");
+        return Ok(None);
     }
+    node.apply_block(result.block.clone())
+        .map_err(|error| format!("failed to apply mined block: {error}"))?;
+    node.flush_to_storage()
+        .map_err(|error| format!("failed to flush mined block: {error}"))?;
+    println!(
+        "mined:: |height::{}|hash::{}|difficulty::{}|txs::{}|attempts::{}|",
+        result.block.height().0,
+        short_hash(Some(result.block.hash())),
+        result.block.difficulty(),
+        result.block.transactions.len(),
+        result.attempts
+    );
+    Ok(Some(result.block))
 }
 
 fn parse_secret_key(value: Option<&String>) -> Result<SecretKey, String> {
@@ -2267,10 +2348,11 @@ Usage:
   paqus node config [config-path]
   paqus node init [db-path] [miner-address-hex]
   paqus node run [db-path] [--config path] [--listen addr] [--rpc-listen addr] [--peer addr] [--peers-file path] [--gateway host:port] [--public-addr host:port] [--wallet path] [--miner address-hex] [--miner-secret-key key-hex] [--mine]
-  paqus wallet new [--show-secret]
+  paqus wallet new [wallet-path] [--show-secret]
   paqus wallet address <secret-key-hex>
   paqus wallet balance <address-hex> [db-path]
   paqus wallet pay <address-hex> <amount> [--wallet path] [--fee units] [--rpc addr]
+  paqus wallet send <address-hex> <amount> [--wallet path] [--nonce n] [--fee units] [--rpc addr]
   paqus wallet send --wallet path --to address-hex --amount units [--nonce n] [--fee units] [--submit] [--rpc addr]
 
 RPC:
@@ -2313,6 +2395,7 @@ fn print_network_info() {
     println!("stage: {PROTOCOL_STAGE}");
     println!("protocol_version: {PROTOCOL_VERSION}");
     println!("block_time_secs: {BLOCK_TIME}");
+    println!("confirmation_depth: {CONFIRMATION_DEPTH}");
     println!("finality_depth: {FINALITY_DEPTH}");
     println!("difficulty_start: {DIFFICULTY_START}");
 }

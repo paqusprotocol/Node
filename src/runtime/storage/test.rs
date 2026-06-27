@@ -46,12 +46,39 @@ fn stores_and_loads_blocks_by_height_and_hash() {
 }
 
 #[test]
+fn side_blocks_do_not_overwrite_canonical_height_index() {
+    let storage = Storage::temporary().unwrap();
+    let genesis = block(0, Hash([0; 64]));
+    let canonical = block(1, genesis.hash().into());
+    let side = Block::with_difficulty(
+        Height(1),
+        genesis.hash(),
+        address(8),
+        1,
+        1_700_000_101,
+        Nonce(7),
+        vec![],
+    );
+    let side_hash = side.hash();
+
+    storage.save_block(&genesis).unwrap();
+    storage.save_block(&canonical).unwrap();
+    storage.save_side_block(&side).unwrap();
+
+    assert_eq!(
+        storage.load_block_by_height(Height(1)).unwrap(),
+        Some(canonical)
+    );
+    assert_eq!(storage.load_block_by_hash(&side_hash).unwrap(), Some(side));
+}
+
+#[test]
 fn indexes_transactions_by_hash_and_address() {
     let storage = Storage::temporary().unwrap();
     let transaction = signed_transaction(address(2), 10, 0);
     let tx_hash = transaction.hash();
-    let sender = transaction.payload.from;
-    let receiver = transaction.payload.to;
+    let sender = transaction.transaction.from;
+    let receiver = transaction.transaction.to;
     let block = Block::with_difficulty(
         Height(1),
         Hash([0; 64]),
@@ -82,6 +109,55 @@ fn indexes_transactions_by_hash_and_address() {
     assert_eq!(received.len(), 1);
     assert_eq!(received[0].tx_hash, tx_hash);
     assert!(!received[0].sent);
+}
+
+#[test]
+fn save_ledger_rebuilds_canonical_transaction_indexes() {
+    let storage = Storage::temporary().unwrap();
+    let genesis = block(0, Hash([0; 64]));
+    let old_transaction = signed_transaction(address(2), 10, 0);
+    let old_hash = old_transaction.hash();
+    let old_block = Block::with_difficulty(
+        Height(1),
+        genesis.hash(),
+        address(9),
+        1,
+        1_700_000_001,
+        Nonce(1),
+        vec![old_transaction],
+    );
+    let new_transaction = signed_transaction(address(3), 11, 0);
+    let new_hash = new_transaction.hash();
+    let new_block = Block::with_difficulty(
+        Height(1),
+        genesis.hash(),
+        address(8),
+        1,
+        1_700_000_002,
+        Nonce(2),
+        vec![new_transaction.clone()],
+    );
+
+    let mut old_ledger = Ledger::new();
+    old_ledger.chain.insert_block(genesis.clone()).unwrap();
+    old_ledger.chain.insert_block(old_block).unwrap();
+    storage.save_ledger(&old_ledger).unwrap();
+    assert!(storage.load_transaction(&old_hash).unwrap().is_some());
+
+    let mut new_ledger = Ledger::new();
+    new_ledger.chain.insert_block(genesis).unwrap();
+    new_ledger.chain.insert_block(new_block.clone()).unwrap();
+    storage.save_ledger(&new_ledger).unwrap();
+
+    assert!(storage.load_transaction(&old_hash).unwrap().is_none());
+    let (location, loaded) = storage.load_transaction(&new_hash).unwrap().unwrap();
+    assert_eq!(location.block_height, Height(1));
+    assert_eq!(location.block_hash, new_block.hash());
+    assert_eq!(loaded, new_transaction);
+    assert_eq!(
+        storage.load_block_by_height(Height(1)).unwrap(),
+        Some(new_block)
+    );
 }
 
 #[test]
