@@ -592,4 +592,42 @@ mod tests {
         assert_eq!(block.coinbase.as_ref().unwrap().subsidy, Amount(50));
         assert_eq!(ledger.apply_block(block), Ok(()));
     }
+
+    #[test]
+    fn candidate_block_uses_zero_subsidy_after_mined_supply_is_exhausted() {
+        let keypair = generate_keypair();
+        let from = address_from_public_key(&keypair.public_key);
+        let to = address(2);
+        let miner = address(9);
+        let mut ledger = Ledger::new();
+        ledger
+            .create_account(from, Amount(paqus::params::MAX_UNIT_SUPPLY))
+            .unwrap();
+        ledger.create_account(to, Amount(0)).unwrap();
+        ledger.create_account(miner, Amount(0)).unwrap();
+        ledger
+            .apply_block(Block::new(
+                Height(0),
+                Hash([0; 64]),
+                miner,
+                1_700_000_000,
+                Nonce(0),
+                vec![],
+            ))
+            .unwrap();
+
+        let mut mempool = Mempool::new();
+        let transaction =
+            signed_transaction_from(&keypair.secret_key, keypair.public_key, to, 1, 0);
+        mempool.insert_validated(&ledger, transaction).unwrap();
+
+        let block = mempool
+            .create_candidate_block(&ledger, miner, 1_700_000_001, Nonce(0), 10)
+            .unwrap();
+        let coinbase = block.coinbase.as_ref().unwrap();
+
+        assert_eq!(coinbase.subsidy, Amount(0));
+        assert_eq!(coinbase.fees, Amount(crate::runtime::params::BASE_FEE));
+        assert_eq!(ledger.apply_block(block), Ok(()));
+    }
 }

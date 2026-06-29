@@ -4,6 +4,7 @@ use borsh::{BorshDeserialize, BorshSerialize};
 use lmdb::{Cursor, Database, DatabaseFlags, Environment, Transaction, WriteFlags};
 use paqus::block::Block;
 use paqus::ledger::{Ledger, calculate_state_root};
+use paqus::snapshot::is_snapshot_height;
 use paqus::state::Account;
 use paqus::transaction::SignedTransaction;
 use paqus::types::{Address, BlockHash, BlockHeight, Hash, Height, TransactionHash};
@@ -377,6 +378,11 @@ impl Storage {
         let (Some(height), Some(block_hash)) = (ledger.tip_height(), ledger.tip_hash()) else {
             return Ok(());
         };
+        if height.0 != 0 && !is_snapshot_height(height) {
+            return Err(StorageError::Integrity(
+                "state snapshot height is not a protocol snapshot height",
+            ));
+        }
         let snapshot = StateSnapshot {
             height,
             block_hash,
@@ -476,18 +482,20 @@ impl Storage {
         if let (Some(height), Some(hash)) = (ledger.tip_height(), ledger.tip_hash()) {
             put_value(&mut txn, self.meta, TIP_HEIGHT_KEY, &height)?;
             txn.put(self.meta, &TIP_HASH_KEY, &hash.0, WriteFlags::empty())?;
-            let snapshot = StateSnapshot {
-                height,
-                block_hash: hash,
-                state_root: ledger.state_root().into(),
-                accounts: ledger.accounts.clone(),
-            };
-            put_value(
-                &mut txn,
-                self.state_snapshots,
-                &height_key(height),
-                &snapshot,
-            )?;
+            if height.0 == 0 || is_snapshot_height(height) {
+                let snapshot = StateSnapshot {
+                    height,
+                    block_hash: hash,
+                    state_root: ledger.state_root().into(),
+                    accounts: ledger.accounts.clone(),
+                };
+                put_value(
+                    &mut txn,
+                    self.state_snapshots,
+                    &height_key(height),
+                    &snapshot,
+                )?;
+            }
             if height.0 == 0 {
                 put_value(
                     &mut txn,

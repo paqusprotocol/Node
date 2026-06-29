@@ -167,6 +167,21 @@ fn save_ledger_rebuilds_canonical_transaction_indexes() {
 }
 
 #[test]
+fn save_ledger_skips_state_snapshot_at_non_protocol_snapshot_height() {
+    let storage = Storage::temporary().unwrap();
+    let genesis = block(0, Hash([0; 64]));
+    let next = block(1, genesis.hash().into());
+    let mut ledger = Ledger::new();
+    ledger.chain.insert_block(genesis).unwrap();
+    ledger.chain.insert_block(next.clone()).unwrap();
+
+    storage.save_ledger(&ledger).unwrap();
+
+    assert_eq!(storage.load_tip().unwrap(), Some((Height(1), next.hash())));
+    assert!(storage.load_state_snapshot(Height(1)).unwrap().is_none());
+}
+
+#[test]
 fn initializes_storage_version_for_empty_database() {
     let storage = Storage::temporary().unwrap();
 
@@ -242,7 +257,7 @@ fn rejects_block_loaded_from_wrong_hash_key() {
 #[test]
 fn stores_and_loads_accounts() {
     let storage = Storage::temporary().unwrap();
-    let account = Account::with_nonce(address(1), Amount(25), Nonce(7));
+    let account = Account::trusted_with_nonce(address(1), Amount(25), Nonce(7));
 
     storage.save_account(&account).unwrap();
 
@@ -389,6 +404,24 @@ fn stores_and_loads_state_snapshot() {
     assert!(
         snapshot.verify_against_block(&storage.load_block_by_height(Height(0)).unwrap().unwrap())
     );
+}
+
+#[test]
+fn rejects_state_snapshot_at_non_protocol_snapshot_height() {
+    let storage = Storage::temporary().unwrap();
+    let mut ledger = Ledger::new();
+    let genesis = block(0, Hash([0; 64]));
+    let next = block(1, genesis.hash().into());
+
+    ledger.chain.insert_block(genesis).unwrap();
+    ledger.chain.insert_block(next).unwrap();
+
+    assert!(matches!(
+        storage.save_state_snapshot(&ledger),
+        Err(StorageError::Integrity(
+            "state snapshot height is not a protocol snapshot height"
+        ))
+    ));
 }
 
 #[test]
