@@ -72,6 +72,11 @@ impl PeerConnection {
         Ok(Self { addr, stream })
     }
 
+    pub fn from_stream(addr: SocketAddr, stream: TcpStream) -> Result<Self, String> {
+        configure_stream(&stream, PERSISTENT_PEER_TIMEOUT)?;
+        Ok(Self { addr, stream })
+    }
+
     pub fn addr(&self) -> SocketAddr {
         self.addr
     }
@@ -136,16 +141,21 @@ pub fn dedupe_peers(peers: &mut Vec<SocketAddr>) {
     peers.retain(|peer| seen.insert(*peer));
 }
 
-pub fn poll_peer(peer: SocketAddr, node: &Arc<Mutex<Node>>) -> Result<PeerPoll, String> {
+pub fn poll_peer(
+    peer: SocketAddr,
+    node: &Arc<Mutex<Node>>,
+    public_addrs: &[SocketAddr],
+) -> Result<PeerPoll, String> {
     let mut peer = PeerConnection::connect(peer)?;
-    poll_peer_connection(&mut peer, node)
+    poll_peer_connection(&mut peer, node, public_addrs)
 }
 
 pub fn poll_peer_connection(
     peer: &mut PeerConnection,
     node: &Arc<Mutex<Node>>,
+    public_addrs: &[SocketAddr],
 ) -> Result<PeerPoll, String> {
-    handshake_peer(peer, node)?;
+    handshake_peer(peer, node, public_addrs)?;
     let tip = request_tip(peer)?;
     let local_height = node
         .lock()
@@ -176,7 +186,11 @@ pub fn request_peers_connection(peer: &mut PeerConnection) -> Result<Vec<PeerInf
     }
 }
 
-fn handshake_peer(peer: &mut PeerConnection, node: &Arc<Mutex<Node>>) -> Result<(), String> {
+fn handshake_peer(
+    peer: &mut PeerConnection,
+    node: &Arc<Mutex<Node>>,
+    public_addrs: &[SocketAddr],
+) -> Result<(), String> {
     let tip = {
         let node = node
             .lock()
@@ -187,9 +201,22 @@ fn handshake_peer(peer: &mut PeerConnection, node: &Arc<Mutex<Node>>) -> Result<
     };
     let version = VersionInfo::local(tip);
     match peer.request(NetworkMessage::Version(version))? {
-        NetworkMessage::VerAck(remote) => remote
-            .validate_compatibility()
-            .map_err(|reason| format!("peer returned incompatible version: {reason:?}")),
+        NetworkMessage::VerAck(remote) => {
+            remote
+                .validate_compatibility()
+                .map_err(|reason| format!("peer returned incompatible version: {reason:?}"))?;
+            if !public_addrs.is_empty() {
+                peer.send(NetworkMessage::Peers(
+                    public_addrs
+                        .iter()
+                        .map(|addr| PeerInfo {
+                            address: addr.to_string(),
+                        })
+                        .collect(),
+                ))?;
+            }
+            Ok(())
+        }
         NetworkMessage::Reject { reason, message } => {
             Err(format!("peer rejected handshake: {reason:?}: {message}"))
         }

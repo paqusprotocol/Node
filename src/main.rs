@@ -684,6 +684,7 @@ struct RpcState {
     node: Arc<Mutex<Node>>,
     peers: Arc<Mutex<HashMap<SocketAddr, PeerState>>>,
     peer_connections: Arc<Mutex<HashMap<SocketAddr, PeerConnection>>>,
+    inbound_connections: Arc<Mutex<HashMap<SocketAddr, PeerConnection>>>,
     mining: bool,
     log_counters: Arc<LogCounters>,
 }
@@ -702,6 +703,9 @@ struct StatusResponse {
     height: u64,
     tip_hash: String,
     peers: usize,
+    known_peers: usize,
+    outbound_peers: usize,
+    inbound_peers: usize,
     mining: bool,
 }
 
@@ -889,6 +893,7 @@ struct NodeService {
     listeners: Vec<TcpListener>,
     peers: Arc<Mutex<HashMap<SocketAddr, PeerState>>>,
     peer_connections: Arc<Mutex<HashMap<SocketAddr, PeerConnection>>>,
+    inbound_connections: Arc<Mutex<HashMap<SocketAddr, PeerConnection>>>,
     log_counters: Arc<LogCounters>,
     requires_peer_sync_before_mining: bool,
     last_mine: Instant,
@@ -932,6 +937,7 @@ impl NodeService {
             listeners,
             peers: Arc::new(Mutex::new(peers)),
             peer_connections: Arc::new(Mutex::new(HashMap::new())),
+            inbound_connections: Arc::new(Mutex::new(HashMap::new())),
             log_counters,
             requires_peer_sync_before_mining,
             last_mine: Instant::now(),
@@ -993,7 +999,7 @@ impl NodeService {
         }
 
         for peer in peers {
-            let result = poll_peer(peer, &self.node);
+            let result = poll_peer(peer, &self.node, &self.config.public_addrs);
             match result {
                 Ok(PeerPoll::Idle { remote_tip }) | Ok(PeerPoll::Synced { remote_tip }) => {
                     if let Ok(mut peers) = self.peers.lock() {
@@ -1075,12 +1081,24 @@ impl NodeService {
                     .lock()
                     .map_err(|_| "peer state lock poisoned".to_string())?
                     .len();
+                let outbound_count = self
+                    .peer_connections
+                    .lock()
+                    .map_err(|_| "peer connection lock poisoned".to_string())?
+                    .len();
+                let inbound_count = self
+                    .inbound_connections
+                    .lock()
+                    .map_err(|_| "inbound connection lock poisoned".to_string())?
+                    .len();
                 println!(
-                    "status: |height::{}|tip::{}|difficulty::{}|peers::{}|mining::{}|accepted_tx::{}|broadcast_tx::{}|",
+                    "status: |height::{}|tip::{}|difficulty::{}|known_peers::{}|outbound_peers::{}|inbound_peers::{}|mining::{}|accepted_tx::{}|broadcast_tx::{}|",
                     node.tip_height().unwrap_or(Height(0)).0,
                     short_hash(node.tip_hash()),
                     format_difficulty(node.next_difficulty()),
                     peer_count,
+                    outbound_count,
+                    inbound_count,
                     self.config.mine,
                     self.log_counters.accepted_tx_total.load(Ordering::Relaxed),
                     self.log_counters.broadcast_tx_total.load(Ordering::Relaxed)
@@ -1229,10 +1247,28 @@ impl NodeService {
                         println!("p2p inbound:: |peer::{}|event::accepted|", peer);
                         let node = self.node.clone();
                         let peers = self.peers.clone();
+                        let inbound_connections = self.inbound_connections.clone();
                         let public_addrs = self.config.public_addrs.clone();
                         let listen_addrs = self.config.listen_addrs.clone();
                         let max_peers = self.config.max_peers;
                         let peers_file = self.config.peers_file.clone();
+                        if let Ok(mut inbound) = inbound_connections.lock() {
+                            match stream.try_clone() {
+                                Ok(writer) => match PeerConnection::from_stream(peer, writer) {
+                                    Ok(connection) => {
+                                        inbound.insert(peer, connection);
+                                    }
+                                    Err(error) => {
+                                        eprintln!(
+                                            "p2p inbound {peer} writer setup failed: {error}"
+                                        );
+                                    }
+                                },
+                                Err(error) => {
+                                    eprintln!("p2p inbound {peer} clone failed: {error}");
+                                }
+                            }
+                        }
                         thread::Builder::new()
                             .name(format!("paqus-p2p-{peer}"))
                             .spawn(move || {
@@ -1247,6 +1283,9 @@ impl NodeService {
                                     peers_file,
                                 ) {
                                     eprintln!("p2p inbound {peer} failed: {error}");
+                                }
+                                if let Ok(mut inbound) = inbound_connections.lock() {
+                                    inbound.remove(&peer);
                                 }
                             })
                             .map_err(|error| format!("failed to spawn p2p handler: {error}"))?;
@@ -1401,7 +1440,7 @@ impl NodeService {
         let connection = connections
             .get_mut(&peer)
             .ok_or_else(|| format!("missing peer connection for {peer}"))?;
-        poll_peer_connection(connection, &self.node)
+        poll_peer_connection(connection, &self.node, &self.config.public_addrs)
     }
 
     fn add_peer_infos(&mut self, peers: Vec<PeerInfo>) -> bool {
@@ -1573,6 +1612,7 @@ impl NodeService {
             sent: 0,
             failed: 0,
         };
+        let known_peers = peers.iter().copied().collect::<HashSet<_>>();
         for peer in peers {
             let result = {
                 let mut connections = match self.peer_connections.lock() {
@@ -1609,6 +1649,43 @@ impl NodeService {
                         connections.remove(&peer);
                     }
                     eprintln!("broadcast to {peer} failed: {error}");
+                }
+            }
+        }
+        let inbound_peers = match self.inbound_connections.lock() {
+            Ok(connections) => connections.keys().copied().collect::<Vec<_>>(),
+            Err(_) => {
+                eprintln!("inbound connection lock poisoned");
+                Vec::new()
+            }
+        };
+        for peer in inbound_peers {
+            if known_peers.contains(&peer) {
+                continue;
+            }
+            report.attempted += 1;
+            let result = {
+                let mut connections = match self.inbound_connections.lock() {
+                    Ok(connections) => connections,
+                    Err(_) => {
+                        report.failed += 1;
+                        eprintln!("inbound connection lock poisoned");
+                        continue;
+                    }
+                };
+                connections
+                    .get_mut(&peer)
+                    .ok_or_else(|| format!("missing inbound connection for {peer}"))
+                    .and_then(|connection| connection.send(message.clone()))
+            };
+            match result {
+                Ok(()) => report.sent += 1,
+                Err(error) => {
+                    report.failed += 1;
+                    if let Ok(mut connections) = self.inbound_connections.lock() {
+                        connections.remove(&peer);
+                    }
+                    eprintln!("broadcast to inbound {peer} failed: {error}");
                 }
             }
         }
@@ -1721,14 +1798,22 @@ fn start_rpc_server(state: RpcState, addr: SocketAddr) -> Result<thread::JoinHan
 }
 
 async fn rpc_status(State(state): State<RpcState>) -> impl IntoResponse {
-    match (state.node.lock(), state.peers.lock()) {
-        (Ok(node), Ok(peers)) => Json(StatusResponse {
+    match (
+        state.node.lock(),
+        state.peers.lock(),
+        state.peer_connections.lock(),
+        state.inbound_connections.lock(),
+    ) {
+        (Ok(node), Ok(peers), Ok(outbound), Ok(inbound)) => Json(StatusResponse {
             chain: CHAIN_NAME,
             stage: PROTOCOL_STAGE,
             protocol_version: PROTOCOL_VERSION,
             height: node.tip_height().unwrap_or(Height(0)).0,
             tip_hash: format_hash(node.tip_hash()),
             peers: peers.len(),
+            known_peers: peers.len(),
+            outbound_peers: outbound.len(),
+            inbound_peers: inbound.len(),
             mining: state.mining,
         })
         .into_response(),
@@ -1977,6 +2062,7 @@ async fn rpc_submit_tx(
     let _report = broadcast_to_peers(
         &state.peers,
         &state.peer_connections,
+        &state.inbound_connections,
         NetworkMessage::Transaction(transaction),
     );
     state
@@ -2223,6 +2309,7 @@ fn run_node(args: &[String]) -> Result<(), String> {
         node,
         peers: service.peers.clone(),
         peer_connections: service.peer_connections.clone(),
+        inbound_connections: service.inbound_connections.clone(),
         mining: service.config.mine,
         log_counters,
     };

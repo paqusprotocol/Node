@@ -205,6 +205,11 @@ interfaces, and `[::]:5555` listens on all IPv6 interfaces. `--public-addr` is
 the reachable address that the node announces to peers, so it must use your
 public IPv4/IPv6 address or DNS name and the P2P port `5555`.
 
+After the P2P version handshake, nodes advertise their configured
+`--public-addr` values through peer exchange. A public bootstrap node can
+therefore learn and cache reachable peers that connect to it, then share those
+peers with later nodes through `GetPeers` without requiring `paqus-gateway`.
+
 Join with a manual peer:
 
 ```bash
@@ -294,6 +299,8 @@ Operators can tune the policy without changing consensus:
 
 ## RPC
 
+By default, keep RPC local:
+
 ```bash
 curl http://127.0.0.1:6666/health
 curl http://127.0.0.1:6666/status
@@ -308,6 +315,34 @@ curl http://127.0.0.1:6666/address/<address-hex>
 curl http://127.0.0.1:6666/accounts
 curl http://127.0.0.1:6666/mempool
 ```
+
+To expose RPC on IPv6 for a remote wallet, bind to all IPv6 interfaces:
+
+```bash
+paqus-node node run ./data/paqus --rpc-listen '[::]:6666'
+```
+
+Check that the node is listening publicly:
+
+```bash
+ss -ltnp | grep 6666
+```
+
+Expected output should show `*:6666` or `[::]:6666`.
+
+From another machine, use the server's real IPv6 address in brackets:
+
+```bash
+curl 'http://[2404:8000:1044:4d8:1202:b5ff:feb0:7020]:6666/health'
+```
+
+Then point `paqus-wallet` at the same endpoint:
+
+```bash
+PAQUS_RPC_ADDR='[2404:8000:1044:4d8:1202:b5ff:feb0:7020]:6666' cargo run
+```
+
+Keep public RPC access limited when possible.
 
 Submit signed transaction hex:
 

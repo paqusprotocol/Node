@@ -75,6 +75,7 @@ fn mark_seen<T: Copy + Eq + std::hash::Hash>(
 pub fn broadcast_to_peers(
     peers: &Arc<Mutex<HashMap<SocketAddr, PeerState>>>,
     peer_connections: &Arc<Mutex<HashMap<SocketAddr, PeerConnection>>>,
+    inbound_connections: &Arc<Mutex<HashMap<SocketAddr, PeerConnection>>>,
     message: NetworkMessage,
 ) -> BroadcastReport {
     let peers = match peers.lock() {
@@ -90,6 +91,10 @@ pub fn broadcast_to_peers(
         sent: 0,
         failed: 0,
     };
+    let known_peers = peers
+        .iter()
+        .copied()
+        .collect::<std::collections::HashSet<_>>();
     for peer in peers {
         let result = {
             let mut connections = match peer_connections.lock() {
@@ -127,6 +132,43 @@ pub fn broadcast_to_peers(
                     connections.remove(&peer);
                 }
                 eprintln!("broadcast to {peer} failed: {error}");
+            }
+        }
+    }
+    let inbound_peers = match inbound_connections.lock() {
+        Ok(connections) => connections.keys().copied().collect::<Vec<_>>(),
+        Err(_) => {
+            eprintln!("inbound connection lock poisoned");
+            Vec::new()
+        }
+    };
+    for peer in inbound_peers {
+        if known_peers.contains(&peer) {
+            continue;
+        }
+        report.attempted += 1;
+        let result = {
+            let mut connections = match inbound_connections.lock() {
+                Ok(connections) => connections,
+                Err(_) => {
+                    report.failed += 1;
+                    eprintln!("inbound connection lock poisoned");
+                    continue;
+                }
+            };
+            connections
+                .get_mut(&peer)
+                .ok_or_else(|| format!("missing inbound connection for {peer}"))
+                .and_then(|connection| connection.send(message.clone()))
+        };
+        match result {
+            Ok(()) => report.sent += 1,
+            Err(error) => {
+                report.failed += 1;
+                if let Ok(mut connections) = inbound_connections.lock() {
+                    connections.remove(&peer);
+                }
+                eprintln!("broadcast to inbound {peer} failed: {error}");
             }
         }
     }
