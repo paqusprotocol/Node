@@ -32,7 +32,8 @@ use paquscore::{
 use paquscore::{
     BLOCK_REWARD_MATURITY, BLOCK_TIME, CHAIN_ID, CHAIN_NAME, COIN_NAME, CONFIRMATION_DEPTH,
     DEFAULT_TRANSACTION_FEE, DIFFICULTY_ADJUSTMENT_INTERVAL, DIFFICULTY_START, FINALITY_DEPTH,
-    MAX_BLOCK_TXS, NETWORK_MAGIC, PROTOCOL_STAGE, PROTOCOL_VERSION, STORAGE_VERSION,
+    GENESIS_PREMINE, MAX_BLOCK_TXS, MAX_MINED_SUPPLY, MAX_UNIT_SUPPLY, NETWORK_MAGIC,
+    PROTOCOL_STAGE, PROTOCOL_VERSION, STORAGE_VERSION,
 };
 use runtime::mempool::MempoolConfig;
 use runtime::miner::{MiningConfig, mine_prepared_block, prepare_candidate_block};
@@ -687,12 +688,19 @@ struct RpcState {
     inbound_connections: Arc<Mutex<HashMap<SocketAddr, PeerConnection>>>,
     mining: bool,
     log_counters: Arc<LogCounters>,
+    mining_stats: Arc<MiningStats>,
 }
 
 #[derive(Default)]
 struct LogCounters {
     accepted_tx_total: AtomicU64,
     broadcast_tx_total: AtomicU64,
+}
+
+#[derive(Default)]
+struct MiningStats {
+    last_hashrate_hps: AtomicU64,
+    last_attempts: AtomicU64,
 }
 
 #[derive(Serialize)]
@@ -707,6 +715,8 @@ struct StatusResponse {
     outbound_peers: usize,
     inbound_peers: usize,
     mining: bool,
+    hashrate_hps: u64,
+    last_mine_attempts: u64,
 }
 
 #[derive(Serialize)]
@@ -741,7 +751,31 @@ struct ChainResponse {
     block_time_secs: u32,
     confirmation_depth: u32,
     finality_depth: u32,
+    block_reward_maturity: u32,
     difficulty_start: u32,
+}
+
+#[derive(Serialize)]
+struct ChainStatsResponse {
+    chain: &'static str,
+    coin: &'static str,
+    height: u64,
+    blocks: u64,
+    average_block_time_secs: Option<u64>,
+    target_block_time_secs: u32,
+    target_supply: u64,
+    genesis_premine: u64,
+    max_mined_supply: u64,
+    mined_supply: u64,
+    current_supply: u64,
+    remaining_mined_supply: u64,
+    total_coinbase_rewards: u64,
+    total_fees_collected: u64,
+    total_transactions: u64,
+    pending_transactions: u64,
+    total_transfer_volume: u64,
+    total_transaction_fees: u64,
+    average_transfer_amount: u64,
 }
 
 #[derive(Serialize)]
@@ -797,9 +831,29 @@ struct BlockResponse {
 }
 
 #[derive(Serialize)]
+struct MinedBlockResponse {
+    height: u64,
+    hash: String,
+    confirmations: u64,
+    maturity_height: u64,
+    matured: bool,
+    subsidy: u32,
+    fees: u32,
+    total: u32,
+    tx_count: usize,
+    timestamp: u64,
+}
+
+struct AddressActivity {
+    mined_blocks: Vec<MinedBlockResponse>,
+    transactions: Vec<TxResponse>,
+}
+
+#[derive(Serialize)]
 struct AddressResponse {
     address: String,
     balance: serde_json::Value,
+    mined_blocks: Vec<MinedBlockResponse>,
     transactions: Vec<TxResponse>,
 }
 
@@ -895,6 +949,7 @@ struct NodeService {
     peer_connections: Arc<Mutex<HashMap<SocketAddr, PeerConnection>>>,
     inbound_connections: Arc<Mutex<HashMap<SocketAddr, PeerConnection>>>,
     log_counters: Arc<LogCounters>,
+    mining_stats: Arc<MiningStats>,
     requires_peer_sync_before_mining: bool,
     last_mine: Instant,
     last_status: Instant,
@@ -919,6 +974,7 @@ impl NodeService {
         config: RunConfig,
         listeners: Vec<TcpListener>,
         log_counters: Arc<LogCounters>,
+        mining_stats: Arc<MiningStats>,
     ) -> Self {
         let requires_peer_sync_before_mining =
             config.mine && (!config.peers.is_empty() || config.gateway_url.is_some());
@@ -939,6 +995,7 @@ impl NodeService {
             peer_connections: Arc::new(Mutex::new(HashMap::new())),
             inbound_connections: Arc::new(Mutex::new(HashMap::new())),
             log_counters,
+            mining_stats,
             requires_peer_sync_before_mining,
             last_mine: Instant::now(),
             last_status: Instant::now(),
@@ -1056,7 +1113,7 @@ impl NodeService {
                     println!("mining waiting:: |reason::{reason}|");
                 } else {
                     self.set_activity(NodeActivity::Mining)?;
-                    let block = mine_once_unlocked(&self.node, &self.config)?;
+                    let block = mine_once_unlocked(&self.node, &self.config, &self.mining_stats)?;
                     if let Some(block) = block {
                         let height = block.height().0;
                         let hash = short_hash(Some(block.hash()));
@@ -1092,7 +1149,7 @@ impl NodeService {
                     .map_err(|_| "inbound connection lock poisoned".to_string())?
                     .len();
                 println!(
-                    "status: |height::{}|tip::{}|difficulty::{}|known_peers::{}|outbound_peers::{}|inbound_peers::{}|mining::{}|accepted_tx::{}|broadcast_tx::{}|",
+                    "status: |height::{}|tip::{}|difficulty::{}|known_peers::{}|outbound_peers::{}|inbound_peers::{}|mining::{}|hashrate_hps::{}|accepted_tx::{}|broadcast_tx::{}|",
                     node.tip_height().unwrap_or(Height(0)).0,
                     short_hash(node.tip_hash()),
                     format_difficulty(node.next_difficulty()),
@@ -1100,6 +1157,7 @@ impl NodeService {
                     outbound_count,
                     inbound_count,
                     self.config.mine,
+                    self.mining_stats.last_hashrate_hps.load(Ordering::Relaxed),
                     self.log_counters.accepted_tx_total.load(Ordering::Relaxed),
                     self.log_counters.broadcast_tx_total.load(Ordering::Relaxed)
                 );
@@ -1757,6 +1815,8 @@ fn start_rpc_server(state: RpcState, addr: SocketAddr) -> Result<thread::JoinHan
         .route("/status", get(rpc_status))
         .route("/health", get(rpc_health))
         .route("/chain", get(rpc_chain))
+        .route("/stats", get(rpc_stats))
+        .route("/chain/stats", get(rpc_stats))
         .route("/peers", get(rpc_peers))
         .route("/balance/{address}", get(rpc_balance))
         .route("/blocks/latest", get(rpc_latest_blocks))
@@ -1815,6 +1875,8 @@ async fn rpc_status(State(state): State<RpcState>) -> impl IntoResponse {
             outbound_peers: outbound.len(),
             inbound_peers: inbound.len(),
             mining: state.mining,
+            hashrate_hps: state.mining_stats.last_hashrate_hps.load(Ordering::Relaxed),
+            last_mine_attempts: state.mining_stats.last_attempts.load(Ordering::Relaxed),
         })
         .into_response(),
         _ => rpc_error(StatusCode::INTERNAL_SERVER_ERROR, "state_lock_failed"),
@@ -1834,8 +1896,19 @@ async fn rpc_chain() -> impl IntoResponse {
         block_time_secs: BLOCK_TIME,
         confirmation_depth: CONFIRMATION_DEPTH,
         finality_depth: FINALITY_DEPTH,
+        block_reward_maturity: BLOCK_REWARD_MATURITY,
         difficulty_start: DIFFICULTY_START,
     })
+}
+
+async fn rpc_stats(State(state): State<RpcState>) -> impl IntoResponse {
+    match state.node.lock() {
+        Ok(node) => match chain_stats(&node) {
+            Ok(stats) => Json(stats).into_response(),
+            Err(error) => rpc_error(StatusCode::INTERNAL_SERVER_ERROR, error),
+        },
+        Err(_) => rpc_error(StatusCode::INTERNAL_SERVER_ERROR, "state_lock_failed"),
+    }
 }
 
 async fn rpc_peers(State(state): State<RpcState>) -> impl IntoResponse {
@@ -1964,8 +2037,8 @@ async fn rpc_address(
         Err(error) => return rpc_error(StatusCode::BAD_REQUEST, error),
     };
     match state.node.lock() {
-        Ok(node) => match address_transactions(&node, &address) {
-            Ok(transactions) => {
+        Ok(node) => match address_activity(&node, &address) {
+            Ok(activity) => {
                 let balance: serde_json::Value = serde_json::from_str(&balance_json(
                     &node, &address,
                 ))
@@ -1973,7 +2046,8 @@ async fn rpc_address(
                 Json(AddressResponse {
                     address: address_to_string(&address),
                     balance,
-                    transactions,
+                    mined_blocks: activity.mined_blocks,
+                    transactions: activity.transactions,
                 })
                 .into_response()
             }
@@ -2204,7 +2278,8 @@ fn find_transaction(node: &Node, hash: &Hash) -> Result<Option<TxResponse>, Stri
     Ok(None)
 }
 
-fn address_transactions(node: &Node, address: &Address) -> Result<Vec<TxResponse>, String> {
+fn address_activity(node: &Node, address: &Address) -> Result<AddressActivity, String> {
+    let mut mined_blocks = Vec::new();
     let mut transactions = Vec::new();
     let tip = node.tip_height().unwrap_or(Height(0)).0;
     for height in 0..=tip {
@@ -2215,6 +2290,23 @@ fn address_transactions(node: &Node, address: &Address) -> Result<Vec<TxResponse
         let Some(block) = block else {
             continue;
         };
+        if block.miner_address() == *address {
+            if let Some(coinbase) = block.coinbase.as_ref() {
+                let maturity_height = height.saturating_add(BLOCK_REWARD_MATURITY as u64);
+                mined_blocks.push(MinedBlockResponse {
+                    height,
+                    hash: hex::encode(block.hash().0),
+                    confirmations: tip.saturating_sub(height).saturating_add(1),
+                    maturity_height,
+                    matured: tip >= maturity_height,
+                    subsidy: coinbase.subsidy.0,
+                    fees: coinbase.fees.0,
+                    total: coinbase.total().0,
+                    tx_count: block.transaction_count(),
+                    timestamp: block.timestamp(),
+                });
+            }
+        }
         for transaction in &block.transactions {
             if transaction.transaction.from == *address || transaction.transaction.to == *address {
                 transactions.push(tx_response(
@@ -2233,8 +2325,91 @@ fn address_transactions(node: &Node, address: &Address) -> Result<Vec<TxResponse
         }
     }
 
+    mined_blocks.reverse();
     transactions.reverse();
-    Ok(transactions)
+    Ok(AddressActivity {
+        mined_blocks,
+        transactions,
+    })
+}
+
+fn chain_stats(node: &Node) -> Result<ChainStatsResponse, String> {
+    let tip = node.tip_height().unwrap_or(Height(0)).0;
+    let mut blocks = 0u64;
+    let mut mined_supply = 0u64;
+    let mut total_coinbase_rewards = 0u64;
+    let mut total_fees_collected = 0u64;
+    let mut total_transactions = 0u64;
+    let mut total_transfer_volume = 0u64;
+    let mut total_transaction_fees = 0u64;
+    let mut previous_timestamp = None;
+    let mut total_block_time_secs = 0u64;
+    let mut block_time_samples = 0u64;
+
+    for height in 0..=tip {
+        let block = node
+            .storage
+            .load_block_by_height(Height(height))
+            .map_err(|error| format!("failed to load block: {error}"))?;
+        let Some(block) = block else {
+            continue;
+        };
+        blocks = blocks.saturating_add(1);
+        if let Some(previous_timestamp) = previous_timestamp {
+            total_block_time_secs = total_block_time_secs
+                .saturating_add(block.timestamp().saturating_sub(previous_timestamp));
+            block_time_samples = block_time_samples.saturating_add(1);
+        }
+        previous_timestamp = Some(block.timestamp());
+        if let Some(coinbase) = block.coinbase.as_ref() {
+            mined_supply = mined_supply.saturating_add(coinbase.subsidy.0 as u64);
+            total_fees_collected = total_fees_collected.saturating_add(coinbase.fees.0 as u64);
+            total_coinbase_rewards =
+                total_coinbase_rewards.saturating_add(coinbase.total().0 as u64);
+        }
+        for transaction in &block.transactions {
+            total_transactions = total_transactions.saturating_add(1);
+            total_transfer_volume =
+                total_transfer_volume.saturating_add(transaction.transaction.amount.0 as u64);
+            total_transaction_fees =
+                total_transaction_fees.saturating_add(transaction.transaction.fee.0 as u64);
+        }
+    }
+
+    let pending_transactions = node.mempool.len() as u64;
+    let average_transfer_amount = if total_transactions == 0 {
+        0
+    } else {
+        total_transfer_volume / total_transactions
+    };
+    let current_supply = (GENESIS_PREMINE as u64).saturating_add(mined_supply);
+    let average_block_time_secs = if block_time_samples == 0 {
+        None
+    } else {
+        Some(total_block_time_secs / block_time_samples)
+    };
+
+    Ok(ChainStatsResponse {
+        chain: CHAIN_NAME,
+        coin: COIN_NAME,
+        height: tip,
+        blocks,
+        average_block_time_secs,
+        target_block_time_secs: BLOCK_TIME,
+        target_supply: MAX_UNIT_SUPPLY as u64,
+        genesis_premine: GENESIS_PREMINE as u64,
+        max_mined_supply: MAX_MINED_SUPPLY as u64,
+        mined_supply,
+        current_supply,
+        remaining_mined_supply: (MAX_MINED_SUPPLY as u64).saturating_sub(mined_supply),
+        total_coinbase_rewards,
+        total_fees_collected,
+        total_transactions,
+        pending_transactions,
+        total_transfer_volume,
+        total_transaction_fees,
+        average_transfer_amount,
+    })
 }
 
 fn run_node(args: &[String]) -> Result<(), String> {
@@ -2274,8 +2449,15 @@ fn run_node(args: &[String]) -> Result<(), String> {
     }
     let node = Arc::new(Mutex::new(node));
     let log_counters = Arc::new(LogCounters::default());
+    let mining_stats = Arc::new(MiningStats::default());
 
-    let mut service = NodeService::new(node.clone(), config, listeners, log_counters.clone());
+    let mut service = NodeService::new(
+        node.clone(),
+        config,
+        listeners,
+        log_counters.clone(),
+        mining_stats.clone(),
+    );
     service.preflight()?;
 
     let (height, tip_hash, difficulty) = {
@@ -2312,6 +2494,7 @@ fn run_node(args: &[String]) -> Result<(), String> {
         inbound_connections: service.inbound_connections.clone(),
         mining: service.config.mine,
         log_counters,
+        mining_stats,
     };
     let _rpc_handle = start_rpc_server(rpc_state, service.config.rpc_addr)?;
     service.run()
@@ -2681,6 +2864,7 @@ fn parse_socket(value: Option<&String>, flag: &str) -> Result<SocketAddr, String
 fn mine_once_unlocked(
     node_state: &Arc<Mutex<Node>>,
     config: &RunConfig,
+    mining_stats: &MiningStats,
 ) -> Result<Option<Block>, String> {
     let timestamp = unix_timestamp()?;
     let (candidate, consensus, mining_config) = {
@@ -2717,9 +2901,12 @@ fn mine_once_unlocked(
     };
 
     let parent_hash = BlockHash::from(candidate.previous_hash().as_hash());
-    let Some(result) = mine_prepared_block(candidate, &consensus, mining_config)
-        .map_err(|error| format!("mining failed: {error}"))?
-    else {
+    let started = Instant::now();
+    let mined = mine_prepared_block(candidate, &consensus, mining_config)
+        .map_err(|error| format!("mining failed: {error}"))?;
+    let elapsed = started.elapsed();
+    let Some(result) = mined else {
+        update_mining_stats(mining_stats, mining_config.max_attempts, elapsed);
         let node = node_state
             .lock()
             .map_err(|_| "node state lock poisoned".to_string())?;
@@ -2730,6 +2917,7 @@ fn mine_once_unlocked(
         }
         return Ok(None);
     };
+    update_mining_stats(mining_stats, result.attempts, elapsed);
 
     let mut node = node_state
         .lock()
@@ -2752,6 +2940,18 @@ fn mine_once_unlocked(
         result.block.timestamp()
     );
     Ok(Some(result.block))
+}
+
+fn update_mining_stats(mining_stats: &MiningStats, attempts: u64, elapsed: Duration) {
+    let elapsed_nanos = elapsed.as_nanos().max(1);
+    let hashrate =
+        ((attempts as u128) * 1_000_000_000u128 / elapsed_nanos).min(u64::MAX as u128) as u64;
+    mining_stats
+        .last_hashrate_hps
+        .store(hashrate, Ordering::Relaxed);
+    mining_stats
+        .last_attempts
+        .store(attempts, Ordering::Relaxed);
 }
 
 fn parse_secret_key(value: Option<&String>) -> Result<SecretKey, String> {
@@ -2890,6 +3090,7 @@ RPC:
   GET  /status
   GET  /health
   GET  /chain
+  GET  /stats
   GET  /peers
   GET  /balance/<address-hex>
   GET  /blocks/latest
