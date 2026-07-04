@@ -1,6 +1,6 @@
 use super::{
-    NetworkEnvelope, NetworkError, NetworkMessage, Peer, PeerInfo, RejectReason, TipInfo,
-    VersionInfo, handle_message, read_message, write_message,
+    InventoryItem, NetworkEnvelope, NetworkError, NetworkMessage, Peer, PeerInfo, RejectReason,
+    TipInfo, VersionInfo, handle_message, read_message, write_message,
 };
 use crate::runtime::node::Node;
 use crate::runtime::params::BASE_FEE;
@@ -10,7 +10,7 @@ use paqus::consensus::{Consensus, ConsensusConfig};
 use paqus::crypto::{address_from_public_key, generate_keypair, sign};
 use paqus::ledger::Ledger;
 use paqus::transaction::{SignedTransaction, Transaction};
-use paqus::types::{Address, Amount, Hash, Height, Nonce};
+use paqus::types::{Address, Amount, BlockHash, Hash, Height, Nonce, TransactionHash};
 use std::io::{Cursor, Read, Write};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -215,6 +215,149 @@ fn handler_returns_blocks_by_height_and_hash() {
         )
         .unwrap(),
         Some(NetworkMessage::Block(block))
+    );
+}
+
+#[test]
+fn handler_returns_block_ranges_by_height() {
+    let mut node = test_node_with_genesis();
+    let block = node.ledger.block(&Height(0)).unwrap().clone();
+
+    assert_eq!(
+        handle_message(
+            &mut node,
+            NetworkMessage::GetBlocksByHeightRange {
+                start: Height(0),
+                limit: 32
+            }
+        )
+        .unwrap(),
+        Some(NetworkMessage::Blocks(vec![block]))
+    );
+
+    assert_eq!(
+        handle_message(
+            &mut node,
+            NetworkMessage::GetBlocksByHeightRange {
+                start: Height(1),
+                limit: 32
+            }
+        )
+        .unwrap(),
+        Some(NetworkMessage::Blocks(vec![]))
+    );
+}
+
+#[test]
+fn handler_returns_block_header_ranges_by_height() {
+    let mut node = test_node_with_genesis();
+    let block = node.ledger.block(&Height(0)).unwrap().clone();
+
+    assert_eq!(
+        handle_message(
+            &mut node,
+            NetworkMessage::GetBlockHeadersByHeightRange {
+                start: Height(0),
+                limit: 32
+            }
+        )
+        .unwrap(),
+        Some(NetworkMessage::BlockHeaders(vec![block.header]))
+    );
+}
+
+#[test]
+fn handler_returns_common_ancestor_from_locator() {
+    let mut node = test_node_with_genesis();
+    let block = node.ledger.block(&Height(0)).unwrap().clone();
+
+    assert_eq!(
+        handle_message(
+            &mut node,
+            NetworkMessage::GetCommonAncestor {
+                locator: vec![BlockHash([9; 64]), block.hash()]
+            }
+        )
+        .unwrap(),
+        Some(NetworkMessage::CommonAncestor(Some(TipInfo {
+            height: Height(0),
+            hash: block.hash()
+        })))
+    );
+
+    assert_eq!(
+        handle_message(
+            &mut node,
+            NetworkMessage::GetCommonAncestor {
+                locator: vec![BlockHash([9; 64])]
+            }
+        )
+        .unwrap(),
+        Some(NetworkMessage::CommonAncestor(None))
+    );
+}
+
+#[test]
+fn handler_requests_missing_inventory_data() {
+    let mut node = test_node_with_genesis();
+    let block = node.ledger.block(&Height(0)).unwrap().clone();
+
+    assert_eq!(
+        handle_message(
+            &mut node,
+            NetworkMessage::Inventory(vec![
+                InventoryItem::Block(block.hash()),
+                InventoryItem::Transaction(TransactionHash([9; 64]))
+            ])
+        )
+        .unwrap(),
+        Some(NetworkMessage::GetData(vec![InventoryItem::Transaction(
+            TransactionHash([9; 64])
+        )]))
+    );
+
+    assert_eq!(
+        handle_message(
+            &mut node,
+            NetworkMessage::Inventory(vec![InventoryItem::Block(BlockHash([9; 64]))])
+        )
+        .unwrap(),
+        Some(NetworkMessage::GetData(vec![InventoryItem::Block(BlockHash([
+            9; 64
+        ]))]))
+    );
+}
+
+#[test]
+fn handler_returns_mempool_inventory_and_data_by_hash() {
+    let transaction = signed_transaction_to(address(2), 10, 0);
+    let hash = transaction.hash();
+    let sender = transaction.transaction.from;
+    let mut ledger = Ledger::new();
+    ledger.create_account(sender, Amount(25)).unwrap();
+    ledger.create_account(address(2), Amount(0)).unwrap();
+    let mut node = Node::temporary(
+        ledger,
+        Consensus {
+            config: ConsensusConfig { difficulty: 0 },
+        },
+    )
+    .unwrap();
+    node.submit_transaction(transaction.clone()).unwrap();
+
+    assert_eq!(
+        handle_message(&mut node, NetworkMessage::GetMempoolInventory).unwrap(),
+        Some(NetworkMessage::Inventory(vec![InventoryItem::Transaction(
+            hash
+        )]))
+    );
+    assert_eq!(
+        handle_message(
+            &mut node,
+            NetworkMessage::GetData(vec![InventoryItem::Transaction(hash)])
+        )
+        .unwrap(),
+        Some(NetworkMessage::Transactions(vec![transaction]))
     );
 }
 

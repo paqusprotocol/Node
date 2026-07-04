@@ -1,9 +1,9 @@
 use crate::runtime::network::error::NetworkError;
 use crate::runtime::params::{CURRENT_CHAIN_PARAMS, MAX_NETWORK_MESSAGE_SIZE};
 use borsh::{BorshDeserialize, BorshSerialize};
-use paqus::block::Block;
+use paqus::block::{Block, BlockHeader};
 use paqus::transaction::SignedTransaction;
-use paqus::types::{BlockHash, BlockHeight};
+use paqus::types::{BlockHash, BlockHeight, TransactionHash};
 
 #[derive(BorshSerialize, BorshDeserialize, Clone, Debug, PartialEq, Eq)]
 pub struct PeerInfo {
@@ -64,6 +64,12 @@ pub enum RejectReason {
 }
 
 #[derive(BorshSerialize, BorshDeserialize, Clone, Debug, PartialEq, Eq)]
+pub enum InventoryItem {
+    Block(BlockHash),
+    Transaction(TransactionHash),
+}
+
+#[derive(BorshSerialize, BorshDeserialize, Clone, Debug, PartialEq, Eq)]
 pub enum NetworkMessage {
     Version(VersionInfo),
     VerAck(VersionInfo),
@@ -82,11 +88,29 @@ pub enum NetworkMessage {
     GetBlockByHeight {
         height: BlockHeight,
     },
+    GetBlocksByHeightRange {
+        start: BlockHeight,
+        limit: u32,
+    },
+    GetBlockHeadersByHeightRange {
+        start: BlockHeight,
+        limit: u32,
+    },
+    GetCommonAncestor {
+        locator: Vec<BlockHash>,
+    },
+    CommonAncestor(Option<TipInfo>),
     GetBlockByHash {
         hash: BlockHash,
     },
     Block(Block),
+    Blocks(Vec<Block>),
+    BlockHeaders(Vec<BlockHeader>),
+    Inventory(Vec<InventoryItem>),
+    GetData(Vec<InventoryItem>),
     Transaction(SignedTransaction),
+    Transactions(Vec<SignedTransaction>),
+    GetMempoolInventory,
     GetPeers,
     Peers(Vec<PeerInfo>),
 }

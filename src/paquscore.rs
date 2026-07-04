@@ -14,8 +14,8 @@ pub use paqus::types::{
 };
 
 pub use crate::runtime::network::{
-    NetworkEnvelope, NetworkMessage, PeerInfo, TipInfo, VersionInfo, handle_message, read_message,
-    write_message,
+    InventoryItem, NetworkEnvelope, NetworkMessage, PeerInfo, TipInfo, VersionInfo, handle_message,
+    read_message, write_message,
 };
 pub use crate::runtime::node::Node;
 pub use crate::runtime::params::DEFAULT_TRANSACTION_FEE;

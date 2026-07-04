@@ -21,13 +21,14 @@ use mempool::resolve_wallet_nonce;
 use network::{bind_nonblocking, configure_stream, http_get, http_post_json};
 use p2p::{
     PERSISTENT_PEER_TIMEOUT, PeerConnection, PeerPoll, PeerState, dedupe_peers, load_peers_file,
-    poll_peer, poll_peer_connection, request_peers_connection, save_peers_file,
+    poll_peer_connection, request_peers_connection, save_peers_file, sync_from_peers_parallel,
+    sync_mempool_connection,
 };
 use paquscore::{
     Address, Amount, Block, BlockHash, Consensus, GENESIS_PREMINE_ADDRESS, Hash, Height,
-    NetworkMessage, Node, Nonce, PeerInfo, SecretKey, SignedTransaction, Transaction, Wallet,
-    address_from_public_key, address_to_string, derive_public_key, handle_message, read_message,
-    write_message,
+    InventoryItem, NetworkMessage, Node, Nonce, PeerInfo, SecretKey, SignedTransaction,
+    Transaction, Wallet, address_from_public_key, address_to_string, derive_public_key,
+    handle_message, read_message, write_message,
 };
 use paquscore::{
     BLOCK_REWARD_MATURITY, BLOCK_TIME, CHAIN_ID, CHAIN_NAME, COIN_NAME, CONFIRMATION_DEPTH,
@@ -55,7 +56,8 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const DEFAULT_NODE_DB: &str = "./data/paqus";
 const DEFAULT_LISTEN_ADDR: &str = "0.0.0.0:5555";
-const DEFAULT_RPC_ADDR: &str = "127.0.0.1:6666";
+const DEFAULT_RPC_ADDR: &str = "[2404:8000:1044:4d8:1202:b5ff:feb0:7020]:6666";
+const DEFAULT_BOOTSTRAP_PEER: &str = "[2404:8000:1044:4d8:1202:b5ff:feb0:7020]:5555";
 const DEFAULT_CONFIG_FILE: &str = "./data/paqus/node.json";
 const DEFAULT_PEERS_FILE: &str = "./data/paqus/peers.json";
 const DEFAULT_MINING_INTERVAL: Duration = Duration::from_secs(BLOCK_TIME as u64);
@@ -889,7 +891,11 @@ impl Default for RunConfig {
             rpc_addr: DEFAULT_RPC_ADDR
                 .parse()
                 .expect("default rpc address must be valid"),
-            peers: Vec::new(),
+            peers: vec![
+                DEFAULT_BOOTSTRAP_PEER
+                    .parse()
+                    .expect("default bootstrap peer must be valid"),
+            ],
             peers_file: Some(DEFAULT_PEERS_FILE.to_string()),
             gateway_url: None,
             public_addrs: Vec::new(),
@@ -922,7 +928,11 @@ impl Default for RunConfigFile {
                     .collect(),
             ),
             rpc_addr: defaults.rpc_addr.to_string(),
-            peers: Vec::new(),
+            peers: defaults
+                .peers
+                .into_iter()
+                .map(|peer| peer.to_string())
+                .collect(),
             peers_file: Some(DEFAULT_PEERS_FILE.to_string()),
             gateway_url: None,
             public_addr: None,
@@ -1058,12 +1068,45 @@ impl NodeService {
         }
 
         for peer in peers {
-            let result = poll_peer(peer, &self.node, &self.config.public_addrs);
+            let result = PeerConnection::connect(peer).and_then(|mut connection| {
+                let poll = poll_peer_connection(
+                    &mut connection,
+                    &self.node,
+                    &self.config.public_addrs,
+                    peer_state_sync_window(&self.peers, peer),
+                )?;
+                let infos = request_peers_connection(&mut connection).unwrap_or_else(|error| {
+                    eprintln!("preflight peer {peer} discovery failed: {error}");
+                    Vec::new()
+                });
+                if !infos.is_empty() {
+                    println!("preflight peer {peer} discovered peers={}", infos.len());
+                    if self.add_peer_infos(infos) {
+                        let _ = self.save_peers();
+                    }
+                }
+                if let Ok(accepted) = sync_mempool_connection(&mut connection, &self.node) {
+                    if accepted > 0 {
+                        println!("preflight mempool synced:: |peer::{peer}|txs::{accepted}|");
+                    }
+                }
+                Ok(poll)
+            });
             match result {
-                Ok(PeerPoll::Idle { remote_tip }) | Ok(PeerPoll::Synced { remote_tip }) => {
+                Ok(PeerPoll::Idle { remote_tip }) => {
                     if let Ok(mut peers) = self.peers.lock() {
                         if let Some(state) = peers.get_mut(&peer) {
                             state.mark_ok(Some(remote_tip));
+                        }
+                    }
+                }
+                Ok(PeerPoll::Synced {
+                    remote_tip,
+                    synced_blocks,
+                }) => {
+                    if let Ok(mut peers) = self.peers.lock() {
+                        if let Some(state) = peers.get_mut(&peer) {
+                            state.mark_synced(remote_tip, synced_blocks);
                         }
                     }
                 }
@@ -1433,10 +1476,44 @@ impl NodeService {
             }
         };
 
+        if due_peers.len() > 1 {
+            let sync_window = max_peer_sync_window(&self.peers, &due_peers);
+            match sync_from_peers_parallel(
+                due_peers.clone(),
+                &self.node,
+                &self.config.public_addrs,
+                sync_window,
+            ) {
+                Ok(report) if report.applied_blocks > 0 => {
+                    if let Ok(mut peers) = self.peers.lock() {
+                        for peer in &report.used_peer_addrs {
+                            if let Some(state) = peers.get_mut(peer) {
+                                state.mark_synced(report.remote_tip, report.applied_blocks);
+                            }
+                        }
+                        for peer in &report.failed_peer_addrs {
+                            if let Some(state) = peers.get_mut(peer) {
+                                state.mark_failed();
+                            }
+                        }
+                    }
+                    println!(
+                        "parallel sync complete:: |blocks::{}|peers::{}|remote_tip::{}|",
+                        report.applied_blocks, report.used_peers, report.remote_tip.0
+                    );
+                    return;
+                }
+                Ok(_) => {}
+                Err(error) => {
+                    eprintln!("parallel sync failed; falling back to peer polling: {error}")
+                }
+            }
+        }
+
         for peer in due_peers {
             let result = self.poll_persistent_peer(peer);
             match result {
-                Ok(PeerPoll::Idle { remote_tip }) | Ok(PeerPoll::Synced { remote_tip }) => {
+                Ok(PeerPoll::Idle { remote_tip }) => {
                     if let Ok(mut peers) = self.peers.lock() {
                         if let Some(state) = peers.get_mut(&peer) {
                             state.mark_ok(Some(remote_tip));
@@ -1456,6 +1533,32 @@ impl NodeService {
                             let _ = self.save_peers();
                         }
                     }
+                    self.sync_mempool_from_peer(peer);
+                }
+                Ok(PeerPoll::Synced {
+                    remote_tip,
+                    synced_blocks,
+                }) => {
+                    if let Ok(mut peers) = self.peers.lock() {
+                        if let Some(state) = peers.get_mut(&peer) {
+                            state.mark_synced(remote_tip, synced_blocks);
+                        }
+                    }
+                    let infos = match self.peer_connections.lock() {
+                        Ok(mut connections) => connections
+                            .get_mut(&peer)
+                            .and_then(|connection| request_peers_connection(connection).ok()),
+                        Err(_) => {
+                            eprintln!("peer connection lock poisoned");
+                            None
+                        }
+                    };
+                    if let Some(infos) = infos {
+                        if self.add_peer_infos(infos) {
+                            let _ = self.save_peers();
+                        }
+                    }
+                    self.sync_mempool_from_peer(peer);
                 }
                 Err(error) => {
                     let mut dropped = false;
@@ -1488,6 +1591,7 @@ impl NodeService {
     }
 
     fn poll_persistent_peer(&mut self, peer: SocketAddr) -> Result<PeerPoll, String> {
+        let sync_window = peer_state_sync_window(&self.peers, peer);
         let mut connections = self
             .peer_connections
             .lock()
@@ -1500,7 +1604,32 @@ impl NodeService {
         let connection = connections
             .get_mut(&peer)
             .ok_or_else(|| format!("missing peer connection for {peer}"))?;
-        poll_peer_connection(connection, &self.node, &self.config.public_addrs)
+        poll_peer_connection(
+            connection,
+            &self.node,
+            &self.config.public_addrs,
+            sync_window,
+        )
+    }
+
+    fn sync_mempool_from_peer(&mut self, peer: SocketAddr) {
+        let result = match self.peer_connections.lock() {
+            Ok(mut connections) => connections
+                .get_mut(&peer)
+                .ok_or_else(|| format!("missing peer connection for {peer}"))
+                .and_then(|connection| sync_mempool_connection(connection, &self.node)),
+            Err(_) => {
+                eprintln!("peer connection lock poisoned");
+                return;
+            }
+        };
+        match result {
+            Ok(accepted) if accepted > 0 => {
+                println!("mempool synced:: |peer::{peer}|txs::{accepted}|");
+            }
+            Ok(_) => {}
+            Err(error) => eprintln!("mempool sync from {peer} failed: {error}"),
+        }
     }
 
     fn add_peer_infos(&mut self, peers: Vec<PeerInfo>) -> bool {
@@ -1699,7 +1828,7 @@ impl NodeService {
                 connections
                     .get_mut(&peer)
                     .ok_or_else(|| format!("missing peer connection for {peer}"))
-                    .and_then(|connection| connection.send(message.clone()))
+                    .and_then(|connection| announce_or_send(connection, message.clone()))
             };
             match result {
                 Ok(()) => report.sent += 1,
@@ -1771,6 +1900,41 @@ fn inbound_message_log(message: &NetworkMessage, peer: SocketAddr) -> Option<Str
             transaction.transaction.nonce.0
         )),
         _ => None,
+    }
+}
+
+fn announce_or_send(
+    connection: &mut PeerConnection,
+    message: NetworkMessage,
+) -> Result<(), String> {
+    match message {
+        NetworkMessage::Block(block) => {
+            let hash = block.hash();
+            match connection.request(NetworkMessage::Inventory(vec![InventoryItem::Block(hash)])) {
+                Ok(NetworkMessage::GetData(items))
+                    if items.contains(&InventoryItem::Block(hash)) =>
+                {
+                    connection.send(NetworkMessage::Block(block))
+                }
+                Ok(_) => Ok(()),
+                Err(error) => Err(error),
+            }
+        }
+        NetworkMessage::Transaction(transaction) => {
+            let hash = transaction.hash();
+            match connection.request(NetworkMessage::Inventory(vec![InventoryItem::Transaction(
+                hash,
+            )])) {
+                Ok(NetworkMessage::GetData(items))
+                    if items.contains(&InventoryItem::Transaction(hash)) =>
+                {
+                    connection.send(NetworkMessage::Transaction(transaction))
+                }
+                Ok(_) => Ok(()),
+                Err(error) => Err(error),
+            }
+        }
+        other => connection.send(other),
     }
 }
 
@@ -2503,6 +2667,34 @@ fn run_node(args: &[String]) -> Result<(), String> {
     };
     let _rpc_handle = start_rpc_server(rpc_state, service.config.rpc_addr)?;
     service.run()
+}
+
+fn peer_state_sync_window(
+    peers: &Arc<Mutex<HashMap<SocketAddr, PeerState>>>,
+    peer: SocketAddr,
+) -> u64 {
+    peers
+        .lock()
+        .ok()
+        .and_then(|peers| peers.get(&peer).map(|state| state.sync_window))
+        .unwrap_or(64)
+}
+
+fn max_peer_sync_window(
+    peers: &Arc<Mutex<HashMap<SocketAddr, PeerState>>>,
+    due_peers: &[SocketAddr],
+) -> u64 {
+    peers
+        .lock()
+        .ok()
+        .map(|peers| {
+            due_peers
+                .iter()
+                .filter_map(|peer| peers.get(peer).map(|state| state.sync_window))
+                .max()
+                .unwrap_or(64)
+        })
+        .unwrap_or(64)
 }
 
 fn warn_if_public_rpc(config: &RunConfig) {
