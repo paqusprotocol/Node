@@ -1,5 +1,6 @@
 /target/
 /data/
 wallet.json
+receiver.json
 *.wallet.json
 *.log
