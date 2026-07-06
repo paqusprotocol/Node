@@ -27,8 +27,8 @@ use p2p::{
 use paquscore::{
     Address, Amount, Block, BlockHash, Consensus, GENESIS_PREMINE_ADDRESS, Hash, Height,
     InventoryItem, NetworkMessage, Node, Nonce, PeerInfo, SecretKey, SignedTransaction,
-    Transaction, TransactionHash, Wallet, address_from_public_key, address_to_string,
-    derive_public_key, handle_message, read_message, write_message,
+    Transaction, TransactionHash, Wallet, address_from_public_key, address_from_string,
+    address_to_string, derive_public_key, handle_message, read_message, write_message,
 };
 use paquscore::{
     BLOCK_REWARD_MATURITY, BLOCK_TIME, CHAIN_ID, CHAIN_NAME, COIN_NAME, CONFIRMATION_DEPTH,
@@ -2108,7 +2108,7 @@ async fn rpc_balance(
     State(state): State<RpcState>,
     AxumPath(address): AxumPath<String>,
 ) -> impl IntoResponse {
-    let address = match parse_address_hex(&address) {
+    let address = match parse_address_string(&address) {
         Ok(address) => address,
         Err(error) => return rpc_error(StatusCode::BAD_REQUEST, error),
     };
@@ -2208,7 +2208,7 @@ async fn rpc_address(
     State(state): State<RpcState>,
     AxumPath(address): AxumPath<String>,
 ) -> impl IntoResponse {
-    let address = match parse_address_hex(&address) {
+    let address = match parse_address_string(&address) {
         Ok(address) => address,
         Err(error) => return rpc_error(StatusCode::BAD_REQUEST, error),
     };
@@ -3208,9 +3208,13 @@ fn signed_transaction_from_hex(value: &str) -> Result<SignedTransaction, String>
 
 fn parse_address(value: Option<&String>) -> Result<Address, String> {
     let Some(value) = value else {
-        return Err("missing address hex".to_string());
+        return Err("missing address".to_string());
     };
-    parse_address_hex(value)
+    parse_address_string(value)
+}
+
+fn parse_address_string(value: &str) -> Result<Address, String> {
+    address_from_string(value).or_else(|_| parse_address_hex(value))
 }
 
 fn parse_address_hex(value: &str) -> Result<Address, String> {
@@ -3290,14 +3294,14 @@ Usage:
   paqus node info
   paqus node libp2p-info
   paqus node config [config-path]
-  paqus node init [db-path] [miner-address-hex]
-  paqus node run [db-path] [--config path] [--listen addr] [--rpc-listen addr] [--peer addr] [--peers-file path] [--gateway host:port] [--public-addr host:port] [--min-relay-fee units] [--market-fee units] [--low-fee-expiry-secs n] [--mempool-expiry-secs n] [--wallet path] [--miner address-hex] [--miner-secret-key key-hex] [--mine]
+  paqus node init [db-path] [miner-address]
+  paqus node run [db-path] [--config path] [--listen addr] [--rpc-listen addr] [--peer addr] [--peers-file path] [--gateway host:port] [--public-addr host:port] [--min-relay-fee units] [--market-fee units] [--low-fee-expiry-secs n] [--mempool-expiry-secs n] [--wallet path] [--miner address] [--miner-secret-key key-hex] [--mine]
   paqus wallet new [wallet-path] [--show-secret]
   paqus wallet address <secret-key-hex>
-  paqus wallet balance <address-hex> [db-path]
-  paqus wallet pay <address-hex> <amount> [--wallet path] [--fee units] [--rpc addr]
-  paqus wallet send <address-hex> <amount> [--wallet path] [--nonce n] [--fee units] [--rpc addr]
-  paqus wallet send --wallet path --to address-hex --amount units [--nonce n] [--fee units] [--submit] [--rpc addr]
+  paqus wallet balance <address> [db-path]
+  paqus wallet pay <address> <amount> [--wallet path] [--fee units] [--rpc addr]
+  paqus wallet send <address> <amount> [--wallet path] [--nonce n] [--fee units] [--rpc addr]
+  paqus wallet send --wallet path --to address --amount units [--nonce n] [--fee units] [--submit] [--rpc addr]
 
 RPC:
   GET  /status
@@ -3305,12 +3309,12 @@ RPC:
   GET  /chain
   GET  /stats
   GET  /peers
-  GET  /balance/<address-hex>
+  GET  /balance/<address>
   GET  /blocks/latest
   GET  /blocks/<height>
   GET  /blocks/hash/<block-hash>
   GET  /tx/<tx-hash>
-  GET  /address/<address-hex>
+  GET  /address/<address>
   GET  /accounts
   GET  /mempool
   POST /tx              JSON: {{\"tx\":\"signed-transaction-hex\"}}
@@ -3360,6 +3364,22 @@ mod tests {
 
     fn args(values: &[&str]) -> Vec<String> {
         values.iter().map(|value| value.to_string()).collect()
+    }
+
+    #[test]
+    fn parse_address_accepts_wallet_address_string() {
+        let address = Address([0xab; 20]);
+        let encoded = address_to_string(&address);
+
+        assert_eq!(parse_address_string(&encoded), Ok(address));
+    }
+
+    #[test]
+    fn parse_address_accepts_legacy_hex() {
+        let address = Address([0xab; 20]);
+        let encoded = hex::encode(address.0);
+
+        assert_eq!(parse_address_string(&encoded), Ok(address));
     }
 
     #[test]

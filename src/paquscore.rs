@@ -6,7 +6,7 @@ pub use paqus::consensus::{
 };
 pub use paqus::crypto::{
     Address, BlockHash, Hash, SecretKey, TransactionHash, address_from_public_key,
-    address_to_string, derive_public_key,
+    address_from_string, address_to_string, derive_public_key,
 };
 pub use paqus::genesis::{CURRENT_CHAIN_PARAMS, GENESIS_MINER_ADDRESS as GENESIS_PREMINE_ADDRESS};
 pub use paqus::ledger::{BLOCK_REWARD_MATURITY, CONFIRMATION_DEPTH, FINALITY_DEPTH};

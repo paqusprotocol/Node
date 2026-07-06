@@ -87,13 +87,13 @@ cargo run -- address <secret-key-hex>
 Check balance:
 
 ```bash
-cargo run -- balance <address-hex> --rpc 127.0.0.1:6666
+cargo run -- balance <address> --rpc 127.0.0.1:6666
 ```
 
 Send a transaction:
 
 ```bash
-cargo run -- send <recipient-address-hex> 10 --wallet wallet.json
+cargo run -- send <address> 10 --wallet wallet.json
 ```
 
 Useful `wallet send` options:
@@ -112,7 +112,7 @@ does not make an otherwise valid transaction invalid by consensus.
 Advanced form for printing signed transaction hex without broadcasting:
 
 ```bash
-cargo run -- send --wallet wallet.json --to <recipient-address-hex> --amount 10
+cargo run -- send --wallet wallet.json --to <address> --amount 10
 ```
 
 Broadcast the advanced form to the node RPC with `--submit`:
@@ -120,7 +120,7 @@ Broadcast the advanced form to the node RPC with `--submit`:
 ```bash
 cargo run -- send \
   --wallet wallet.json \
-  --to <recipient-address-hex> \
+  --to <address> \
   --amount 10 \
   --submit
 ```
@@ -165,12 +165,15 @@ Common `node run` options:
 --peers-file <path>
 --gateway <host:port>
 --public-addr <host:port>
---miner <address-hex>
+--miner <address>
 --miner-secret-key <secret-key-hex>
 ```
 
 `--listen` and `--public-addr` can be repeated. Use one IPv4 address and one
 IPv6 address when the node should accept and announce both address families.
+
+Addresses are normally displayed as uppercase `PX1...` wallet addresses.
+Legacy 20-byte hex addresses are still accepted for older scripts.
 
 ## Peers
 
@@ -306,12 +309,12 @@ curl http://127.0.0.1:6666/health
 curl http://127.0.0.1:6666/status
 curl http://127.0.0.1:6666/peers
 curl http://127.0.0.1:6666/chain
-curl http://127.0.0.1:6666/balance/<address-hex>
+curl http://127.0.0.1:6666/balance/<address>
 curl http://127.0.0.1:6666/blocks/latest
 curl http://127.0.0.1:6666/blocks/<height>
 curl http://127.0.0.1:6666/blocks/hash/<block-hash>
 curl http://127.0.0.1:6666/tx/<tx-hash>
-curl http://127.0.0.1:6666/address/<address-hex>
+curl http://127.0.0.1:6666/address/<address>
 curl http://127.0.0.1:6666/accounts
 curl http://127.0.0.1:6666/mempool
 ```
