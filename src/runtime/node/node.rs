@@ -139,13 +139,25 @@ impl Node {
             ledger
         };
 
-        let genesis_accounts = storage.load_genesis_accounts()?.unwrap_or_else(|| {
-            if ledger.tip_height() == Some(Height(0)) {
-                ledger.accounts.clone()
-            } else {
-                BTreeMap::new()
+        let genesis_accounts = match storage.load_genesis_accounts()? {
+            Some(accounts) => accounts,
+            None => {
+                let accounts = if let Some(snapshot) = storage.load_state_snapshot(Height(0))? {
+                    snapshot.accounts
+                } else if ledger.tip_height() == Some(Height(0)) {
+                    ledger.accounts.clone()
+                } else {
+                    let genesis = storage
+                        .load_block_by_height(Height(0))?
+                        .ok_or(NodeError::MissingGenesisState)?;
+                    let mut genesis_ledger = Ledger::new();
+                    genesis_ledger.apply_block(genesis)?;
+                    genesis_ledger.accounts
+                };
+                storage.save_genesis_accounts(&accounts)?;
+                accounts
             }
-        });
+        };
         let mut node = Self::with_genesis_accounts(ledger, storage, consensus, genesis_accounts);
         node.index_stored_blocks()?;
         Ok(node)

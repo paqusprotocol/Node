@@ -508,6 +508,11 @@ impl Storage {
     }
 
     pub fn save_ledger(&self, ledger: &Ledger) -> Result<(), StorageError> {
+        let genesis_snapshot = ledger
+            .chain
+            .block(&Height(0))
+            .map(|block| genesis_snapshot_from_ledger(ledger, block))
+            .transpose()?;
         let mut txn = self.env.begin_rw_txn()?;
         txn.clear_db(self.blocks_by_height)?;
         txn.clear_db(self.accounts)?;
@@ -555,14 +560,21 @@ impl Storage {
                     &snapshot,
                 )?;
             }
-            if height.0 == 0 {
-                put_value(
-                    &mut txn,
-                    self.genesis_accounts,
-                    b"accounts",
-                    &ledger.accounts,
-                )?;
-            }
+        }
+
+        if let Some(snapshot) = genesis_snapshot {
+            put_value(
+                &mut txn,
+                self.genesis_accounts,
+                b"accounts",
+                &snapshot.accounts,
+            )?;
+            put_value(
+                &mut txn,
+                self.state_snapshots,
+                &height_key(Height(0)),
+                &snapshot,
+            )?;
         }
 
         txn.commit()?;
@@ -749,6 +761,35 @@ impl Storage {
 
 fn height_key(height: BlockHeight) -> [u8; 8] {
     height.0.to_be_bytes()
+}
+
+fn genesis_snapshot_from_ledger(
+    ledger: &Ledger,
+    block: &Block,
+) -> Result<StateSnapshot, StorageError> {
+    if block.height() != Height(0) {
+        return Err(StorageError::Integrity(
+            "genesis snapshot block is not height 0",
+        ));
+    }
+    let mut genesis_ledger = Ledger::new();
+    if genesis_ledger.apply_block(block.clone()).is_err() {
+        if ledger.tip_height() == Some(Height(0)) {
+            return Ok(StateSnapshot {
+                height: Height(0),
+                block_hash: block.hash(),
+                state_root: ledger.state_root().into(),
+                accounts: ledger.accounts.clone(),
+            });
+        }
+        return Err(StorageError::Integrity("stored genesis block is invalid"));
+    }
+    Ok(StateSnapshot {
+        height: Height(0),
+        block_hash: block.hash(),
+        state_root: genesis_ledger.state_root().into(),
+        accounts: genesis_ledger.accounts,
+    })
 }
 
 fn address_tx_key(address: &Address, height: BlockHeight, tx_index: u32, sent: bool) -> Vec<u8> {

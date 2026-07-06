@@ -292,6 +292,7 @@ fn save_ledger_skips_state_snapshot_at_non_protocol_snapshot_height() {
     storage.save_ledger(&ledger).unwrap();
 
     assert_eq!(storage.load_tip().unwrap(), Some((Height(1), next.hash())));
+    assert!(storage.load_state_snapshot(Height(0)).unwrap().is_some());
     assert!(storage.load_state_snapshot(Height(1)).unwrap().is_none());
 }
 
