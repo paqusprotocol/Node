@@ -413,10 +413,6 @@ impl Node {
             return Ok(Some(ledger));
         }
 
-        if self.genesis_accounts.is_empty() {
-            return Err(NodeError::MissingGenesisState);
-        }
-
         let parent_hash = BlockHash::from(block.previous_hash().as_hash());
         let ledger = self.ledger_for_branch_tip(parent_hash)?;
         Self::validate_canonical_state_root(&ledger, block)?;
@@ -435,10 +431,6 @@ impl Node {
     }
 
     fn reorg_to_best_tip(&mut self) -> Result<(), NodeError> {
-        if self.genesis_accounts.is_empty() {
-            return Err(NodeError::MissingGenesisState);
-        }
-
         let old_blocks: Vec<_> = self.ledger.chain.blocks.values().cloned().collect();
         let old_tip_hash = self.ledger.tip_hash();
         let best_tip = self
@@ -813,6 +805,62 @@ mod tests {
         assert!(matches!(error, NodeError::Ledger(_)));
         assert!(!node.fork_choice.contains(&block_hash));
         assert_eq!(node.tip_hash(), Some(genesis.hash()));
+    }
+
+    #[test]
+    fn reorgs_from_empty_genesis_accounts() {
+        let genesis = Block::new(
+            Height(0),
+            Hash([0; 64]),
+            address(9),
+            1_700_000_000,
+            Nonce(0),
+            vec![],
+        );
+        let mut active = Block::with_difficulty(
+            Height(1),
+            genesis.hash(),
+            address(9),
+            1,
+            1_700_000_001,
+            Nonce(1),
+            vec![],
+        );
+        let mut side = Block::with_difficulty(
+            Height(1),
+            genesis.hash(),
+            address(8),
+            4,
+            1_700_000_001,
+            Nonce(2),
+            vec![],
+        );
+        let genesis_accounts = BTreeMap::new();
+        let mut ledger = Ledger {
+            accounts: genesis_accounts.clone(),
+            chain: Chain::new(),
+        };
+        ledger.chain.insert_block(genesis).unwrap();
+        active.set_state_root(ledger.state_root_after_block(&active).unwrap());
+        side.set_state_root(ledger.state_root_after_block(&side).unwrap());
+        let side_hash = side.hash();
+        ledger.apply_block(active).unwrap();
+        let mut node = Node::with_genesis_accounts(
+            ledger,
+            Storage::temporary().unwrap(),
+            Consensus {
+                config: ConsensusConfig { difficulty: 0 },
+            },
+            genesis_accounts,
+        );
+
+        node.apply_block(side).unwrap();
+
+        assert_eq!(node.tip_hash(), Some(side_hash));
+        assert_eq!(
+            node.balance(&address(8)),
+            node.ledger.account(&address(8)).map(|a| a.balance)
+        );
     }
 
     #[test]
