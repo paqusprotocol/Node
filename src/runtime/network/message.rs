@@ -1,9 +1,9 @@
 use crate::runtime::network::error::NetworkError;
 use crate::runtime::params::{CURRENT_CHAIN_PARAMS, MAX_NETWORK_MESSAGE_SIZE};
 use borsh::{BorshDeserialize, BorshSerialize};
-use paqus::block::{Block, BlockHeader};
+use paqus::block::{Block, BlockHeader, BlockHeight};
+use paqus::crypto::{BlockHash, TransactionHash};
 use paqus::transaction::SignedTransaction;
-use paqus::types::{BlockHash, BlockHeight, TransactionHash};
 
 #[derive(BorshSerialize, BorshDeserialize, Clone, Debug, PartialEq, Eq)]
 pub struct PeerInfo {

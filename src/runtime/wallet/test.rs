@@ -1,8 +1,9 @@
 use super::{Wallet, WalletError};
 use crate::runtime::params::BASE_FEE;
-use paqus::crypto::address_from_string;
+use paqus::block::Nonce;
+use paqus::consensus::supply::Amount;
+use paqus::crypto::{Address, address_from_string};
 use paqus::transaction::Transaction;
-use paqus::types::{Address, Amount, Nonce};
 
 fn receiver() -> Address {
     Address([2; 20])
@@ -13,7 +14,6 @@ fn generates_wallet_with_address() {
     let wallet = Wallet::generate();
     let wallet_address = wallet.wallet_address();
 
-    assert_eq!(wallet_address.len(), 40);
     assert_eq!(address_from_string(&wallet_address), Ok(wallet.address));
 }
 

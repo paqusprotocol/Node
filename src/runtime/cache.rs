@@ -1,14 +1,20 @@
 use paqus::block::Block;
+use paqus::block::{BlockHeight, Height};
+use paqus::consensus::supply::Amount;
+use paqus::crypto::{Address, BlockHash, Hash, PublicKey};
+use paqus::crypto::{CachedVerifyingKey, cached_verifying_key, try_address_from_public_key};
 use paqus::ledger::Ledger;
 use paqus::state::Account;
-use paqus::types::{Address, BlockHash, BlockHeight};
+use paqus::transaction::{SignedTransaction, TransactionError};
 use std::collections::BTreeMap;
 
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default)]
 pub struct CoreCache {
     accounts: BTreeMap<Address, Account>,
     blocks_by_height: BTreeMap<BlockHeight, Block>,
     blocks_by_hash: BTreeMap<BlockHash, Block>,
+    addresses_by_public_key: BTreeMap<PublicKey, Address>,
+    verifying_keys_by_public_key: BTreeMap<PublicKey, CachedVerifyingKey>,
     tip_height: Option<BlockHeight>,
     tip_hash: Option<BlockHash>,
 }
@@ -42,6 +48,84 @@ impl CoreCache {
         self.accounts.get(address)
     }
 
+    pub fn address_for_public_key(
+        &mut self,
+        public_key: &PublicKey,
+    ) -> Result<Address, TransactionError> {
+        if let Some(address) = self.addresses_by_public_key.get(public_key) {
+            return Ok(*address);
+        }
+
+        let address = try_address_from_public_key(public_key)
+            .map_err(|_| TransactionError::EmptyPublicKey)?;
+        self.addresses_by_public_key.insert(*public_key, address);
+        Ok(address)
+    }
+
+    pub fn verifying_key_for_public_key(&mut self, public_key: &PublicKey) -> &CachedVerifyingKey {
+        self.verifying_keys_by_public_key
+            .entry(*public_key)
+            .or_insert_with(|| cached_verifying_key(public_key))
+    }
+
+    pub fn validate_signed_transaction(
+        &mut self,
+        transaction: &SignedTransaction,
+    ) -> Result<(), TransactionError> {
+        self.validate_signed_transaction_for_height(transaction, Height(0))
+    }
+
+    pub fn validate_signed_transaction_for_height(
+        &mut self,
+        transaction: &SignedTransaction,
+        height: BlockHeight,
+    ) -> Result<(), TransactionError> {
+        transaction.validate_for_height(height)?;
+
+        if self.address_for_public_key(&transaction.witness.public_key)?
+            != transaction.transaction.from
+        {
+            return Err(TransactionError::SenderAddressMismatch);
+        }
+
+        self.verify_transaction_signature(transaction)
+    }
+
+    pub fn validate_signed_transaction_at(
+        &mut self,
+        transaction: &SignedTransaction,
+        now: u64,
+    ) -> Result<(), TransactionError> {
+        self.validate_signed_transaction_at_height(transaction, now, Height(0))
+    }
+
+    pub fn validate_signed_transaction_at_height(
+        &mut self,
+        transaction: &SignedTransaction,
+        now: u64,
+        height: BlockHeight,
+    ) -> Result<(), TransactionError> {
+        transaction.validate_at_height(now, height)?;
+
+        if self.address_for_public_key(&transaction.witness.public_key)?
+            != transaction.transaction.from
+        {
+            return Err(TransactionError::SenderAddressMismatch);
+        }
+
+        self.verify_transaction_signature(transaction)
+    }
+
+    fn verify_transaction_signature(
+        &mut self,
+        transaction: &SignedTransaction,
+    ) -> Result<(), TransactionError> {
+        let payload_bytes = transaction.transaction.signing_bytes();
+        self.verifying_key_for_public_key(&transaction.witness.public_key)
+            .verify(&payload_bytes, &transaction.witness.signature)
+            .map_err(|_| TransactionError::InvalidSignature)
+    }
+
     pub fn insert_block(&mut self, block: Block) {
         let height = block.height();
         let hash = block.hash();
@@ -72,6 +156,8 @@ impl CoreCache {
         self.accounts.clear();
         self.blocks_by_height.clear();
         self.blocks_by_hash.clear();
+        self.addresses_by_public_key.clear();
+        self.verifying_keys_by_public_key.clear();
         self.tip_height = None;
         self.tip_hash = None;
     }
@@ -80,10 +166,11 @@ impl CoreCache {
 #[cfg(test)]
 mod test {
     use super::CoreCache;
-    use paqus::block::Block;
+    use paqus::block::{Block, Height, Nonce};
+    use paqus::consensus::supply::Amount;
+    use paqus::crypto::{Address, Hash, address_from_public_key, generate_keypair};
     use paqus::ledger::Ledger;
     use paqus::state::Account;
-    use paqus::types::{Address, Amount, Hash, Height, Nonce};
 
     fn address(byte: u8) -> Address {
         Address([byte; 20])
@@ -111,6 +198,41 @@ mod test {
         assert_eq!(cache.block_by_hash(&block_hash), Some(&block));
         assert_eq!(cache.tip_height(), Some(Height(0)));
         assert_eq!(cache.tip_hash(), Some(block_hash));
+    }
+
+    #[test]
+    fn caches_addresses_by_public_key() {
+        let keypair = generate_keypair();
+        let mut cache = CoreCache::new();
+        let expected = address_from_public_key(&keypair.public_key);
+
+        assert_eq!(
+            cache.address_for_public_key(&keypair.public_key),
+            Ok(expected)
+        );
+        assert_eq!(
+            cache.addresses_by_public_key.get(&keypair.public_key),
+            Some(&expected)
+        );
+        assert_eq!(
+            cache.address_for_public_key(&keypair.public_key),
+            Ok(expected)
+        );
+    }
+
+    #[test]
+    fn caches_verifying_keys_by_public_key() {
+        let keypair = generate_keypair();
+        let mut cache = CoreCache::new();
+
+        cache.verifying_key_for_public_key(&keypair.public_key);
+        assert!(
+            cache
+                .verifying_keys_by_public_key
+                .contains_key(&keypair.public_key)
+        );
+        cache.verifying_key_for_public_key(&keypair.public_key);
+        assert_eq!(cache.verifying_keys_by_public_key.len(), 1);
     }
 
     #[test]

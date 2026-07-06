@@ -1,6 +1,7 @@
 use crate::runtime::network::error::NetworkError;
 use crate::runtime::network::message::{InventoryItem, NetworkMessage, TipInfo, VersionInfo};
 use crate::runtime::node::Node;
+use paqus::block::Height;
 
 const MAX_RANGE_RESPONSE_ITEMS: u32 = 64;
 
@@ -33,7 +34,7 @@ pub fn handle_message(
         NetworkMessage::GetBlocksByHeightRange { start, limit } => {
             let limit = limit.min(MAX_RANGE_RESPONSE_ITEMS);
             let blocks = (start.0..start.0.saturating_add(limit as u64))
-                .map(paqus::types::Height)
+                .map(Height)
                 .map_while(|height| node.ledger.block(&height).cloned())
                 .collect::<Vec<_>>();
             Ok(Some(NetworkMessage::Blocks(blocks)))
@@ -41,7 +42,7 @@ pub fn handle_message(
         NetworkMessage::GetBlockHeadersByHeightRange { start, limit } => {
             let limit = limit.min(MAX_RANGE_RESPONSE_ITEMS);
             let headers = (start.0..start.0.saturating_add(limit as u64))
-                .map(paqus::types::Height)
+                .map(Height)
                 .map_while(|height| node.ledger.block(&height).map(|block| block.header.clone()))
                 .collect::<Vec<_>>();
             Ok(Some(NetworkMessage::BlockHeaders(headers)))

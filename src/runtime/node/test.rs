@@ -1,13 +1,15 @@
 use super::Node;
 use crate::runtime::params::{BASE_FEE, BLOCK_REWARD_MATURITY};
-use paqus::block::{Block, BlockError};
+use paqus::block::{Block, BlockError, Height, Nonce};
 use paqus::consensus::{Consensus, ConsensusConfig, ConsensusError};
-use paqus::crypto::{KeyPair, address_from_public_key, generate_keypair, sign};
-use paqus::genesis::GENESIS_PREMINE_ADDRESS;
+use paqus::consensus::supply::Amount;
+use paqus::crypto::{
+    Address, Hash, KeyPair, PublicKey, Signature, address_from_public_key, generate_keypair, sign,
+};
+use paqus::genesis::GENESIS_MINER_ADDRESS;
 use paqus::ledger::Ledger;
 use paqus::state::Account;
 use paqus::transaction::{SignedTransaction, Transaction};
-use paqus::types::{Address, Amount, Hash, Height, Nonce, PublicKey, Signature};
 use std::collections::BTreeMap;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -15,7 +17,7 @@ fn address(byte: u8) -> Address {
     Address([byte; 20])
 }
 
-fn signed_transaction_to(to: Address, amount: u32, nonce: u64) -> SignedTransaction {
+fn signed_transaction_to(to: Address, amount: u64, nonce: u64) -> SignedTransaction {
     let keypair = generate_keypair();
     signed_transaction_from_keypair(&keypair, to, amount, nonce)
 }
@@ -23,7 +25,7 @@ fn signed_transaction_to(to: Address, amount: u32, nonce: u64) -> SignedTransact
 fn signed_transaction_from_keypair(
     keypair: &KeyPair,
     to: Address,
-    amount: u32,
+    amount: u64,
     nonce: u64,
 ) -> SignedTransaction {
     let from = address_from_public_key(&keypair.public_key);
@@ -153,7 +155,7 @@ fn initializes_genesis_when_storage_is_empty() {
     let node = Node::init_or_load(&dir, Consensus::with_default_config()).unwrap();
 
     assert_eq!(node.tip_height(), Some(Height(0)));
-    assert!(node.balance(&GENESIS_PREMINE_ADDRESS).is_some());
+    assert!(node.balance(&GENESIS_MINER_ADDRESS).is_some());
 }
 
 #[test]

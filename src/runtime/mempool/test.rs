@@ -1,11 +1,11 @@
 use super::{Mempool, MempoolConfig, MempoolError};
 use crate::runtime::params::{BASE_FEE, LOW_FEE_EXPIRY_SECS, MEMPOOL_EXPIRY_SECS};
-use paqus::block::Block;
-use paqus::crypto::{address_from_public_key, generate_keypair, sign};
+use paqus::block::{Block, Height, Nonce};
+use paqus::consensus::supply::Amount;
+use paqus::crypto::{Address, Hash, PublicKey, SecretKey, address_from_public_key, generate_keypair, sign};
 use paqus::ledger::{Ledger, LedgerError};
 use paqus::state::StateError;
 use paqus::transaction::{SignedTransaction, Transaction, TransactionError};
-use paqus::types::{Address, Amount, Hash, Height, Nonce};
 
 fn address(byte: u8) -> Address {
     Address([byte; 20])
@@ -32,10 +32,10 @@ fn signed_transaction_at(nonce: u64, timestamp: u64) -> SignedTransaction {
 }
 
 fn signed_transaction_from(
-    secret_key: &paqus::types::SecretKey,
-    public_key: paqus::types::PublicKey,
+    secret_key: &SecretKey,
+    public_key: PublicKey,
     to: Address,
-    amount: u32,
+    amount: u64,
     nonce: u64,
 ) -> SignedTransaction {
     signed_transaction_from_with_fee(
@@ -49,11 +49,11 @@ fn signed_transaction_from(
 }
 
 fn signed_transaction_from_with_fee(
-    secret_key: &paqus::types::SecretKey,
-    public_key: paqus::types::PublicKey,
+    secret_key: &SecretKey,
+    public_key: PublicKey,
     to: Address,
-    amount: u32,
-    fee: u32,
+    amount: u64,
+    fee: u64,
     nonce: u64,
 ) -> SignedTransaction {
     let from = address_from_public_key(&public_key);

@@ -4,15 +4,14 @@ use crate::runtime::miner::{MiningConfig, MiningResult, mine_candidate_block};
 use crate::runtime::node::error::NodeError;
 use crate::runtime::params::{DIFFICULTY_ADJUSTMENT_INTERVAL, HASH_SIZE};
 use crate::runtime::storage::Storage;
-use paqus::block::Block;
+use paqus::block::{Block, BlockHeight, Height};
 use paqus::consensus::Consensus;
+use paqus::consensus::supply::{Amount, Balance};
+use paqus::crypto::{Address, BlockHash, Hash, TransactionHash};
 use paqus::genesis::{GENESIS_HASH, genesis_block};
 use paqus::ledger::fork_choice::ForkChoice;
 use paqus::ledger::{Chain, Ledger};
-use paqus::transaction::SignedTransaction;
-use paqus::types::{
-    AccountNonce, Address, Amount, Balance, BlockHash, BlockHeight, Height, TransactionHash,
-};
+use paqus::transaction::{AccountNonce, SignedTransaction};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -85,7 +84,7 @@ pub struct Node {
 
 impl Node {
     pub fn new(ledger: Ledger, storage: Storage, consensus: Consensus) -> Self {
-        let genesis_accounts = if ledger.tip_height() == Some(paqus::types::Height(0)) {
+        let genesis_accounts = if ledger.tip_height() == Some(Height(0)) {
             ledger.accounts.clone()
         } else {
             BTreeMap::new()
@@ -141,7 +140,7 @@ impl Node {
         };
 
         let genesis_accounts = storage.load_genesis_accounts()?.unwrap_or_else(|| {
-            if ledger.tip_height() == Some(paqus::types::Height(0)) {
+            if ledger.tip_height() == Some(Height(0)) {
                 ledger.accounts.clone()
             } else {
                 BTreeMap::new()
@@ -156,9 +155,12 @@ impl Node {
         &mut self,
         transaction: SignedTransaction,
     ) -> Result<TransactionHash, NodeError> {
-        Ok(self
-            .mempool
-            .insert_validated_at(&self.ledger, transaction, current_unix_timestamp())?)
+        Ok(self.mempool.insert_validated_at_with_cache(
+            &self.ledger,
+            transaction,
+            current_unix_timestamp(),
+            &mut self.cache,
+        )?)
     }
 
     pub fn apply_block(&mut self, block: Block) -> Result<(), NodeError> {
@@ -184,7 +186,7 @@ impl Node {
 
     fn apply_known_parent_block(&mut self, block: Block) -> Result<(), NodeError> {
         self.validate_block_for_known_parent(&block)?;
-        self.validate_block_state_for_known_parent(&block)?;
+        let active_staged = self.validate_block_state_for_known_parent(&block)?;
         let block_hash = self.fork_choice.insert_block(block.clone())?;
         let best_tip_hash = self.fork_choice.best_tip().map(|node| node.hash);
 
@@ -201,7 +203,13 @@ impl Node {
             return self.reorg_to_best_tip();
         }
 
-        self.ledger.apply_block(block.clone())?;
+        self.ledger = active_staged.unwrap_or_else(|| {
+            let mut ledger = self.ledger.clone();
+            ledger
+                .apply_block(block.clone())
+                .expect("validated active block should apply");
+            ledger
+        });
         self.mempool.remove_confirmed(&block);
         self.cache.insert_block(block.clone());
         for transaction in &block.transactions {
@@ -378,17 +386,19 @@ impl Node {
         }
     }
 
-    fn validate_block_state_for_known_parent(&self, block: &Block) -> Result<(), NodeError> {
+    fn validate_block_state_for_known_parent(
+        &self,
+        block: &Block,
+    ) -> Result<Option<Ledger>, NodeError> {
         let extends_active_tip = match self.ledger.tip_hash() {
             Some(tip_hash) => block.previous_hash() == tip_hash,
             None => block.height().0 == 0,
         };
 
         if extends_active_tip {
-            let mut ledger = self.ledger.clone();
-            Self::validate_canonical_state_root(&ledger, block)?;
-            ledger.apply_block(block.clone())?;
-            return Ok(());
+            Self::validate_canonical_state_root(&self.ledger, block)?;
+            let (ledger, _) = self.ledger.execute_block(block)?;
+            return Ok(Some(ledger));
         }
 
         if self.genesis_accounts.is_empty() {
@@ -396,10 +406,9 @@ impl Node {
         }
 
         let parent_hash = BlockHash::from(block.previous_hash().as_hash());
-        let mut ledger = self.ledger_for_branch_tip(parent_hash)?;
+        let ledger = self.ledger_for_branch_tip(parent_hash)?;
         Self::validate_canonical_state_root(&ledger, block)?;
-        ledger.apply_block(block.clone())?;
-        Ok(())
+        Ok(None)
     }
 
     fn validate_canonical_state_root(ledger: &Ledger, block: &Block) -> Result<(), NodeError> {
@@ -407,7 +416,7 @@ impl Node {
         if block.state_root() != expected_state_root {
             return Err(paqus::ledger::LedgerError::InvalidStateRoot.into());
         }
-        if !block.is_genesis() && block.state_root() == paqus::types::Hash([0; HASH_SIZE]) {
+        if !block.is_genesis() && block.state_root() == Hash([0; HASH_SIZE]) {
             return Err(paqus::ledger::LedgerError::InvalidStateRoot.into());
         }
         Ok(())
@@ -548,9 +557,6 @@ impl Node {
         }
         self.consensus
             .validate_next_block_with_tip_at(block, &parent.block, now)?;
-        if !paqus::checkpoint::validate_checkpoint(block.height(), block.hash()) {
-            return Err(NodeError::CheckpointMismatch);
-        }
         Ok(())
     }
 
@@ -729,13 +735,13 @@ fn current_unix_timestamp() -> u64 {
 mod tests {
     use super::*;
     use crate::runtime::storage::Storage;
-    use paqus::block::Block;
+    use paqus::block::{Block, Height, Nonce};
+    use paqus::consensus::supply::Amount;
     use paqus::consensus::{Consensus, ConsensusConfig};
-    use paqus::crypto::{address_from_public_key, generate_keypair, sign};
+    use paqus::crypto::{Hash, address_from_public_key, generate_keypair, sign};
     use paqus::ledger::Ledger;
     use paqus::state::Account;
     use paqus::transaction::{SignedTransaction, Transaction};
-    use paqus::types::{Amount, Hash, Height, Nonce};
 
     fn address(byte: u8) -> Address {
         Address([byte; 20])

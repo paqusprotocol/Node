@@ -1,8 +1,8 @@
 use crate::runtime::mempool::Mempool;
-use paqus::block::Block;
+use paqus::block::{Block, Nonce};
 use paqus::consensus::{Consensus, ConsensusError};
+use paqus::crypto::Address;
 use paqus::ledger::Ledger;
-use paqus::types::{Address, Nonce};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct MiningConfig {

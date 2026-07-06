@@ -5,12 +5,14 @@ use super::{
 use crate::runtime::node::Node;
 use crate::runtime::params::BASE_FEE;
 use crate::runtime::params::MAX_NETWORK_MESSAGE_SIZE;
-use paqus::block::Block;
+use paqus::block::{Block, Height, Nonce};
 use paqus::consensus::{Consensus, ConsensusConfig};
-use paqus::crypto::{address_from_public_key, generate_keypair, sign};
+use paqus::consensus::supply::Amount;
+use paqus::crypto::{
+    Address, BlockHash, Hash, TransactionHash, address_from_public_key, generate_keypair, sign,
+};
 use paqus::ledger::Ledger;
 use paqus::transaction::{SignedTransaction, Transaction};
-use paqus::types::{Address, Amount, BlockHash, Hash, Height, Nonce, TransactionHash};
 use std::io::{Cursor, Read, Write};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -422,7 +424,7 @@ fn test_node_with_genesis() -> Node {
     .unwrap()
 }
 
-fn signed_transaction_to(to: Address, amount: u32, nonce: u64) -> SignedTransaction {
+fn signed_transaction_to(to: Address, amount: u64, nonce: u64) -> SignedTransaction {
     let keypair = generate_keypair();
     let from = address_from_public_key(&keypair.public_key);
     let payload = Transaction::new_at(

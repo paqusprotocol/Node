@@ -2,12 +2,12 @@ use crate::runtime::params::{ADDRESS_SIZE, HASH_SIZE, STORAGE_VERSION};
 use crate::runtime::storage::error::StorageError;
 use borsh::{BorshDeserialize, BorshSerialize};
 use lmdb::{Cursor, Database, DatabaseFlags, Environment, Transaction, WriteFlags};
-use paqus::block::Block;
+use paqus::block::{Block, BlockHeight, Height};
+use paqus::crypto::{Address, BlockHash, Hash, TransactionHash};
 use paqus::ledger::{Ledger, calculate_state_root};
 use paqus::snapshot::is_snapshot_height;
 use paqus::state::Account;
 use paqus::transaction::SignedTransaction;
-use paqus::types::{Address, BlockHash, BlockHeight, Hash, Height, TransactionHash};
 use std::collections::BTreeMap;
 use std::path::Path;
 use std::sync::Arc;
@@ -20,6 +20,7 @@ const GENESIS_ACCOUNTS: &str = "genesis_accounts";
 const STATE_SNAPSHOTS: &str = "state_snapshots";
 const TX_INDEX: &str = "tx_index";
 const ADDRESS_TX_INDEX: &str = "address_tx_index";
+const MINER_BLOCK_INDEX: &str = "miner_block_index";
 const META: &str = "meta";
 const TIP_HEIGHT_KEY: &[u8] = b"tip_height";
 const TIP_HASH_KEY: &[u8] = b"tip_hash";
@@ -49,6 +50,12 @@ pub struct AddressTransactionLocation {
     pub sent: bool,
 }
 
+#[derive(BorshSerialize, BorshDeserialize, Clone, Copy, Debug, PartialEq, Eq)]
+pub struct MinerBlockLocation {
+    pub block_height: BlockHeight,
+    pub block_hash: BlockHash,
+}
+
 impl StateSnapshot {
     pub fn verify_state_root(&self) -> bool {
         calculate_state_root(&self.accounts) == self.state_root
@@ -72,6 +79,7 @@ pub struct Storage {
     state_snapshots: Database,
     tx_index: Database,
     address_tx_index: Database,
+    miner_block_index: Database,
     meta: Database,
 }
 
@@ -110,6 +118,7 @@ impl Storage {
             state_snapshots: env.create_db(Some(STATE_SNAPSHOTS), DatabaseFlags::empty())?,
             tx_index: env.create_db(Some(TX_INDEX), DatabaseFlags::empty())?,
             address_tx_index: env.create_db(Some(ADDRESS_TX_INDEX), DatabaseFlags::empty())?,
+            miner_block_index: env.create_db(Some(MINER_BLOCK_INDEX), DatabaseFlags::empty())?,
             meta: env.create_db(Some(META), DatabaseFlags::empty())?,
             env,
         })
@@ -150,7 +159,8 @@ impl Storage {
             && is_db_empty(&txn, self.genesis_accounts)?
             && is_db_empty(&txn, self.state_snapshots)?
             && is_db_empty(&txn, self.tx_index)?
-            && is_db_empty(&txn, self.address_tx_index)?)
+            && is_db_empty(&txn, self.address_tx_index)?
+            && is_db_empty(&txn, self.miner_block_index)?)
     }
 
     pub fn save_block(&self, block: &Block) -> Result<(), StorageError> {
@@ -169,6 +179,7 @@ impl Storage {
             WriteFlags::empty(),
         )?;
         self.index_block_transactions(&mut txn, block)?;
+        self.index_miner_block(&mut txn, block)?;
         txn.commit()?;
         Ok(())
     }
@@ -184,6 +195,27 @@ impl Storage {
         )?;
         txn.commit()?;
         Ok(())
+    }
+
+    fn index_miner_block(
+        &self,
+        txn: &mut lmdb::RwTransaction<'_>,
+        block: &Block,
+    ) -> Result<(), StorageError> {
+        if block.coinbase.is_none() {
+            return Ok(());
+        }
+
+        let location = MinerBlockLocation {
+            block_height: block.height(),
+            block_hash: block.hash(),
+        };
+        put_value(
+            txn,
+            self.miner_block_index,
+            &miner_block_key(&block.miner_address(), block.height()),
+            &location,
+        )
     }
 
     fn index_block_transactions(
@@ -335,13 +367,38 @@ impl Storage {
         let txn = self.env.begin_ro_txn()?;
         let mut cursor = txn.open_ro_cursor(self.address_tx_index)?;
         for (key, bytes) in cursor.iter() {
-            if key.starts_with(&prefix) {
-                locations.push(decode(bytes)?);
+            if key < prefix.as_slice() {
+                continue;
             }
+            if !key.starts_with(&prefix) {
+                break;
+            }
+            locations.push(decode(bytes)?);
         }
         locations.sort_by_key(|location: &AddressTransactionLocation| {
             (location.block_height, location.tx_index, location.sent)
         });
+        Ok(locations)
+    }
+
+    pub fn load_miner_block_locations(
+        &self,
+        address: &Address,
+    ) -> Result<Vec<MinerBlockLocation>, StorageError> {
+        let prefix = address.0;
+        let mut locations = Vec::new();
+        let txn = self.env.begin_ro_txn()?;
+        let mut cursor = txn.open_ro_cursor(self.miner_block_index)?;
+        for (key, bytes) in cursor.iter() {
+            if key < prefix.as_slice() {
+                continue;
+            }
+            if !key.starts_with(&prefix) {
+                break;
+            }
+            locations.push(decode(bytes)?);
+        }
+        locations.sort_by_key(|location: &MinerBlockLocation| location.block_height);
         Ok(locations)
     }
 
@@ -457,6 +514,7 @@ impl Storage {
         txn.clear_db(self.state_snapshots)?;
         txn.clear_db(self.tx_index)?;
         txn.clear_db(self.address_tx_index)?;
+        txn.clear_db(self.miner_block_index)?;
 
         for account in ledger.accounts.values() {
             put_value(&mut txn, self.accounts, &account.address.0, account)?;
@@ -477,6 +535,7 @@ impl Storage {
                 WriteFlags::empty(),
             )?;
             self.index_block_transactions(&mut txn, block)?;
+            self.index_miner_block(&mut txn, block)?;
         }
 
         if let (Some(height), Some(hash)) = (ledger.tip_height(), ledger.tip_hash()) {
@@ -698,6 +757,13 @@ fn address_tx_key(address: &Address, height: BlockHeight, tx_index: u32, sent: b
     key.extend_from_slice(&height.0.to_be_bytes());
     key.extend_from_slice(&tx_index.to_be_bytes());
     key.push(u8::from(sent));
+    key
+}
+
+fn miner_block_key(address: &Address, height: BlockHeight) -> Vec<u8> {
+    let mut key = Vec::with_capacity(ADDRESS_SIZE + 8);
+    key.extend_from_slice(&address.0);
+    key.extend_from_slice(&height.0.to_be_bytes());
     key
 }
 

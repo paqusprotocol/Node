@@ -1,11 +1,11 @@
 use super::{StateSnapshot, Storage, StorageError};
 use crate::runtime::params::{DEFAULT_TRANSACTION_FEE, STORAGE_VERSION};
-use paqus::block::Block;
-use paqus::crypto::{address_from_public_key, generate_keypair, sign};
+use paqus::block::{Block, Height, Nonce};
+use paqus::consensus::supply::Amount;
+use paqus::crypto::{Address, BlockHash, Hash, address_from_public_key, generate_keypair, sign};
 use paqus::ledger::Ledger;
 use paqus::state::Account;
 use paqus::transaction::{SignedTransaction, Transaction};
-use paqus::types::{Address, Amount, BlockHash, Hash, Height, Nonce};
 
 fn address(byte: u8) -> Address {
     Address([byte; 20])
@@ -22,7 +22,7 @@ fn block(height: u64, previous_hash: Hash) -> Block {
     )
 }
 
-fn signed_transaction(to: Address, amount: u32, nonce: u64) -> SignedTransaction {
+fn signed_transaction(to: Address, amount: u64, nonce: u64) -> SignedTransaction {
     let keypair = generate_keypair();
     let from = address_from_public_key(&keypair.public_key);
     let payload = Transaction::new(
@@ -118,6 +118,57 @@ fn indexes_transactions_by_hash_and_address() {
 }
 
 #[test]
+fn indexes_canonical_blocks_by_miner_address() {
+    let storage = Storage::temporary().unwrap();
+    let miner = address(7);
+    let side_miner = address(8);
+    let genesis = block(0, Hash([0; 64]));
+    let canonical = Block::with_coinbase(
+        Height(1),
+        genesis.hash(),
+        miner,
+        1,
+        1_700_000_001,
+        Nonce(0),
+        Some(paqus::block::CoinbaseTransaction::new(
+            miner,
+            Amount(0),
+            Amount(0),
+        )),
+        vec![],
+    );
+    let side = Block::with_coinbase(
+        Height(1),
+        genesis.hash(),
+        side_miner,
+        1,
+        1_700_000_002,
+        Nonce(1),
+        Some(paqus::block::CoinbaseTransaction::new(
+            side_miner,
+            Amount(0),
+            Amount(0),
+        )),
+        vec![],
+    );
+
+    storage.save_block(&genesis).unwrap();
+    storage.save_block(&canonical).unwrap();
+    storage.save_side_block(&side).unwrap();
+
+    let mined = storage.load_miner_block_locations(&miner).unwrap();
+    assert_eq!(mined.len(), 1);
+    assert_eq!(mined[0].block_height, Height(1));
+    assert_eq!(mined[0].block_hash, canonical.hash());
+    assert!(
+        storage
+            .load_miner_block_locations(&side_miner)
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[test]
 fn save_ledger_rebuilds_canonical_transaction_indexes() {
     let storage = Storage::temporary().unwrap();
     let genesis = block(0, Hash([0; 64]));
@@ -164,6 +215,69 @@ fn save_ledger_rebuilds_canonical_transaction_indexes() {
         storage.load_block_by_height(Height(1)).unwrap(),
         Some(new_block)
     );
+}
+
+#[test]
+fn save_ledger_rebuilds_miner_block_index() {
+    let storage = Storage::temporary().unwrap();
+    let genesis = block(0, Hash([0; 64]));
+    let old_miner = address(4);
+    let new_miner = address(5);
+    let old_block = Block::with_coinbase(
+        Height(1),
+        genesis.hash(),
+        old_miner,
+        1,
+        1_700_000_001,
+        Nonce(1),
+        Some(paqus::block::CoinbaseTransaction::new(
+            old_miner,
+            Amount(0),
+            Amount(0),
+        )),
+        vec![],
+    );
+    let new_block = Block::with_coinbase(
+        Height(1),
+        genesis.hash(),
+        new_miner,
+        1,
+        1_700_000_002,
+        Nonce(2),
+        Some(paqus::block::CoinbaseTransaction::new(
+            new_miner,
+            Amount(0),
+            Amount(0),
+        )),
+        vec![],
+    );
+
+    let mut old_ledger = Ledger::new();
+    old_ledger.chain.insert_block(genesis.clone()).unwrap();
+    old_ledger.chain.insert_block(old_block).unwrap();
+    storage.save_ledger(&old_ledger).unwrap();
+    assert_eq!(
+        storage
+            .load_miner_block_locations(&old_miner)
+            .unwrap()
+            .len(),
+        1
+    );
+
+    let mut new_ledger = Ledger::new();
+    new_ledger.chain.insert_block(genesis).unwrap();
+    new_ledger.chain.insert_block(new_block.clone()).unwrap();
+    storage.save_ledger(&new_ledger).unwrap();
+
+    assert!(
+        storage
+            .load_miner_block_locations(&old_miner)
+            .unwrap()
+            .is_empty()
+    );
+    let mined = storage.load_miner_block_locations(&new_miner).unwrap();
+    assert_eq!(mined.len(), 1);
+    assert_eq!(mined[0].block_hash, new_block.hash());
 }
 
 #[test]

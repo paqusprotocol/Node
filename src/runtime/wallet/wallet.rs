@@ -1,11 +1,11 @@
 use crate::runtime::wallet::error::WalletError;
 use paqus::crypto::{
-    address_from_public_key, address_to_string, derive_public_key, generate_keypair, sign,
+    Address, PublicKey, SecretKey, address_from_public_key, address_to_string, derive_public_key,
+    generate_keypair, sign,
 };
 use paqus::transaction::{SignedTransaction, Transaction};
-use paqus::types::{Address, PublicKey, SecretKey};
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Wallet {
     pub public_key: PublicKey,
     pub secret_key: SecretKey,

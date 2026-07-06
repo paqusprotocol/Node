@@ -1,11 +1,12 @@
 use super::{MiningConfig, mine_candidate_block};
 use crate::runtime::mempool::Mempool;
 use crate::runtime::params::BASE_FEE;
+use paqus::block::{Block, Height, Nonce};
 use paqus::consensus::{Consensus, ConsensusConfig};
-use paqus::crypto::{address_from_public_key, generate_keypair, sign};
+use paqus::consensus::supply::Amount;
+use paqus::crypto::{Address, Hash, address_from_public_key, generate_keypair, sign};
 use paqus::ledger::Ledger;
 use paqus::transaction::{SignedTransaction, Transaction};
-use paqus::types::{Address, Amount, Nonce};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 fn address(byte: u8) -> Address {
@@ -20,9 +21,9 @@ fn mines_coinbase_only_candidate_without_user_transactions() {
     let mut ledger = Ledger::new();
     let miner = address(9);
     ledger.create_account(miner, Amount(0)).unwrap();
-    let genesis = paqus::block::Block::new(
-        paqus::types::Height(0),
-        paqus::types::Hash([0; 64]),
+    let genesis = Block::new(
+        Height(0),
+        Hash([0; 64]),
         miner,
         1_700_000_000,
         Nonce(0),

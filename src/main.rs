@@ -27,8 +27,8 @@ use p2p::{
 use paquscore::{
     Address, Amount, Block, BlockHash, Consensus, GENESIS_PREMINE_ADDRESS, Hash, Height,
     InventoryItem, NetworkMessage, Node, Nonce, PeerInfo, SecretKey, SignedTransaction,
-    Transaction, Wallet, address_from_public_key, address_to_string, derive_public_key,
-    handle_message, read_message, write_message,
+    Transaction, TransactionHash, Wallet, address_from_public_key, address_to_string,
+    derive_public_key, handle_message, read_message, write_message,
 };
 use paquscore::{
     BLOCK_REWARD_MATURITY, BLOCK_TIME, CHAIN_ID, CHAIN_NAME, COIN_NAME, CONFIRMATION_DEPTH,
@@ -616,8 +616,8 @@ struct RunConfig {
     gateway_heartbeat: Duration,
     shutdown_file: String,
     max_peers: usize,
-    min_relay_fee: u32,
-    market_fee: u32,
+    min_relay_fee: u64,
+    market_fee: u64,
     low_fee_expiry: Duration,
     mempool_expiry: Duration,
     miner_address: Address,
@@ -640,9 +640,9 @@ struct RunConfigFile {
     shutdown_file: String,
     max_peers: usize,
     #[serde(default)]
-    min_relay_fee: Option<u32>,
+    min_relay_fee: Option<u64>,
     #[serde(default)]
-    market_fee: Option<u32>,
+    market_fee: Option<u64>,
     #[serde(default)]
     low_fee_expiry_secs: Option<u64>,
     #[serde(default)]
@@ -785,8 +785,8 @@ struct TxResponse {
     hash: String,
     from: String,
     to: String,
-    amount: u32,
-    fee: u32,
+    amount: u64,
+    fee: u64,
     nonce: u64,
     timestamp: u64,
     age_secs: u64,
@@ -798,15 +798,15 @@ struct TxResponse {
 #[derive(Serialize)]
 struct CoinbaseResponse {
     to: String,
-    subsidy: u32,
-    fees: u32,
-    total: u32,
+    subsidy: u64,
+    fees: u64,
+    total: u64,
 }
 
 #[derive(Serialize)]
 struct GenesisAllocationResponse {
     to: String,
-    amount: u32,
+    amount: u64,
 }
 
 #[derive(Serialize)]
@@ -825,7 +825,7 @@ struct BlockResponse {
     block_time_secs: Option<u64>,
     target_block_time_secs: u32,
     block_time_delta_secs: Option<i64>,
-    value_moved: u32,
+    value_moved: u64,
     nonce: u64,
     tx_count: usize,
     size: usize,
@@ -841,9 +841,9 @@ struct MinedBlockResponse {
     confirmations: u64,
     maturity_height: u64,
     matured: bool,
-    subsidy: u32,
-    fees: u32,
-    total: u32,
+    subsidy: u64,
+    fees: u64,
+    total: u64,
     tx_count: usize,
     timestamp: u64,
 }
@@ -864,11 +864,11 @@ struct AddressResponse {
 #[derive(Serialize)]
 struct AccountResponse {
     address: String,
-    confirmed: u32,
-    available: u32,
-    unspendable: u32,
-    pending_incoming: u32,
-    pending_outgoing: u32,
+    confirmed: u64,
+    available: u64,
+    unspendable: u64,
+    pending_incoming: u64,
+    pending_outgoing: u64,
     nonce: u64,
     credits: usize,
 }
@@ -1037,7 +1037,7 @@ impl NodeService {
         }
 
         if self.config.mine {
-            let secret_key = self.config.miner_secret_key.ok_or_else(|| {
+            let secret_key = self.config.miner_secret_key.as_ref().ok_or_else(|| {
                 "mining requires --wallet or --miner-secret-key so the miner identity is explicit"
                     .to_string()
             })?;
@@ -1068,7 +1068,9 @@ impl NodeService {
         }
 
         for peer in peers {
+            println!("preflight peer {peer} connecting");
             let result = PeerConnection::connect(peer).and_then(|mut connection| {
+                println!("preflight peer {peer} connected; polling tip and sync state");
                 let poll = poll_peer_connection(
                     &mut connection,
                     &self.node,
@@ -1094,6 +1096,10 @@ impl NodeService {
             });
             match result {
                 Ok(PeerPoll::Idle { remote_tip }) => {
+                    println!(
+                        "preflight peer {peer} ok:: |remote_tip::{}|state::idle|",
+                        remote_tip.0
+                    );
                     if let Ok(mut peers) = self.peers.lock() {
                         if let Some(state) = peers.get_mut(&peer) {
                             state.mark_ok(Some(remote_tip));
@@ -1104,6 +1110,10 @@ impl NodeService {
                     remote_tip,
                     synced_blocks,
                 }) => {
+                    println!(
+                        "preflight peer {peer} synced:: |remote_tip::{}|blocks::{}|",
+                        remote_tip.0, synced_blocks
+                    );
                     if let Ok(mut peers) = self.peers.lock() {
                         if let Some(state) = peers.get_mut(&peer) {
                             state.mark_synced(remote_tip, synced_blocks);
@@ -2424,25 +2434,18 @@ fn find_transaction(node: &Node, hash: &Hash) -> Result<Option<TxResponse>, Stri
         }
     }
 
-    let tip = node.tip_height().unwrap_or(Height(0)).0;
-    for height in 0..=tip {
-        let block = node
-            .storage
-            .load_block_by_height(Height(height))
-            .map_err(|error| format!("failed to load block: {error}"))?;
-        let Some(block) = block else {
-            continue;
-        };
-        for transaction in &block.transactions {
-            if transaction.hash() == *hash {
-                return Ok(Some(tx_response(
-                    transaction,
-                    Some(block.height()),
-                    Some(block.hash().into()),
-                    "confirmed",
-                )));
-            }
-        }
+    let hash = TransactionHash(hash.0);
+    if let Some((location, transaction)) = node
+        .storage
+        .load_transaction(&hash)
+        .map_err(|error| format!("failed to load indexed transaction: {error}"))?
+    {
+        return Ok(Some(tx_response(
+            &transaction,
+            Some(location.block_height),
+            Some(location.block_hash.into()),
+            "confirmed",
+        )));
     }
     Ok(None)
 }
@@ -2451,47 +2454,60 @@ fn address_activity(node: &Node, address: &Address) -> Result<AddressActivity, S
     let mut mined_blocks = Vec::new();
     let mut transactions = Vec::new();
     let tip = node.tip_height().unwrap_or(Height(0)).0;
-    for height in 0..=tip {
+    let mined_locations = node
+        .storage
+        .load_miner_block_locations(address)
+        .map_err(|error| format!("failed to load miner block index: {error}"))?;
+    for location in mined_locations {
+        let height = location.block_height.0;
         let block = node
             .storage
-            .load_block_by_height(Height(height))
+            .load_block_by_height(location.block_height)
             .map_err(|error| format!("failed to load block: {error}"))?;
         let Some(block) = block else {
             continue;
         };
-        if block.miner_address() == *address {
-            if let Some(coinbase) = block.coinbase.as_ref() {
-                let maturity_height = height.saturating_add(BLOCK_REWARD_MATURITY as u64);
-                mined_blocks.push(MinedBlockResponse {
-                    height,
-                    hash: hex::encode(block.hash().0),
-                    confirmations: tip.saturating_sub(height).saturating_add(1),
-                    maturity_height,
-                    matured: tip >= maturity_height,
-                    subsidy: coinbase.subsidy.0,
-                    fees: coinbase.fees.0,
-                    total: coinbase.total().0,
-                    tx_count: block.transaction_count(),
-                    timestamp: block.timestamp(),
-                });
-            }
+        if block.hash() != location.block_hash || block.miner_address() != *address {
+            continue;
         }
-        for transaction in &block.transactions {
-            if transaction.transaction.from == *address || transaction.transaction.to == *address {
-                transactions.push(tx_response(
-                    transaction,
-                    Some(block.height()),
-                    Some(block.hash().into()),
-                    "confirmed",
-                ));
-            }
+        if let Some(coinbase) = block.coinbase.as_ref() {
+            let maturity_height = height.saturating_add(BLOCK_REWARD_MATURITY as u64);
+            mined_blocks.push(MinedBlockResponse {
+                height,
+                hash: hex::encode(block.hash().0),
+                confirmations: tip.saturating_sub(height).saturating_add(1),
+                maturity_height,
+                matured: tip >= maturity_height,
+                subsidy: coinbase.subsidy.0,
+                fees: coinbase.fees.0,
+                total: coinbase.total().0,
+                tx_count: block.transaction_count(),
+                timestamp: block.timestamp(),
+            });
         }
     }
 
-    for transaction in node.mempool.transactions() {
-        if transaction.transaction.from == *address || transaction.transaction.to == *address {
-            transactions.push(tx_response(transaction, None, None, "pending"));
+    let locations = node
+        .storage
+        .load_address_transaction_locations(address)
+        .map_err(|error| format!("failed to load address transaction index: {error}"))?;
+    for location in locations {
+        if let Some((_, transaction)) = node
+            .storage
+            .load_transaction(&location.tx_hash)
+            .map_err(|error| format!("failed to load indexed transaction: {error}"))?
+        {
+            transactions.push(tx_response(
+                &transaction,
+                Some(location.block_height),
+                Some(location.block_hash.into()),
+                "confirmed",
+            ));
         }
+    }
+
+    for transaction in node.mempool.transactions_for_address(address) {
+        transactions.push(tx_response(transaction, None, None, "pending"));
     }
 
     mined_blocks.reverse();
@@ -2832,7 +2848,7 @@ fn parse_run_config(args: &[String]) -> Result<RunConfig, String> {
                 config.min_relay_fee = args
                     .get(index)
                     .ok_or_else(|| "missing value for --min-relay-fee".to_string())?
-                    .parse::<u32>()
+                    .parse::<u64>()
                     .map_err(|error| format!("invalid min relay fee: {error}"))?
                     .max(runtime::params::MIN_RELAY_FEE_FLOOR);
             }
@@ -2841,7 +2857,7 @@ fn parse_run_config(args: &[String]) -> Result<RunConfig, String> {
                 config.market_fee = args
                     .get(index)
                     .ok_or_else(|| "missing value for --market-fee".to_string())?
-                    .parse::<u32>()
+                    .parse::<u64>()
                     .map_err(|error| format!("invalid market fee: {error}"))?;
             }
             "--low-fee-expiry-secs" => {
@@ -3165,7 +3181,7 @@ fn parse_secret_key(value: Option<&String>) -> Result<SecretKey, String> {
 fn parse_amount(value: Option<&String>, flag: &str) -> Result<Amount, String> {
     let value = value.ok_or_else(|| format!("missing value for {flag}"))?;
     value
-        .parse::<u32>()
+        .parse::<u64>()
         .map(Amount)
         .map_err(|error| format!("invalid amount for {flag}: {error}"))
 }
@@ -3372,7 +3388,7 @@ mod tests {
 
         assert_eq!(config.db_path, "./data/paqus");
         assert_eq!(config.listen_addrs.len(), 2);
-        assert_eq!(config.peers.len(), 2);
+        assert_eq!(config.peers.len(), 3);
         assert_eq!(config.public_addrs.len(), 1);
         assert_eq!(config.rpc_addr, "127.0.0.1:6666".parse().unwrap());
         assert!(config.mine);

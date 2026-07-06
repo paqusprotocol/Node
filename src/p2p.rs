@@ -181,7 +181,9 @@ pub fn poll_peer_connection(
     public_addrs: &[SocketAddr],
     sync_window: u64,
 ) -> Result<PeerPoll, String> {
+    println!("peer {} handshake start", peer.addr());
     handshake_peer(peer, node, public_addrs)?;
+    println!("peer {} handshake ok; requesting tip", peer.addr());
     let tip = request_tip(peer)?;
     let local_height = node
         .lock()
@@ -189,6 +191,12 @@ pub fn poll_peer_connection(
         .tip_height()
         .unwrap_or(Height(0))
         .0;
+    println!(
+        "peer {} tip check:: |local::{}|remote::{}|",
+        peer.addr(),
+        local_height,
+        tip.0
+    );
     if tip.0 <= local_height {
         return if request_missing_parent_blocks(peer, node)? {
             Ok(PeerPoll::Synced {
@@ -203,11 +211,32 @@ pub fn poll_peer_connection(
     let ancestor = request_common_ancestor(peer, node)?;
     let sync_window = sync_window.clamp(MIN_BLOCKS_PER_SYNC, MAX_BLOCKS_PER_SYNC);
     let target = tip.0.min(ancestor.height.0.saturating_add(sync_window));
+    println!(
+        "peer {} sync plan:: |ancestor::{}|target::{}|remote_tip::{}|window::{}|",
+        peer.addr(),
+        ancestor.height.0,
+        target,
+        tip.0,
+        sync_window
+    );
     if target <= ancestor.height.0 {
         return Ok(PeerPoll::Idle { remote_tip: tip });
     }
     let start = Height(ancestor.height.0.saturating_add(1));
+    println!(
+        "peer {} requesting headers:: |start::{}|target::{}|",
+        peer.addr(),
+        start.0,
+        target
+    );
     let headers = request_headers(peer, start, target, ancestor.hash)?;
+    println!(
+        "peer {} headers ok:: |count::{}|start::{}|target::{}|",
+        peer.addr(),
+        headers.len(),
+        start.0,
+        target
+    );
     request_blocks(peer, node, start, target, headers)?;
     request_missing_parent_blocks(peer, node)?;
     Ok(PeerPoll::Synced {
@@ -502,6 +531,13 @@ fn fetch_blocks(
     while next_height <= target {
         let remaining = target.saturating_sub(next_height).saturating_add(1);
         let limit = remaining.min(MAX_BLOCKS_PER_BATCH) as u32;
+        println!(
+            "peer {} downloading blocks:: |start::{}|limit::{}|target::{}|",
+            peer.addr(),
+            next_height,
+            limit,
+            target
+        );
         let response = peer.request(NetworkMessage::GetBlocksByHeightRange {
             start: Height(next_height),
             limit,

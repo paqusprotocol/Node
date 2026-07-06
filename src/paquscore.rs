@@ -1,16 +1,20 @@
 pub use paqus::block::Block;
-pub use paqus::consensus::Consensus;
-pub use paqus::crypto::{address_from_public_key, address_to_string, derive_public_key};
-pub use paqus::genesis::GENESIS_PREMINE_ADDRESS;
-pub use paqus::params::{
-    BLOCK_REWARD_MATURITY, BLOCK_TIME, CHAIN_ID, CHAIN_NAME, COIN_NAME, CONFIRMATION_DEPTH,
-    CURRENT_CHAIN_PARAMS, DIFFICULTY_ADJUSTMENT_INTERVAL, DIFFICULTY_START, FINALITY_DEPTH,
-    GENESIS_PREMINE, MAX_BLOCK_TXS, MAX_MINED_SUPPLY, MAX_UNIT_SUPPLY, PROTOCOL_STAGE,
-    PROTOCOL_VERSION,
+pub use paqus::block::{Height, Nonce};
+pub use paqus::consensus::supply::{Amount, MAX_MINED_SUPPLY, MAX_UNIT_SUPPLY};
+pub use paqus::consensus::{
+    BLOCK_TIME, Consensus, DIFFICULTY_ADJUSTMENT_INTERVAL, DIFFICULTY_START,
 };
+pub use paqus::crypto::{
+    Address, BlockHash, Hash, SecretKey, TransactionHash, address_from_public_key,
+    address_to_string, derive_public_key,
+};
+pub use paqus::genesis::{CURRENT_CHAIN_PARAMS, GENESIS_MINER_ADDRESS as GENESIS_PREMINE_ADDRESS};
+pub use paqus::ledger::{BLOCK_REWARD_MATURITY, CONFIRMATION_DEPTH, FINALITY_DEPTH};
 pub use paqus::transaction::{SignedTransaction, Transaction};
-pub use paqus::types::{
-    Address, Amount, BlockHash, Hash, Height, Nonce, SecretKey, TransactionHash,
+
+pub use crate::runtime::params::{
+    CHAIN_ID, CHAIN_NAME, COIN_NAME, GENESIS_PREMINE, MAX_BLOCK_TXS, PROTOCOL_STAGE,
+    PROTOCOL_VERSION,
 };
 
 pub use crate::runtime::network::{
