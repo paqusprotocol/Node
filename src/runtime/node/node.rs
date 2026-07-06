@@ -583,6 +583,7 @@ impl Node {
                 difficulty,
                 max_attempts,
                 transaction_limit,
+                min_fee_rate: self.mempool.dynamic_market_fee_rate(),
             },
         )?
         .ok_or(NodeError::MiningExhausted)?;

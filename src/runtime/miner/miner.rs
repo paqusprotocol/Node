@@ -9,6 +9,7 @@ pub struct MiningConfig {
     pub difficulty: u32,
     pub max_attempts: u64,
     pub transaction_limit: usize,
+    pub min_fee_rate: u64,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -31,6 +32,7 @@ pub fn mine_candidate_block(
         miner_address,
         timestamp,
         config.transaction_limit,
+        config.min_fee_rate,
         config.difficulty,
     )?;
     mine_prepared_block(block, consensus, config)
@@ -42,15 +44,17 @@ pub fn prepare_candidate_block(
     miner_address: Address,
     timestamp: u64,
     transaction_limit: usize,
+    min_fee_rate: u64,
     difficulty: u32,
 ) -> Result<Block, ConsensusError> {
     let mut block = mempool
-        .create_candidate_block(
+        .create_candidate_block_with_min_fee_rate(
             ledger,
             miner_address,
             timestamp,
             Nonce(0),
             transaction_limit,
+            min_fee_rate,
         )
         .map_err(|_| ConsensusError::InvalidBlock(paqus::block::BlockError::InvalidStateRoot))?;
     block.header.difficulty = difficulty;

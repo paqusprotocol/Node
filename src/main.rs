@@ -622,6 +622,7 @@ struct RunConfig {
     mempool_expiry: Duration,
     miner_address: Address,
     miner_secret_key: Option<SecretKey>,
+    miner_min_fee_rate: Option<u64>,
     mine: bool,
     mine_interval: Duration,
     mine_attempts: u64,
@@ -650,6 +651,8 @@ struct RunConfigFile {
     wallet: Option<String>,
     miner_address: Option<String>,
     miner_secret_key: Option<String>,
+    #[serde(default)]
+    miner_min_fee_rate: Option<u64>,
     mine: bool,
     mine_interval_secs: u64,
     mine_attempts: u64,
@@ -908,6 +911,7 @@ impl Default for RunConfig {
             mempool_expiry: Duration::from_secs(runtime::params::MEMPOOL_EXPIRY_SECS),
             miner_address: Address([9; 20]),
             miner_secret_key: None,
+            miner_min_fee_rate: None,
             mine: false,
             mine_interval: DEFAULT_MINING_INTERVAL,
             mine_attempts: 10_000,
@@ -946,6 +950,7 @@ impl Default for RunConfigFile {
             wallet: None,
             miner_address: None,
             miner_secret_key: None,
+            miner_min_fee_rate: defaults.miner_min_fee_rate,
             mine: false,
             mine_interval_secs: defaults.mine_interval.as_secs(),
             mine_attempts: defaults.mine_attempts,
@@ -2645,7 +2650,7 @@ fn run_node(args: &[String]) -> Result<(), String> {
     );
     service.preflight()?;
 
-    let (height, tip_hash, difficulty) = {
+    let (height, tip_hash, difficulty, dynamic_market_fee_rate) = {
         let node = node
             .lock()
             .map_err(|_| "node state lock poisoned".to_string())?;
@@ -2653,11 +2658,12 @@ fn run_node(args: &[String]) -> Result<(), String> {
             node.tip_height().unwrap_or(Height(0)).0,
             short_hash(node.tip_hash()),
             format_difficulty(node.next_difficulty()),
+            node.mempool.dynamic_market_fee_rate(),
         )
     };
 
     println!(
-        "Paqus Node db::{}|p2p::{}|rpc::{}|height::{}|tip::{}|difficulty::{}|peers::{}|mining::{}|min_relay_fee::{}|market_fee::{}|low_fee_expiry::{}s|mempool_expiry::{}s",
+        "Paqus Node db::{}|p2p::{}|rpc::{}|height::{}|tip::{}|difficulty::{}|peers::{}|mining::{}|min_relay_fee_rate_per_kib::{}|base_market_fee_rate_per_kib::{}|dynamic_market_fee_rate_per_kib::{}|miner_min_fee_rate_per_kib::{}|low_fee_expiry::{}s|mempool_expiry::{}s",
         service.config.db_path,
         format_socket_addrs(&bound_addrs),
         service.config.rpc_addr,
@@ -2668,6 +2674,12 @@ fn run_node(args: &[String]) -> Result<(), String> {
         service.config.mine,
         service.config.min_relay_fee,
         service.config.market_fee,
+        dynamic_market_fee_rate,
+        service
+            .config
+            .miner_min_fee_rate
+            .map(|rate| rate.to_string())
+            .unwrap_or_else(|| "dynamic".to_string()),
         service.config.low_fee_expiry.as_secs(),
         service.config.mempool_expiry.as_secs()
     );
@@ -2890,6 +2902,15 @@ fn parse_run_config(args: &[String]) -> Result<RunConfig, String> {
                 index += 1;
                 config.miner_secret_key = Some(parse_secret_key(args.get(index))?);
             }
+            "--miner-min-fee-rate" => {
+                index += 1;
+                config.miner_min_fee_rate = Some(
+                    args.get(index)
+                        .ok_or_else(|| "missing value for --miner-min-fee-rate".to_string())?
+                        .parse::<u64>()
+                        .map_err(|error| format!("invalid miner min fee rate: {error}"))?,
+                );
+            }
             "--premine" => {
                 return Err(
                     "premine address is fixed by protocol and cannot be overridden".to_string(),
@@ -3028,6 +3049,7 @@ fn apply_run_config_file(config: &mut RunConfig, file: RunConfigFile) -> Result<
     if let Some(secret_key) = file.miner_secret_key {
         config.miner_secret_key = Some(parse_secret_key(Some(&secret_key))?);
     }
+    config.miner_min_fee_rate = file.miner_min_fee_rate;
 
     Ok(())
 }
@@ -3087,18 +3109,25 @@ fn mine_once_unlocked(
         node.mempool.prune_expired(timestamp);
         let difficulty = node.next_difficulty().map_err(|error| error.to_string())?;
         let mempool_len = node.mempool.len();
+        let miner_min_fee_rate = config
+            .miner_min_fee_rate
+            .unwrap_or_else(|| node.mempool.dynamic_market_fee_rate());
         println!(
             "pow:: |algo::argon2id|difficulty_bits::{}|target::{}|",
             difficulty,
             pow_target_description(difficulty)
         );
-        println!("mempool:: |txs::{}|", mempool_len);
+        println!(
+            "mempool:: |txs::{}|miner_min_fee_rate_per_kib::{}|",
+            mempool_len, miner_min_fee_rate
+        );
         let candidate = prepare_candidate_block(
             &node.mempool,
             &node.ledger,
             config.miner_address,
             timestamp,
             MAX_BLOCK_TXS,
+            miner_min_fee_rate,
             difficulty,
         )
         .map_err(|error| format!("failed to prepare mining candidate: {error}"))?;
@@ -3109,6 +3138,7 @@ fn mine_once_unlocked(
                 difficulty,
                 max_attempts: config.mine_attempts,
                 transaction_limit: MAX_BLOCK_TXS,
+                min_fee_rate: miner_min_fee_rate,
             },
         )
     };
@@ -3295,7 +3325,7 @@ Usage:
   paqus node libp2p-info
   paqus node config [config-path]
   paqus node init [db-path] [miner-address]
-  paqus node run [db-path] [--config path] [--listen addr] [--rpc-listen addr] [--peer addr] [--peers-file path] [--gateway host:port] [--public-addr host:port] [--min-relay-fee units] [--market-fee units] [--low-fee-expiry-secs n] [--mempool-expiry-secs n] [--wallet path] [--miner address] [--miner-secret-key key-hex] [--mine]
+  paqus node run [db-path] [--config path] [--listen addr] [--rpc-listen addr] [--peer addr] [--peers-file path] [--gateway host:port] [--public-addr host:port] [--min-relay-fee units-per-kib] [--market-fee units-per-kib] [--miner-min-fee-rate units-per-kib] [--low-fee-expiry-secs n] [--mempool-expiry-secs n] [--wallet path] [--miner address] [--miner-secret-key key-hex] [--mine]
   paqus wallet new [wallet-path] [--show-secret]
   paqus wallet address <secret-key-hex>
   paqus wallet balance <address> [db-path]

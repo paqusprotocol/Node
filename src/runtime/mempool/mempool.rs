@@ -1,9 +1,10 @@
 use crate::runtime::cache::CoreCache;
 use crate::runtime::mempool::error::MempoolError;
 use crate::runtime::params::{
-    DEFAULT_MARKET_FEE, DEFAULT_MIN_RELAY_FEE, HASH_SIZE, LOW_FEE_EXPIRY_SECS, MAX_MEMPOOL_BYTES,
-    MAX_MEMPOOL_TXS, MAX_RELAY_TRANSACTION_AGE_SECS, MAX_RELAY_TRANSACTION_FUTURE_SECS,
-    MEMPOOL_EXPIRY_SECS, MIN_RELAY_FEE_FLOOR,
+    DEFAULT_MARKET_FEE, DEFAULT_MIN_RELAY_FEE, DYNAMIC_MARKET_FEE_MAX_MULTIPLIER,
+    FEE_RATE_UNIT_BYTES, HASH_SIZE, LOW_FEE_EXPIRY_SECS, MAX_MEMPOOL_BYTES, MAX_MEMPOOL_TXS,
+    MAX_RELAY_TRANSACTION_AGE_SECS, MAX_RELAY_TRANSACTION_FUTURE_SECS, MEMPOOL_EXPIRY_SECS,
+    MIN_RELAY_FEE_FLOOR,
 };
 use paqus::block::{Block, BlockNonce, CoinbaseTransaction, Height, Nonce};
 use paqus::consensus::supply::Amount;
@@ -15,7 +16,7 @@ use std::cmp::Reverse;
 use std::collections::BTreeMap;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-type FeeHeadKey = (u64, Reverse<AccountNonce>, Reverse<TransactionHash>);
+type FeeHeadKey = (u64, u64, Reverse<AccountNonce>, Reverse<TransactionHash>);
 type ExpiryKey = (u64, TransactionHash);
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -246,7 +247,11 @@ impl Mempool {
     }
 
     fn validate_fee_policy(&self, transaction: &SignedTransaction) -> Result<(), MempoolError> {
-        let min_relay_fee = self.config.min_relay_fee.max(MIN_RELAY_FEE_FLOOR);
+        let min_relay_fee = required_fee_for_rate(
+            self.config.min_relay_fee.max(MIN_RELAY_FEE_FLOOR),
+            transaction.serialized_size(),
+        )
+        .max(MIN_RELAY_FEE_FLOOR);
         if transaction.transaction.fee.0 < min_relay_fee {
             return Err(MempoolError::FeeTooLow);
         }
@@ -254,7 +259,11 @@ impl Mempool {
     }
 
     fn transaction_ttl(&self, transaction: &SignedTransaction) -> u64 {
-        if transaction.transaction.fee.0 < self.config.market_fee {
+        let market_fee = required_fee_for_rate(
+            self.dynamic_market_fee_rate(),
+            transaction.serialized_size(),
+        );
+        if transaction.transaction.fee.0 < market_fee {
             self.config.low_fee_ttl_secs
         } else {
             self.config.transaction_ttl_secs
@@ -396,8 +405,10 @@ impl Mempool {
 
     fn head_key(&self, hash: TransactionHash) -> Option<FeeHeadKey> {
         let transaction = &self.transactions.get(&hash)?.transaction;
+        let fee = transaction.transaction.fee.0;
         Some((
-            transaction.transaction.fee.0,
+            fee_rate_key(fee, transaction.serialized_size()),
+            fee,
             Reverse(transaction.transaction.nonce),
             Reverse(hash),
         ))
@@ -482,6 +493,23 @@ impl Mempool {
         self.total_bytes
     }
 
+    pub fn mempool_pressure_bps(&self) -> u64 {
+        let byte_pressure = occupancy_bps(self.total_bytes, self.config.max_bytes);
+        let tx_pressure = occupancy_bps(self.transactions.len(), self.config.max_transactions);
+        byte_pressure.max(tx_pressure)
+    }
+
+    pub fn dynamic_market_fee_rate(&self) -> u64 {
+        let base_rate = self.config.market_fee.max(self.config.min_relay_fee);
+        let pressure_bps = self.mempool_pressure_bps();
+        let pressure_premium = base_rate
+            .saturating_mul(DYNAMIC_MARKET_FEE_MAX_MULTIPLIER)
+            .saturating_mul(pressure_bps)
+            .saturating_add(9_999)
+            / 10_000;
+        base_rate.saturating_add(pressure_premium)
+    }
+
     pub fn is_empty(&self) -> bool {
         self.transactions.is_empty()
     }
@@ -511,6 +539,14 @@ impl Mempool {
     }
 
     pub fn select_for_block(&self, limit: usize) -> Vec<SignedTransaction> {
+        self.select_for_block_with_min_fee_rate(limit, self.dynamic_market_fee_rate())
+    }
+
+    pub fn select_for_block_with_min_fee_rate(
+        &self,
+        limit: usize,
+        min_fee_rate: u64,
+    ) -> Vec<SignedTransaction> {
         let mut heads_by_fee = self.heads_by_fee.clone();
         let mut head_by_sender = self.head_by_sender.clone();
         let mut selected = Vec::new();
@@ -522,6 +558,11 @@ impl Mempool {
             else {
                 continue;
             };
+            if fee_rate_key(transaction.transaction.fee.0, transaction.serialized_size())
+                < min_fee_rate
+            {
+                continue;
+            }
             let sender = transaction.transaction.from;
             if head_by_sender.get(&sender) != Some(&(hash, key)) {
                 continue;
@@ -559,13 +600,32 @@ impl Mempool {
         nonce: BlockNonce,
         transaction_limit: usize,
     ) -> Result<Block, LedgerError> {
+        self.create_candidate_block_with_min_fee_rate(
+            ledger,
+            miner_address,
+            timestamp,
+            nonce,
+            transaction_limit,
+            self.dynamic_market_fee_rate(),
+        )
+    }
+
+    pub fn create_candidate_block_with_min_fee_rate(
+        &self,
+        ledger: &Ledger,
+        miner_address: Address,
+        timestamp: u64,
+        nonce: BlockNonce,
+        transaction_limit: usize,
+        min_fee_rate: u64,
+    ) -> Result<Block, LedgerError> {
         let height = ledger
             .tip_height()
             .map(|height| Height(height.0.saturating_add(1)))
             .unwrap_or(Height(0));
         let previous_hash = ledger.tip_hash().unwrap_or(BlockHash([0; HASH_SIZE]));
 
-        let transactions = self.select_for_block(transaction_limit);
+        let transactions = self.select_for_block_with_min_fee_rate(transaction_limit, min_fee_rate);
         let fees = Amount(
             transactions
                 .iter()
@@ -609,6 +669,30 @@ fn current_unix_timestamp() -> u64 {
         .duration_since(UNIX_EPOCH)
         .map(|duration| duration.as_secs())
         .unwrap_or(0)
+}
+
+fn required_fee_for_rate(rate: u64, transaction_size: usize) -> u64 {
+    if rate == 0 || transaction_size == 0 {
+        return 0;
+    }
+    let size = transaction_size as u64;
+    size.saturating_mul(rate)
+        .saturating_add(FEE_RATE_UNIT_BYTES as u64 - 1)
+        / FEE_RATE_UNIT_BYTES as u64
+}
+
+fn fee_rate_key(fee: u64, transaction_size: usize) -> u64 {
+    if transaction_size == 0 {
+        return u64::MAX;
+    }
+    fee.saturating_mul(FEE_RATE_UNIT_BYTES as u64) / transaction_size as u64
+}
+
+fn occupancy_bps(used: usize, capacity: usize) -> u64 {
+    if capacity == 0 {
+        return 10_000;
+    }
+    ((used as u128).saturating_mul(10_000) / capacity as u128).min(10_000) as u64
 }
 
 #[cfg(test)]
@@ -664,10 +748,28 @@ mod tests {
         SignedTransaction::new(payload, public_key, signature)
     }
 
+    fn signed_transaction_from_with_fee_rate_at(
+        secret_key: &SecretKey,
+        public_key: PublicKey,
+        to: Address,
+        amount: u64,
+        fee_rate: u64,
+        nonce: u64,
+        timestamp: u64,
+    ) -> SignedTransaction {
+        let template = signed_transaction_from_with_fee_at(
+            secret_key, public_key, to, amount, 0, nonce, timestamp,
+        );
+        let fee = required_fee_for_rate(fee_rate, template.serialized_size());
+        signed_transaction_from_with_fee_at(
+            secret_key, public_key, to, amount, fee, nonce, timestamp,
+        )
+    }
+
     #[test]
     fn prunes_low_fee_transactions_after_low_fee_expiry() {
         let keypair = generate_keypair();
-        let transaction = signed_transaction_from_with_fee_at(
+        let transaction = signed_transaction_from_with_fee_rate_at(
             &keypair.secret_key,
             keypair.public_key,
             address(2),
@@ -697,7 +799,7 @@ mod tests {
     #[test]
     fn keeps_market_fee_transactions_until_full_mempool_expiry() {
         let keypair = generate_keypair();
-        let transaction = signed_transaction_from_with_fee_at(
+        let transaction = signed_transaction_from_with_fee_rate_at(
             &keypair.secret_key,
             keypair.public_key,
             address(2),
@@ -729,6 +831,55 @@ mod tests {
     }
 
     #[test]
+    fn dynamic_market_fee_rate_increases_with_mempool_pressure() {
+        let first_keypair = generate_keypair();
+        let second_keypair = generate_keypair();
+        let first = signed_transaction_from_with_fee_rate_at(
+            &first_keypair.secret_key,
+            first_keypair.public_key,
+            address(2),
+            10,
+            2,
+            0,
+            1_000,
+        );
+        let second = signed_transaction_from_with_fee_rate_at(
+            &second_keypair.secret_key,
+            second_keypair.public_key,
+            address(3),
+            10,
+            2,
+            0,
+            1_001,
+        );
+        let second_hash = second.hash();
+        let mut mempool = Mempool::with_config(MempoolConfig {
+            max_transactions: 2,
+            min_relay_fee: 1,
+            market_fee: 2,
+            low_fee_ttl_secs: crate::runtime::params::LOW_FEE_EXPIRY_SECS,
+            transaction_ttl_secs: crate::runtime::params::MEMPOOL_EXPIRY_SECS,
+            ..MempoolConfig::default()
+        });
+
+        assert_eq!(mempool.mempool_pressure_bps(), 0);
+        assert_eq!(mempool.dynamic_market_fee_rate(), 2);
+
+        mempool.insert_at(first, 1_000).unwrap();
+
+        assert_eq!(mempool.mempool_pressure_bps(), 5_000);
+        assert_eq!(mempool.dynamic_market_fee_rate(), 10);
+
+        mempool.insert_at(second, 1_001).unwrap();
+
+        assert_eq!(
+            mempool.prune_expired(1_001 + crate::runtime::params::LOW_FEE_EXPIRY_SECS + 1),
+            1
+        );
+        assert!(!mempool.contains(&second_hash));
+    }
+
+    #[test]
     fn sender_nonce_index_tracks_replacement_prune_and_clear() {
         let keypair = generate_keypair();
         let sender = address_from_public_key(&keypair.public_key);
@@ -742,7 +893,7 @@ mod tests {
             transaction_ttl_secs: crate::runtime::params::MEMPOOL_EXPIRY_SECS,
             ..MempoolConfig::default()
         });
-        let original = signed_transaction_from_with_fee_at(
+        let original = signed_transaction_from_with_fee_rate_at(
             &keypair.secret_key,
             keypair.public_key,
             address(2),
@@ -766,7 +917,7 @@ mod tests {
         assert_eq!(mempool.expiries.len(), 1);
         assert_eq!(mempool.transactions_for_address(&sender).count(), 1);
 
-        let replacement = signed_transaction_from_with_fee_at(
+        let replacement = signed_transaction_from_with_fee_rate_at(
             &keypair.secret_key,
             keypair.public_key,
             address(2),
@@ -804,7 +955,7 @@ mod tests {
         assert!(mempool.expiries.is_empty());
         assert_eq!(mempool.transactions_for_address(&sender).count(), 0);
 
-        let fresh = signed_transaction_from_with_fee_at(
+        let fresh = signed_transaction_from_with_fee_rate_at(
             &keypair.secret_key,
             keypair.public_key,
             address(2),
@@ -838,7 +989,7 @@ mod tests {
         let receiver = address(2);
         let mut mempool = Mempool::new();
         let now = current_unix_timestamp();
-        let first_slow = signed_transaction_from_with_fee_at(
+        let first_slow = signed_transaction_from_with_fee_rate_at(
             &first_keypair.secret_key,
             first_keypair.public_key,
             receiver,
@@ -847,7 +998,7 @@ mod tests {
             0,
             now,
         );
-        let first_aggressive = signed_transaction_from_with_fee_at(
+        let first_aggressive = signed_transaction_from_with_fee_rate_at(
             &first_keypair.secret_key,
             first_keypair.public_key,
             receiver,
@@ -856,7 +1007,7 @@ mod tests {
             1,
             now,
         );
-        let second_fast = signed_transaction_from_with_fee_at(
+        let second_fast = signed_transaction_from_with_fee_rate_at(
             &second_keypair.secret_key,
             second_keypair.public_key,
             receiver,
@@ -865,20 +1016,84 @@ mod tests {
             0,
             now,
         );
+        let second_fast_fee = second_fast.transaction.fee;
+        let first_aggressive_fee = first_aggressive.transaction.fee;
 
         mempool.insert(first_aggressive).unwrap();
         mempool.insert(first_slow).unwrap();
         mempool.insert(second_fast).unwrap();
 
-        let selected = mempool.select_for_block(3);
+        let selected = mempool.select_for_block_with_min_fee_rate(3, 0);
 
         assert_eq!(selected[0].transaction.from, second_sender);
-        assert_eq!(selected[0].transaction.fee, Amount(5));
+        assert_eq!(selected[0].transaction.fee, second_fast_fee);
         assert_eq!(selected[1].transaction.from, first_sender);
         assert_eq!(selected[1].transaction.nonce, Nonce(0));
         assert_eq!(selected[2].transaction.from, first_sender);
         assert_eq!(selected[2].transaction.nonce, Nonce(1));
-        assert_eq!(selected[2].transaction.fee, Amount(9));
+        assert_eq!(selected[2].transaction.fee, first_aggressive_fee);
+    }
+
+    #[test]
+    fn miner_min_fee_rate_filters_candidate_block_transactions() {
+        let low_keypair = generate_keypair();
+        let high_keypair = generate_keypair();
+        let low_sender = address_from_public_key(&low_keypair.public_key);
+        let high_sender = address_from_public_key(&high_keypair.public_key);
+        let to = address(2);
+        let miner = address(9);
+        let mut ledger = Ledger::new();
+        ledger.create_account(low_sender, Amount(100)).unwrap();
+        ledger.create_account(high_sender, Amount(100)).unwrap();
+        ledger.create_account(to, Amount(0)).unwrap();
+        ledger.create_account(miner, Amount(0)).unwrap();
+        ledger
+            .apply_block(Block::new(
+                Height(0),
+                Hash([0; 64]),
+                miner,
+                1_700_000_000,
+                Nonce(0),
+                vec![],
+            ))
+            .unwrap();
+
+        let mut mempool = Mempool::new();
+        let now = current_unix_timestamp();
+        let low_fee = signed_transaction_from_with_fee_rate_at(
+            &low_keypair.secret_key,
+            low_keypair.public_key,
+            to,
+            1,
+            2,
+            0,
+            now,
+        );
+        let high_fee = signed_transaction_from_with_fee_rate_at(
+            &high_keypair.secret_key,
+            high_keypair.public_key,
+            to,
+            1,
+            10,
+            0,
+            now,
+        );
+        mempool.insert_validated(&ledger, low_fee).unwrap();
+        mempool.insert_validated(&ledger, high_fee).unwrap();
+
+        let block = mempool
+            .create_candidate_block_with_min_fee_rate(
+                &ledger,
+                miner,
+                1_700_000_001,
+                Nonce(0),
+                10,
+                10,
+            )
+            .unwrap();
+
+        assert_eq!(block.transaction_count(), 1);
+        assert_eq!(block.transactions[0].transaction.from, high_sender);
     }
 
     #[test]
@@ -910,7 +1125,14 @@ mod tests {
         mempool.insert_validated(&ledger, transaction).unwrap();
 
         let block = mempool
-            .create_candidate_block(&ledger, miner, 1_700_000_001, Nonce(0), 10)
+            .create_candidate_block_with_min_fee_rate(
+                &ledger,
+                miner,
+                1_700_000_001,
+                Nonce(0),
+                10,
+                0,
+            )
             .unwrap();
 
         assert_eq!(block.coinbase.as_ref().unwrap().subsidy, Amount(50));
@@ -946,7 +1168,14 @@ mod tests {
         mempool.insert_validated(&ledger, transaction).unwrap();
 
         let block = mempool
-            .create_candidate_block(&ledger, miner, 1_700_000_001, Nonce(0), 10)
+            .create_candidate_block_with_min_fee_rate(
+                &ledger,
+                miner,
+                1_700_000_001,
+                Nonce(0),
+                10,
+                0,
+            )
             .unwrap();
         let coinbase = block.coinbase.as_ref().unwrap();
 

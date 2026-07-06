@@ -279,23 +279,35 @@ RPC or connect to peers where transactions are flowing.
 Default relay policy:
 
 ```text
-min_relay_fee = 1
-market_fee = 2
+min_relay_fee = 1   # units per KiB
+market_fee = 2      # units per KiB
 low_fee_expiry_secs = 1800
 mempool_expiry_secs = 86400
 ```
 
-Transactions with fee below `min_relay_fee` are rejected by this node. The
-effective floor is always at least `1`, so fee `0` is not relayed. Transactions
-with fee below `market_fee` can stay pending for up to `low_fee_expiry_secs`
-(30 minutes by default). Transactions at or above `market_fee` can stay pending
-for up to `mempool_expiry_secs` (1 day by default).
+`min_relay_fee` and `market_fee` are fee rates in units per KiB of serialized
+transaction size. The required fee is `ceil(size_bytes * rate / 1024)`.
+Transactions below the required relay fee are rejected by this node. The
+effective relay rate floor is always at least `1`, so fee `0` is not relayed.
+The market fee is dynamic: the configured `market_fee` is the base rate, and the
+effective market rate rises with local mempool pressure. Pressure is the higher
+of byte occupancy (`mempool_bytes / max_mempool_bytes`) and transaction-count
+occupancy (`mempool_txs / max_mempool_txs`). At full pressure, the effective
+market rate can rise by up to `8x` over the base rate. Transactions below the
+current dynamic market fee can stay pending for up to `low_fee_expiry_secs`
+(30 minutes by default). Transactions at or above the dynamic market fee can
+stay pending for up to `mempool_expiry_secs` (1 day by default). Candidate block
+selection prioritizes transaction fee rate while preserving sender nonce order.
+Miners may set their own candidate-block floor with `miner_min_fee_rate` or
+`--miner-min-fee-rate`; when omitted, mining follows the current dynamic market
+fee.
 
 Operators can tune the policy without changing consensus:
 
 ```text
---min-relay-fee <units>
---market-fee <units>
+--min-relay-fee <units-per-kib>
+--market-fee <units-per-kib>
+--miner-min-fee-rate <units-per-kib>
 --low-fee-expiry-secs <seconds>
 --mempool-expiry-secs <seconds>
 ```

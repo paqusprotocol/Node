@@ -42,6 +42,7 @@ fn mines_coinbase_only_candidate_without_user_transactions() {
             difficulty: 0,
             max_attempts: 1,
             transaction_limit: 10,
+            min_fee_rate: 0,
         },
     )
     .unwrap()
@@ -91,6 +92,7 @@ fn mines_candidate_block_until_pow_is_valid() {
             difficulty: 0,
             max_attempts: 1,
             transaction_limit: 10,
+            min_fee_rate: 0,
         },
     )
     .unwrap()
