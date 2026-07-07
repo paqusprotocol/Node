@@ -1,6 +1,6 @@
 pub use paqus::block::Block;
 pub use paqus::block::{Height, Nonce};
-pub use paqus::consensus::supply::{Amount, MAX_MINED_SUPPLY, MAX_UNIT_SUPPLY};
+pub use paqus::consensus::supply::Amount;
 pub use paqus::consensus::{
     BLOCK_TIME, Consensus, DIFFICULTY_ADJUSTMENT_INTERVAL, DIFFICULTY_START,
 };

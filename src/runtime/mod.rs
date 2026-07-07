@@ -10,9 +10,7 @@ pub mod wallet;
 
 pub mod params {
     pub use paqus::block::MAX_BLOCK_TXS;
-    pub use paqus::consensus::supply::{
-        BLOCK_REWARD, DECIMALS, MAX_MINED_SUPPLY, MAX_UNIT_SUPPLY, TAIL_EMISSION, XPQ,
-    };
+    pub use paqus::consensus::supply::{BLOCK_REWARD, DECIMALS, TAIL_EMISSION, XPQ};
     pub use paqus::consensus::{
         BLOCK_TIME, DIFFICULTY_ADJUSTMENT_INTERVAL, DIFFICULTY_START, MAX_FUTURE_TIME,
         MIN_DIFFICULTY,

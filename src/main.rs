@@ -33,8 +33,8 @@ use paquscore::{
 use paquscore::{
     BLOCK_REWARD_MATURITY, BLOCK_TIME, CHAIN_ID, CHAIN_NAME, COIN_NAME, CONFIRMATION_DEPTH,
     DEFAULT_TRANSACTION_FEE, DIFFICULTY_ADJUSTMENT_INTERVAL, DIFFICULTY_START, FINALITY_DEPTH,
-    GENESIS_PREMINE, MAX_BLOCK_TXS, MAX_MINED_SUPPLY, MAX_UNIT_SUPPLY, NETWORK_MAGIC,
-    PROTOCOL_STAGE, PROTOCOL_VERSION, STORAGE_VERSION,
+    GENESIS_PREMINE, MAX_BLOCK_TXS, NETWORK_MAGIC, PROTOCOL_STAGE, PROTOCOL_VERSION,
+    STORAGE_VERSION,
 };
 use runtime::mempool::MempoolConfig;
 use runtime::miner::{MiningConfig, mine_prepared_block, prepare_candidate_block};
@@ -768,12 +768,9 @@ struct ChainStatsResponse {
     blocks: u64,
     average_block_time_secs: Option<u64>,
     target_block_time_secs: u32,
-    target_supply: u64,
     genesis_premine: u64,
-    max_mined_supply: u64,
     mined_supply: u64,
     current_supply: u64,
-    remaining_mined_supply: u64,
     total_coinbase_rewards: u64,
     total_fees_collected: u64,
     total_transactions: u64,
@@ -2586,12 +2583,9 @@ fn chain_stats(node: &Node) -> Result<ChainStatsResponse, String> {
         blocks,
         average_block_time_secs,
         target_block_time_secs: BLOCK_TIME,
-        target_supply: MAX_UNIT_SUPPLY as u64,
         genesis_premine: GENESIS_PREMINE as u64,
-        max_mined_supply: MAX_MINED_SUPPLY as u64,
         mined_supply,
         current_supply,
-        remaining_mined_supply: (MAX_MINED_SUPPLY as u64).saturating_sub(mined_supply),
         total_coinbase_rewards,
         total_fees_collected,
         total_transactions,
