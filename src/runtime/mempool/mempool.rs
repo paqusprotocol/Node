@@ -1050,7 +1050,7 @@ mod tests {
         ledger
             .apply_block(Block::new(
                 Height(0),
-                Hash([0; 64]),
+                Hash([0; HASH_SIZE]),
                 miner,
                 1_700_000_000,
                 Nonce(0),

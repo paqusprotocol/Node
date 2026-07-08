@@ -168,7 +168,7 @@ mod test {
     use super::CoreCache;
     use paqus::block::{Block, Height, Nonce};
     use paqus::consensus::supply::Amount;
-    use paqus::crypto::{Address, Hash, address_from_public_key, generate_keypair};
+    use paqus::crypto::{Address, HASH_SIZE, Hash, address_from_public_key, generate_keypair};
     use paqus::ledger::Ledger;
     use paqus::state::Account;
 
