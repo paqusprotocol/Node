@@ -4,7 +4,8 @@ use paqus::block::{Block, BlockError, Height, Nonce};
 use paqus::consensus::{Consensus, ConsensusConfig, ConsensusError};
 use paqus::consensus::supply::Amount;
 use paqus::crypto::{
-    Address, Hash, KeyPair, PublicKey, Signature, address_from_public_key, generate_keypair, sign,
+    Address, HASH_SIZE, Hash, KeyPair, PublicKey, Signature, address_from_public_key,
+    generate_keypair, sign,
 };
 use paqus::genesis::GENESIS_MINER_ADDRESS;
 use paqus::ledger::Ledger;
@@ -124,7 +125,7 @@ fn mines_and_applies_block_from_mempool() {
     ledger
         .apply_block(Block::new(
             Height(0),
-            Hash([0; 64]),
+            Hash([0; HASH_SIZE]),
             miner,
             1_700_000_000,
             Nonce(0),
@@ -162,7 +163,7 @@ fn initializes_genesis_when_storage_is_empty() {
 fn stores_side_fork_without_changing_active_tip_when_work_is_lower() {
     let genesis = Block::new(
         Height(0),
-        Hash([0; 64]),
+        Hash([0; HASH_SIZE]),
         address(9),
         1_700_000_000,
         Nonce(0),
@@ -192,7 +193,7 @@ fn stores_side_fork_without_changing_active_tip_when_work_is_lower() {
 fn rejects_block_with_unexpected_difficulty() {
     let genesis = Block::new(
         Height(0),
-        Hash([0; 64]),
+        Hash([0; HASH_SIZE]),
         address(9),
         1_700_000_000,
         Nonce(0),
@@ -217,7 +218,7 @@ fn rejects_block_with_unexpected_difficulty() {
 fn rejects_block_timestamp_too_far_in_future() {
     let genesis = Block::new(
         Height(0),
-        Hash([0; 64]),
+        Hash([0; HASH_SIZE]),
         address(9),
         1_700_000_000,
         Nonce(0),
@@ -249,7 +250,7 @@ fn rejects_block_timestamp_too_far_in_future() {
 fn reorgs_state_when_side_fork_becomes_best_tip() {
     let genesis = Block::new(
         Height(0),
-        Hash([0; 64]),
+        Hash([0; HASH_SIZE]),
         address(9),
         1_700_000_000,
         Nonce(0),
@@ -309,7 +310,7 @@ fn reorgs_state_when_side_fork_becomes_best_tip() {
 fn reports_confirmed_available_and_pending_balances() {
     let genesis = Block::new(
         Height(0),
-        Hash([0; 64]),
+        Hash([0; HASH_SIZE]),
         address(9),
         1_700_000_000,
         Nonce(0),
@@ -390,7 +391,7 @@ fn reports_confirmed_available_and_pending_balances() {
 fn keeps_mining_rewards_unspendable_until_maturity() {
     let genesis = Block::new(
         Height(0),
-        Hash([0; 64]),
+        Hash([0; HASH_SIZE]),
         address(9),
         1_700_000_000,
         Nonce(0),

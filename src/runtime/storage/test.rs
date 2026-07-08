@@ -2,7 +2,9 @@ use super::{StateSnapshot, Storage, StorageError};
 use crate::runtime::params::{DEFAULT_TRANSACTION_FEE, STORAGE_VERSION};
 use paqus::block::{Block, Height, Nonce};
 use paqus::consensus::supply::Amount;
-use paqus::crypto::{Address, BlockHash, Hash, address_from_public_key, generate_keypair, sign};
+use paqus::crypto::{
+    Address, BlockHash, HASH_SIZE, Hash, address_from_public_key, generate_keypair, sign,
+};
 use paqus::ledger::Ledger;
 use paqus::state::Account;
 use paqus::transaction::{SignedTransaction, Transaction};
@@ -39,7 +41,7 @@ fn signed_transaction(to: Address, amount: u64, nonce: u64) -> SignedTransaction
 #[test]
 fn stores_and_loads_blocks_by_height_and_hash() {
     let storage = Storage::temporary().unwrap();
-    let block = block(0, Hash([0; 64]));
+    let block = block(0, Hash([0; HASH_SIZE]));
     let hash = block.hash();
 
     storage.save_block(&block).unwrap();
@@ -54,7 +56,7 @@ fn stores_and_loads_blocks_by_height_and_hash() {
 #[test]
 fn side_blocks_do_not_overwrite_canonical_height_index() {
     let storage = Storage::temporary().unwrap();
-    let genesis = block(0, Hash([0; 64]));
+    let genesis = block(0, Hash([0; HASH_SIZE]));
     let canonical = block(1, genesis.hash().into());
     let side = Block::with_difficulty(
         Height(1),
@@ -87,7 +89,7 @@ fn indexes_transactions_by_hash_and_address() {
     let receiver = transaction.transaction.to;
     let block = Block::with_difficulty(
         Height(1),
-        Hash([0; 64]),
+        Hash([0; HASH_SIZE]),
         address(9),
         1,
         1_700_000_001,
@@ -122,7 +124,7 @@ fn indexes_canonical_blocks_by_miner_address() {
     let storage = Storage::temporary().unwrap();
     let miner = address(7);
     let side_miner = address(8);
-    let genesis = block(0, Hash([0; 64]));
+    let genesis = block(0, Hash([0; HASH_SIZE]));
     let canonical = Block::with_coinbase(
         Height(1),
         genesis.hash(),
@@ -171,7 +173,7 @@ fn indexes_canonical_blocks_by_miner_address() {
 #[test]
 fn save_ledger_rebuilds_canonical_transaction_indexes() {
     let storage = Storage::temporary().unwrap();
-    let genesis = block(0, Hash([0; 64]));
+    let genesis = block(0, Hash([0; HASH_SIZE]));
     let old_transaction = signed_transaction(address(2), 10, 0);
     let old_hash = old_transaction.hash();
     let old_block = Block::with_difficulty(
@@ -220,7 +222,7 @@ fn save_ledger_rebuilds_canonical_transaction_indexes() {
 #[test]
 fn save_ledger_rebuilds_miner_block_index() {
     let storage = Storage::temporary().unwrap();
-    let genesis = block(0, Hash([0; 64]));
+    let genesis = block(0, Hash([0; HASH_SIZE]));
     let old_miner = address(4);
     let new_miner = address(5);
     let old_block = Block::with_coinbase(
@@ -283,7 +285,7 @@ fn save_ledger_rebuilds_miner_block_index() {
 #[test]
 fn save_ledger_skips_state_snapshot_at_non_protocol_snapshot_height() {
     let storage = Storage::temporary().unwrap();
-    let genesis = block(0, Hash([0; 64]));
+    let genesis = block(0, Hash([0; HASH_SIZE]));
     let next = block(1, genesis.hash().into());
     let mut ledger = Ledger::new();
     ledger.chain.insert_block(genesis).unwrap();
@@ -326,7 +328,7 @@ fn rejects_unsupported_storage_version() {
 fn rejects_existing_database_without_storage_version() {
     let storage = Storage::temporary().unwrap();
     storage.test_remove_meta(b"storage_version").unwrap();
-    storage.save_block(&block(0, Hash([0; 64]))).unwrap();
+    storage.save_block(&block(0, Hash([0; HASH_SIZE]))).unwrap();
 
     assert!(matches!(
         storage.load_ledger(),
@@ -337,7 +339,7 @@ fn rejects_existing_database_without_storage_version() {
 #[test]
 fn rejects_block_loaded_from_wrong_height_key() {
     let storage = Storage::temporary().unwrap();
-    let block = block(1, Hash([0; 64]));
+    let block = block(1, Hash([0; HASH_SIZE]));
 
     storage
         .test_put_blocks_by_height(&Height(0).0.to_be_bytes(), &block)
@@ -354,8 +356,8 @@ fn rejects_block_loaded_from_wrong_height_key() {
 #[test]
 fn rejects_block_loaded_from_wrong_hash_key() {
     let storage = Storage::temporary().unwrap();
-    let block = block(0, Hash([0; 64]));
-    let wrong_hash = BlockHash([7; 64]);
+    let block = block(0, Hash([0; HASH_SIZE]));
+    let wrong_hash = BlockHash([7; HASH_SIZE]);
 
     storage
         .test_put_blocks_by_hash(wrong_hash.0.as_slice(), &block)
@@ -383,7 +385,7 @@ fn stores_and_loads_accounts() {
 #[test]
 fn stores_and_loads_chain_tip() {
     let storage = Storage::temporary().unwrap();
-    let hash = BlockHash([7; 64]);
+    let hash = BlockHash([7; HASH_SIZE]);
 
     assert_eq!(storage.load_tip().unwrap(), None);
 
@@ -395,7 +397,7 @@ fn stores_and_loads_chain_tip() {
 #[test]
 fn validates_stored_chain_integrity() {
     let storage = Storage::temporary().unwrap();
-    let genesis = block(0, Hash([0; 64]));
+    let genesis = block(0, Hash([0; HASH_SIZE]));
     let next = block(1, genesis.hash().into());
 
     storage.save_block(&genesis).unwrap();
@@ -409,7 +411,9 @@ fn validates_stored_chain_integrity() {
 fn rejects_chain_integrity_when_tip_block_is_missing() {
     let storage = Storage::temporary().unwrap();
 
-    storage.save_tip(Height(3), &BlockHash([7; 64])).unwrap();
+    storage
+        .save_tip(Height(3), &BlockHash([7; HASH_SIZE]))
+        .unwrap();
 
     assert!(matches!(
         storage.validate_chain_integrity(),
@@ -422,8 +426,8 @@ fn rejects_chain_integrity_when_tip_block_is_missing() {
 #[test]
 fn rejects_chain_integrity_when_previous_link_is_broken() {
     let storage = Storage::temporary().unwrap();
-    let genesis = block(0, Hash([0; 64]));
-    let next = block(1, Hash([9; 64]));
+    let genesis = block(0, Hash([0; HASH_SIZE]));
+    let next = block(1, Hash([9; HASH_SIZE]));
 
     storage.save_block(&genesis).unwrap();
     storage.save_block(&next).unwrap();
@@ -441,7 +445,7 @@ fn rejects_chain_integrity_when_previous_link_is_broken() {
 fn stores_ledger_snapshot() {
     let storage = Storage::temporary().unwrap();
     let mut ledger = Ledger::new();
-    let mut genesis = block(0, Hash([0; 64]));
+    let mut genesis = block(0, Hash([0; HASH_SIZE]));
 
     ledger.create_account(address(1), Amount(100)).unwrap();
     genesis.set_state_root(ledger.state_root());
@@ -465,7 +469,7 @@ fn stores_ledger_snapshot() {
 fn loads_ledger_snapshot() {
     let storage = Storage::temporary().unwrap();
     let mut ledger = Ledger::new();
-    let genesis = block(0, Hash([0; 64]));
+    let genesis = block(0, Hash([0; HASH_SIZE]));
     let hash = genesis.hash();
 
     ledger.create_account(address(1), Amount(100)).unwrap();
@@ -494,7 +498,7 @@ fn stores_and_loads_genesis_accounts() {
 fn stores_and_loads_state_snapshot() {
     let storage = Storage::temporary().unwrap();
     let mut ledger = Ledger::new();
-    let mut genesis = block(0, Hash([0; 64]));
+    let mut genesis = block(0, Hash([0; HASH_SIZE]));
 
     ledger.create_account(address(1), Amount(100)).unwrap();
     genesis.set_state_root(ledger.state_root());
@@ -525,7 +529,7 @@ fn stores_and_loads_state_snapshot() {
 fn rejects_state_snapshot_at_non_protocol_snapshot_height() {
     let storage = Storage::temporary().unwrap();
     let mut ledger = Ledger::new();
-    let genesis = block(0, Hash([0; 64]));
+    let genesis = block(0, Hash([0; HASH_SIZE]));
     let next = block(1, genesis.hash().into());
 
     ledger.chain.insert_block(genesis).unwrap();
@@ -542,7 +546,7 @@ fn rejects_state_snapshot_at_non_protocol_snapshot_height() {
 #[test]
 fn difficulty_window_uses_previous_block_for_single_block_interval() {
     let storage = Storage::temporary().unwrap();
-    let genesis = block(0, Hash([0; 64]));
+    let genesis = block(0, Hash([0; HASH_SIZE]));
     let next = block(1, genesis.hash().into());
 
     storage.save_block(&genesis).unwrap();
@@ -558,7 +562,7 @@ fn difficulty_window_uses_previous_block_for_single_block_interval() {
 #[test]
 fn difficulty_window_uses_configured_block_interval() {
     let storage = Storage::temporary().unwrap();
-    let mut previous_hash = Hash([0; 64]);
+    let mut previous_hash = Hash([0; HASH_SIZE]);
 
     for height in 0..=10 {
         let block = block(height, previous_hash);
@@ -570,10 +574,10 @@ fn difficulty_window_uses_configured_block_interval() {
     assert_eq!(
         storage.difficulty_window(Height(10), 10).unwrap(),
         Some((
-            block(0, Hash([0; 64])).timestamp(),
-            block(10, Hash([0; 64])).timestamp(),
+            block(0, Hash([0; HASH_SIZE])).timestamp(),
+            block(10, Hash([0; HASH_SIZE])).timestamp(),
             10,
-            block(10, Hash([0; 64])).difficulty()
+            block(10, Hash([0; HASH_SIZE])).difficulty()
         ))
     );
 }
@@ -585,8 +589,8 @@ fn rejects_tampered_state_snapshot_root() {
     accounts.insert(address(1), Account::new(address(1), Amount(100)));
     let snapshot = StateSnapshot {
         height: Height(0),
-        block_hash: BlockHash([1; 64]),
-        state_root: Hash([9; 64]),
+        block_hash: BlockHash([1; HASH_SIZE]),
+        state_root: Hash([9; HASH_SIZE]),
         accounts,
     };
 

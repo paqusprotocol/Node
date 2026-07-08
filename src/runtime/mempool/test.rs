@@ -2,7 +2,9 @@ use super::{Mempool, MempoolConfig, MempoolError};
 use crate::runtime::params::{BASE_FEE, LOW_FEE_EXPIRY_SECS, MEMPOOL_EXPIRY_SECS};
 use paqus::block::{Block, Height, Nonce};
 use paqus::consensus::supply::Amount;
-use paqus::crypto::{Address, Hash, PublicKey, SecretKey, address_from_public_key, generate_keypair, sign};
+use paqus::crypto::{
+    Address, HASH_SIZE, Hash, PublicKey, SecretKey, address_from_public_key, generate_keypair, sign,
+};
 use paqus::ledger::{Ledger, LedgerError};
 use paqus::state::StateError;
 use paqus::transaction::{SignedTransaction, Transaction, TransactionError};
@@ -512,7 +514,7 @@ fn removes_confirmed_transactions() {
 
     let block = Block::new(
         Height(1),
-        Hash([0; 64]),
+        Hash([0; HASH_SIZE]),
         address(9),
         1_700_000_000,
         Nonce(0),
@@ -537,7 +539,7 @@ fn creates_candidate_block_from_mempool_transactions() {
     ledger
         .apply_block(Block::new(
             Height(0),
-            Hash([0; 64]),
+            Hash([0; HASH_SIZE]),
             miner,
             1_700_000_000,
             Nonce(0),
@@ -573,7 +575,7 @@ fn rejects_transaction_spending_immature_mining_reward() {
     ledger.create_account(miner, Amount(0)).unwrap();
     let genesis = Block::new(
         Height(0),
-        Hash([0; 64]),
+        Hash([0; HASH_SIZE]),
         miner,
         1_700_000_000,
         Nonce(0),

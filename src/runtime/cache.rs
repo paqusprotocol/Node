@@ -1,7 +1,7 @@
 use paqus::block::Block;
 use paqus::block::{BlockHeight, Height};
 use paqus::consensus::supply::Amount;
-use paqus::crypto::{Address, BlockHash, Hash, PublicKey};
+use paqus::crypto::{Address, BlockHash, HASH_SIZE, Hash, PublicKey};
 use paqus::crypto::{CachedVerifyingKey, cached_verifying_key, try_address_from_public_key};
 use paqus::ledger::Ledger;
 use paqus::state::Account;
@@ -182,7 +182,7 @@ mod test {
         let account = Account::new(address(1), Amount(100));
         let block = Block::new(
             Height(0),
-            Hash([0; 64]),
+            Hash([0; HASH_SIZE]),
             address(9),
             1_700_000_000,
             Nonce(0),
@@ -240,7 +240,7 @@ mod test {
         let mut ledger = Ledger::new();
         let block = Block::new(
             Height(0),
-            Hash([0; 64]),
+            Hash([0; HASH_SIZE]),
             address(9),
             1_700_000_000,
             Nonce(0),

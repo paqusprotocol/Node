@@ -4,7 +4,7 @@ use crate::runtime::params::BASE_FEE;
 use paqus::block::{Block, Height, Nonce};
 use paqus::consensus::{Consensus, ConsensusConfig};
 use paqus::consensus::supply::Amount;
-use paqus::crypto::{Address, Hash, address_from_public_key, generate_keypair, sign};
+use paqus::crypto::{Address, HASH_SIZE, Hash, address_from_public_key, generate_keypair, sign};
 use paqus::ledger::Ledger;
 use paqus::transaction::{SignedTransaction, Transaction};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -23,7 +23,7 @@ fn mines_coinbase_only_candidate_without_user_transactions() {
     ledger.create_account(miner, Amount(0)).unwrap();
     let genesis = Block::new(
         Height(0),
-        Hash([0; 64]),
+        Hash([0; HASH_SIZE]),
         miner,
         1_700_000_000,
         Nonce(0),

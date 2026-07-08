@@ -9,7 +9,8 @@ use paqus::block::{Block, Height, Nonce};
 use paqus::consensus::{Consensus, ConsensusConfig};
 use paqus::consensus::supply::Amount;
 use paqus::crypto::{
-    Address, BlockHash, Hash, TransactionHash, address_from_public_key, generate_keypair, sign,
+    Address, BlockHash, HASH_SIZE, Hash, TransactionHash, address_from_public_key,
+    generate_keypair, sign,
 };
 use paqus::ledger::Ledger;
 use paqus::transaction::{SignedTransaction, Transaction};
@@ -23,7 +24,7 @@ fn address(byte: u8) -> Address {
 fn block() -> Block {
     Block::new(
         Height(0),
-        Hash([0; 64]),
+        Hash([0; HASH_SIZE]),
         Address([9; 20]),
         1_700_000_000,
         Nonce(0),
@@ -76,7 +77,7 @@ fn roundtrips_peer_list() {
 fn roundtrips_version_handshake_messages() {
     let version = VersionInfo::local(Some(TipInfo {
         height: Height(7),
-        hash: Hash([7; 64]),
+        hash: Hash([7; HASH_SIZE]),
     }));
     let messages = [
         NetworkMessage::Version(version.clone()),
@@ -277,7 +278,7 @@ fn handler_returns_common_ancestor_from_locator() {
         handle_message(
             &mut node,
             NetworkMessage::GetCommonAncestor {
-                locator: vec![BlockHash([9; 64]), block.hash()]
+                locator: vec![BlockHash([9; HASH_SIZE]), block.hash()]
             }
         )
         .unwrap(),
@@ -291,7 +292,7 @@ fn handler_returns_common_ancestor_from_locator() {
         handle_message(
             &mut node,
             NetworkMessage::GetCommonAncestor {
-                locator: vec![BlockHash([9; 64])]
+                locator: vec![BlockHash([9; HASH_SIZE])]
             }
         )
         .unwrap(),
@@ -309,19 +310,19 @@ fn handler_requests_missing_inventory_data() {
             &mut node,
             NetworkMessage::Inventory(vec![
                 InventoryItem::Block(block.hash()),
-                InventoryItem::Transaction(TransactionHash([9; 64]))
+                InventoryItem::Transaction(TransactionHash([9; HASH_SIZE]))
             ])
         )
         .unwrap(),
         Some(NetworkMessage::GetData(vec![InventoryItem::Transaction(
-            TransactionHash([9; 64])
+            TransactionHash([9; HASH_SIZE])
         )]))
     );
 
     assert_eq!(
         handle_message(
             &mut node,
-            NetworkMessage::Inventory(vec![InventoryItem::Block(BlockHash([9; 64]))])
+            NetworkMessage::Inventory(vec![InventoryItem::Block(BlockHash([9; HASH_SIZE]))])
         )
         .unwrap(),
         Some(NetworkMessage::GetData(vec![InventoryItem::Block(BlockHash([

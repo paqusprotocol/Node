@@ -756,7 +756,7 @@ mod tests {
     fn invalid_state_block_does_not_enter_fork_choice() {
         let genesis = Block::new(
             Height(0),
-            Hash([0; 64]),
+            Hash([0; HASH_SIZE]),
             address(9),
             1_700_000_000,
             Nonce(0),
@@ -812,7 +812,7 @@ mod tests {
     fn reorgs_from_empty_genesis_accounts() {
         let genesis = Block::new(
             Height(0),
-            Hash([0; 64]),
+            Hash([0; HASH_SIZE]),
             address(9),
             1_700_000_000,
             Nonce(0),
@@ -868,7 +868,7 @@ mod tests {
     fn rejects_non_genesis_block_with_zero_state_root() {
         let genesis = Block::new(
             Height(0),
-            Hash([0; 64]),
+            Hash([0; HASH_SIZE]),
             address(9),
             1_700_000_000,
             Nonce(0),
@@ -913,7 +913,7 @@ mod tests {
         .unwrap();
         let genesis = Block::with_difficulty(
             Height(0),
-            Hash([0; 64]),
+            Hash([0; HASH_SIZE]),
             address(9),
             1,
             1_700_000_000,
@@ -946,7 +946,7 @@ mod tests {
     fn indexes_stored_side_blocks_into_fork_choice() {
         let genesis = Block::new(
             Height(0),
-            Hash([0; 64]),
+            Hash([0; HASH_SIZE]),
             address(9),
             1_700_000_000,
             Nonce(0),
@@ -994,7 +994,7 @@ mod tests {
     fn caches_orphan_block_until_parent_arrives() {
         let genesis = Block::new(
             Height(0),
-            Hash([0; 64]),
+            Hash([0; HASH_SIZE]),
             address(9),
             1_700_000_000,
             Nonce(0),
@@ -1052,13 +1052,13 @@ mod tests {
     fn prunes_expired_orphan_blocks() {
         let genesis = Block::new(
             Height(0),
-            Hash([0; 64]),
+            Hash([0; HASH_SIZE]),
             address(9),
             1_700_000_000,
             Nonce(0),
             vec![],
         );
-        let missing_parent_hash = BlockHash([7; 64]);
+        let missing_parent_hash = BlockHash([7; HASH_SIZE]);
         let child = Block::with_difficulty(
             Height(1),
             missing_parent_hash,
@@ -1092,13 +1092,13 @@ mod tests {
     fn queues_missing_parent_request_once_for_orphans() {
         let genesis = Block::new(
             Height(0),
-            Hash([0; 64]),
+            Hash([0; HASH_SIZE]),
             address(9),
             1_700_000_000,
             Nonce(0),
             vec![],
         );
-        let missing_parent_hash = BlockHash([7; 64]);
+        let missing_parent_hash = BlockHash([7; HASH_SIZE]);
         let first = Block::with_difficulty(
             Height(1),
             missing_parent_hash,
@@ -1142,13 +1142,13 @@ mod tests {
     fn retries_missing_parent_request_after_cooldown() {
         let genesis = Block::new(
             Height(0),
-            Hash([0; 64]),
+            Hash([0; HASH_SIZE]),
             address(9),
             1_700_000_000,
             Nonce(0),
             vec![],
         );
-        let missing_parent_hash = BlockHash([7; 64]);
+        let missing_parent_hash = BlockHash([7; HASH_SIZE]);
         let mut ledger = Ledger::new();
         ledger.chain.insert_block(genesis).unwrap();
         let mut node = Node::with_genesis_accounts(
@@ -1178,7 +1178,7 @@ mod tests {
     fn ignores_orphan_blocks_too_far_ahead_of_tip() {
         let genesis = Block::new(
             Height(0),
-            Hash([0; 64]),
+            Hash([0; HASH_SIZE]),
             address(9),
             1_700_000_000,
             Nonce(0),
@@ -1186,7 +1186,7 @@ mod tests {
         );
         let far_orphan = Block::with_difficulty(
             Height(MAX_ORPHAN_HEIGHT_DISTANCE + 1),
-            BlockHash([7; 64]),
+            BlockHash([7; HASH_SIZE]),
             address(9),
             1,
             1_700_000_001,

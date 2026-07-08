@@ -1,5 +1,6 @@
 use crate::p2p::{PeerConnection, PeerState};
 use crate::paquscore::{BlockHash, NetworkMessage, TransactionHash};
+use paqus::crypto::HASH_SIZE;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
@@ -182,10 +183,10 @@ mod tests {
     #[test]
     fn dedupe_tracks_seen_blocks_and_transactions() {
         let mut dedupe = GossipDedupe::new(2);
-        let first_block = BlockHash([1; 64]);
-        let second_block = BlockHash([2; 64]);
-        let third_block = BlockHash([3; 64]);
-        let transaction = TransactionHash([4; 64]);
+        let first_block = BlockHash([1; HASH_SIZE]);
+        let second_block = BlockHash([2; HASH_SIZE]);
+        let third_block = BlockHash([3; HASH_SIZE]);
+        let transaction = TransactionHash([4; HASH_SIZE]);
 
         assert!(dedupe.mark_block_seen(first_block));
         assert!(!dedupe.mark_block_seen(first_block));
