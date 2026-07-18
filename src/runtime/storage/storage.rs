@@ -1008,17 +1008,21 @@ fn protocol_transactions(block: &Block) -> Vec<SignedProtocolTransaction> {
 fn transaction_addresses(transaction: &SignedProtocolTransaction) -> Vec<(Address, bool)> {
     let signer = transaction.signer();
     let mut addresses = vec![(signer, true)];
-    let recipient = match transaction {
-        SignedProtocolTransaction::Transfer(tx) => Some(tx.transaction.to),
+    let recipients = match transaction {
+        SignedProtocolTransaction::Transfer(tx) => {
+            tx.transaction.outputs().map(|output| output.to).collect()
+        }
         SignedProtocolTransaction::Ecash(tx) => match &tx.transaction.kind {
             paqus::transaction::EcashTransactionKind::DepositCash { recipient, .. } => {
-                Some(*recipient)
+                vec![*recipient]
             }
-            _ => None,
+            _ => Vec::new(),
         },
     };
-    if recipient.is_some_and(|recipient| recipient != signer) {
-        addresses.push((recipient.unwrap(), false));
+    for recipient in recipients {
+        if recipient != signer {
+            addresses.push((recipient, false));
+        }
     }
     addresses
 }

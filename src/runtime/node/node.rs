@@ -281,8 +281,10 @@ impl Node {
             if let Some(sender) = self.ledger.account(&transaction.transaction.from) {
                 self.cache.insert_account(sender.clone());
             }
-            if let Some(receiver) = self.ledger.account(&transaction.transaction.to) {
-                self.cache.insert_account(receiver.clone());
+            for output in transaction.transaction.outputs() {
+                if let Some(receiver) = self.ledger.account(&output.to) {
+                    self.cache.insert_account(receiver.clone());
+                }
             }
         }
         if let Some(miner) = self.ledger.account(&block.miner_address()) {
@@ -761,16 +763,16 @@ impl Node {
     pub fn pending_balance(&self, address: &Address) -> PendingBalance {
         let mut pending = PendingBalance::default();
         for transaction in self.mempool.transactions() {
-            if transaction.transaction.to == *address {
-                pending.incoming.0 = pending
-                    .incoming
-                    .0
-                    .saturating_add(transaction.transaction.amount.0);
+            for output in transaction.transaction.outputs() {
+                if output.to == *address {
+                    pending.incoming.0 = pending.incoming.0.saturating_add(output.amount.0);
+                }
             }
             if transaction.transaction.from == *address {
                 let total = transaction
                     .transaction
-                    .amount
+                    .total_amount()
+                    .unwrap_or(Amount(u64::MAX))
                     .0
                     .saturating_add(transaction.transaction.fee.0);
                 pending.outgoing.0 = pending.outgoing.0.saturating_add(total);

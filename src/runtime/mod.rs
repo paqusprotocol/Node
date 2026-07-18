@@ -39,11 +39,12 @@ pub mod params {
     pub const MAX_MEMPOOL_TXS: usize = 1_000;
     pub const MAX_MEMPOOL_BYTES: usize = 10 * 1024 * 1024;
     pub const MAX_NETWORK_MESSAGE_SIZE: usize = 8 * 1024 * 1024;
-    pub const FEE_RATE_UNIT_BYTES: usize = 1024;
+    /// Fee rates are denominated in paqus (the smallest XPQ unit) per virtual byte.
+    pub const FEE_RATE_UNIT_BYTES: usize = 1;
     pub const BASE_FEE: u64 = 16;
     pub const DEFAULT_TRANSACTION_FEE: u64 = BASE_FEE;
     pub const MIN_RELAY_FEE_FLOOR: u64 = 1;
     pub const DEFAULT_MIN_RELAY_FEE: u64 = MIN_RELAY_FEE_FLOOR;
-    pub const DEFAULT_MARKET_FEE: u64 = 2;
+    pub const DEFAULT_MARKET_FEE: u64 = 1;
     pub const DYNAMIC_MARKET_FEE_MAX_MULTIPLIER: u64 = 8;
 }

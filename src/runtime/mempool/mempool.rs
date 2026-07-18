@@ -216,8 +216,10 @@ impl Mempool {
         if let Some(entry) = self.transactions.get(&hash) {
             let transaction = &entry.transaction.transaction;
             self.by_address.insert((transaction.from, hash, true), hash);
-            if transaction.to != transaction.from {
-                self.by_address.insert((transaction.to, hash, false), hash);
+            for output in transaction.outputs() {
+                if output.to != transaction.from {
+                    self.by_address.insert((output.to, hash, false), hash);
+                }
             }
         }
         self.total_bytes = self.total_bytes.saturating_add(transaction_size);
@@ -450,9 +452,10 @@ impl Mempool {
             }
             self.by_address
                 .remove(&(entry.transaction.transaction.from, *hash, true));
-            if entry.transaction.transaction.to != entry.transaction.transaction.from {
-                self.by_address
-                    .remove(&(entry.transaction.transaction.to, *hash, false));
+            for output in entry.transaction.transaction.outputs() {
+                if output.to != entry.transaction.transaction.from {
+                    self.by_address.remove(&(output.to, *hash, false));
+                }
             }
             self.total_bytes = self
                 .total_bytes

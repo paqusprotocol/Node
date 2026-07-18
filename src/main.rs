@@ -171,7 +171,7 @@ fn menu_send() -> Result<(), String> {
     let amount = parse_amount(Some(&prompt("Amount")?), "amount")?;
     let fee = parse_amount(
         Some(&prompt_default(
-            "Fee",
+            "Fee (default dihitung 1 paqus/virtual-byte)",
             &DEFAULT_TRANSACTION_FEE.to_string(),
         )?),
         "fee",
@@ -494,11 +494,24 @@ fn submit_wallet_transaction(
 ) -> Result<(), String> {
     let wallet = load_wallet(wallet_path)?;
     let nonce = nonce.unwrap_or(resolve_wallet_nonce(&wallet.address, rpc_addr)?);
-    let transaction =
-        Transaction::new_at(wallet.address, to, amount, fee, nonce, unix_timestamp()?);
-    let signed = wallet
+    let timestamp = unix_timestamp()?;
+    let transaction = Transaction::new_at(wallet.address, to, amount, fee, nonce, timestamp);
+    let mut signed = wallet
         .sign_transaction(transaction)
         .map_err(|error| format!("failed to sign transaction: {error}"))?;
+    if fee.0 == DEFAULT_TRANSACTION_FEE {
+        let fee = Amount(signed.virtual_size() as u64);
+        signed = wallet
+            .sign_transaction(Transaction::new_at(
+                wallet.address,
+                to,
+                amount,
+                fee,
+                nonce,
+                timestamp,
+            ))
+            .map_err(|error| format!("failed to sign transaction: {error}"))?;
+    }
     let tx_hex = signed_transaction_to_hex(&signed)?;
 
     if submit {
@@ -3207,7 +3220,7 @@ fn protocol_transaction_summary(
         SignedProtocolTransaction::Transfer(tx) => (
             "transfer",
             Some(tx.transaction.to),
-            Some(tx.transaction.amount.0),
+            tx.transaction.total_amount().ok().map(|amount| amount.0),
             Some(tx.transaction.timestamp),
         ),
         SignedProtocolTransaction::Ecash(tx) => match &tx.transaction.kind {
@@ -3423,8 +3436,13 @@ fn chain_stats(node: &Node) -> Result<ChainStatsResponse, String> {
         total_transaction_fees = total_transaction_fees
             .saturating_add(block.checked_total_fees().map(|fees| fees.0).unwrap_or(0));
         for transaction in &block.transactions {
-            total_transfer_volume =
-                total_transfer_volume.saturating_add(transaction.transaction.amount.0);
+            total_transfer_volume = total_transfer_volume.saturating_add(
+                transaction
+                    .transaction
+                    .total_amount()
+                    .map(|amount| amount.0)
+                    .unwrap_or(0),
+            );
         }
     }
 
@@ -3516,7 +3534,7 @@ fn run_node(args: &[String]) -> Result<(), String> {
     };
 
     println!(
-        "Paqus Node db::{}|p2p::{}|rpc::{}|height::{}|tip::{}|difficulty::{}|peers::{}|mining::{}|min_relay_fee_rate_per_kib::{}|base_market_fee_rate_per_kib::{}|dynamic_market_fee_rate_per_kib::{}|miner_min_fee_rate_per_kib::{}|low_fee_expiry::{}s|mempool_expiry::{}s",
+        "Paqus Node db::{}|p2p::{}|rpc::{}|height::{}|tip::{}|difficulty::{}|peers::{}|mining::{}|min_relay_fee_rate_per_byte::{}|base_market_fee_rate_per_byte::{}|dynamic_market_fee_rate_per_byte::{}|miner_min_fee_rate_per_byte::{}|low_fee_expiry::{}s|mempool_expiry::{}s",
         service.config.db_path,
         format_socket_addrs(&bound_addrs),
         service.config.rpc_addr,
@@ -3979,7 +3997,7 @@ fn mine_once_unlocked(
             pow_target_description(difficulty)
         );
         println!(
-            "mempool:: |txs::{}|miner_min_fee_rate_per_kib::{}|",
+            "mempool:: |txs::{}|miner_min_fee_rate_per_byte::{}|",
             mempool_len, miner_min_fee_rate
         );
         let candidate = prepare_candidate_block(
@@ -4201,7 +4219,7 @@ Usage:
   paqus node db check [db-path]
   paqus node db backup <db-path> <backup-path>
   paqus node db restore <backup-path> <db-path>
-  paqus node run [db-path] [--config path] [--listen addr] [--rpc-listen addr] [--peer addr] [--peers-file path] [--gateway host:port] [--public-addr host:port] [--min-relay-fee units-per-kib] [--market-fee units-per-kib] [--miner-min-fee-rate units-per-kib] [--low-fee-expiry-secs n] [--mempool-expiry-secs n] [--wallet path] [--miner address] [--miner-secret-key key-hex] [--mine]
+  paqus node run [db-path] [--config path] [--listen addr] [--rpc-listen addr] [--peer addr] [--peers-file path] [--gateway host:port] [--public-addr host:port] [--min-relay-fee paqus-per-byte] [--market-fee paqus-per-byte] [--miner-min-fee-rate paqus-per-byte] [--low-fee-expiry-secs n] [--mempool-expiry-secs n] [--wallet path] [--miner address] [--miner-secret-key key-hex] [--mine]
   paqus wallet new [wallet-path] [--show-secret]
   paqus wallet address <secret-key-hex>
   paqus wallet balance <address> [db-path]
