@@ -3,11 +3,13 @@ use crate::runtime::storage::error::StorageError;
 use borsh::{BorshDeserialize, BorshSerialize};
 use lmdb::{Cursor, Database, DatabaseFlags, Environment, Transaction, WriteFlags};
 use paqus::block::{Block, BlockHeight, Height};
-use paqus::crypto::{Address, BlockHash, Hash, TransactionHash};
+use paqus::codec::{block_bytes, decode_block};
+use paqus::crypto::{Address, BlockHash, Hash, TransactionHash, WitnessTransactionHash};
+use paqus::event::{EventId, ProtocolEvent, ProtocolEventKind};
 use paqus::ledger::{Ledger, calculate_state_root};
 use paqus::snapshot::is_snapshot_height;
-use paqus::state::Account;
-use paqus::transaction::SignedTransaction;
+use paqus::state::{Account, OffchainCoinState};
+use paqus::transaction::{SignedProtocolTransaction, SignedTransaction, TransactionFamily};
 use std::collections::BTreeMap;
 use std::path::Path;
 use std::sync::Arc;
@@ -19,9 +21,16 @@ const ACCOUNTS: &str = "accounts";
 const GENESIS_ACCOUNTS: &str = "genesis_accounts";
 const STATE_SNAPSHOTS: &str = "state_snapshots";
 const TX_INDEX: &str = "tx_index";
+const WTX_INDEX: &str = "wtx_index";
 const ADDRESS_TX_INDEX: &str = "address_tx_index";
 const MINER_BLOCK_INDEX: &str = "miner_block_index";
 const META: &str = "meta";
+const PROTOCOL_STATE: &str = "protocol_state";
+const EVENTS_BY_ID: &str = "events_by_id";
+const BLOCK_EVENT_INDEX: &str = "block_event_index";
+const TRANSACTION_EVENT_INDEX: &str = "transaction_event_index";
+const ADDRESS_EVENT_INDEX: &str = "address_event_index";
+const PROTOCOL_STATE_KEY: &[u8] = b"current";
 const TIP_HEIGHT_KEY: &[u8] = b"tip_height";
 const TIP_HASH_KEY: &[u8] = b"tip_hash";
 const STORAGE_VERSION_KEY: &[u8] = b"storage_version";
@@ -39,6 +48,7 @@ pub struct TransactionLocation {
     pub block_height: BlockHeight,
     pub block_hash: BlockHash,
     pub tx_index: u32,
+    pub family: TransactionFamily,
 }
 
 #[derive(BorshSerialize, BorshDeserialize, Clone, Copy, Debug, PartialEq, Eq)]
@@ -48,12 +58,33 @@ pub struct AddressTransactionLocation {
     pub block_hash: BlockHash,
     pub tx_index: u32,
     pub sent: bool,
+    pub family: TransactionFamily,
 }
 
 #[derive(BorshSerialize, BorshDeserialize, Clone, Copy, Debug, PartialEq, Eq)]
 pub struct MinerBlockLocation {
     pub block_height: BlockHeight,
     pub block_hash: BlockHash,
+}
+
+#[derive(BorshSerialize, BorshDeserialize, Clone, Debug, PartialEq, Eq)]
+struct StoredProtocolState {
+    offchain_coins: OffchainCoinState,
+    events_by_block: BTreeMap<BlockHash, Vec<ProtocolEvent>>,
+}
+
+impl StoredProtocolState {
+    fn from_ledger(ledger: &Ledger) -> Self {
+        Self {
+            offchain_coins: ledger.offchain_coins.clone(),
+            events_by_block: ledger.events_by_block.clone(),
+        }
+    }
+
+    fn restore(self, ledger: &mut Ledger) {
+        ledger.offchain_coins = self.offchain_coins;
+        ledger.events_by_block = self.events_by_block;
+    }
 }
 
 impl StateSnapshot {
@@ -78,8 +109,14 @@ pub struct Storage {
     genesis_accounts: Database,
     state_snapshots: Database,
     tx_index: Database,
+    wtx_index: Database,
     address_tx_index: Database,
     miner_block_index: Database,
+    protocol_state: Database,
+    events_by_id: Database,
+    block_event_index: Database,
+    transaction_event_index: Database,
+    address_event_index: Database,
     meta: Database,
 }
 
@@ -117,8 +154,16 @@ impl Storage {
             genesis_accounts: env.create_db(Some(GENESIS_ACCOUNTS), DatabaseFlags::empty())?,
             state_snapshots: env.create_db(Some(STATE_SNAPSHOTS), DatabaseFlags::empty())?,
             tx_index: env.create_db(Some(TX_INDEX), DatabaseFlags::empty())?,
+            wtx_index: env.create_db(Some(WTX_INDEX), DatabaseFlags::empty())?,
             address_tx_index: env.create_db(Some(ADDRESS_TX_INDEX), DatabaseFlags::empty())?,
             miner_block_index: env.create_db(Some(MINER_BLOCK_INDEX), DatabaseFlags::empty())?,
+            protocol_state: env.create_db(Some(PROTOCOL_STATE), DatabaseFlags::empty())?,
+            events_by_id: env.create_db(Some(EVENTS_BY_ID), DatabaseFlags::empty())?,
+            block_event_index: env.create_db(Some(BLOCK_EVENT_INDEX), DatabaseFlags::empty())?,
+            transaction_event_index: env
+                .create_db(Some(TRANSACTION_EVENT_INDEX), DatabaseFlags::empty())?,
+            address_event_index: env
+                .create_db(Some(ADDRESS_EVENT_INDEX), DatabaseFlags::empty())?,
             meta: env.create_db(Some(META), DatabaseFlags::empty())?,
             env,
         })
@@ -159,12 +204,18 @@ impl Storage {
             && is_db_empty(&txn, self.genesis_accounts)?
             && is_db_empty(&txn, self.state_snapshots)?
             && is_db_empty(&txn, self.tx_index)?
+            && is_db_empty(&txn, self.wtx_index)?
             && is_db_empty(&txn, self.address_tx_index)?
-            && is_db_empty(&txn, self.miner_block_index)?)
+            && is_db_empty(&txn, self.miner_block_index)?
+            && is_db_empty(&txn, self.events_by_id)?
+            && is_db_empty(&txn, self.block_event_index)?
+            && is_db_empty(&txn, self.transaction_event_index)?
+            && is_db_empty(&txn, self.address_event_index)?)
     }
 
     pub fn save_block(&self, block: &Block) -> Result<(), StorageError> {
-        let bytes = encode(block)?;
+        validate_block_for_storage(block)?;
+        let bytes = block_bytes(block);
         let mut txn = self.env.begin_rw_txn()?;
         txn.put(
             self.blocks_by_height,
@@ -185,7 +236,8 @@ impl Storage {
     }
 
     pub fn save_side_block(&self, block: &Block) -> Result<(), StorageError> {
-        let bytes = encode(block)?;
+        validate_block_for_storage(block)?;
+        let bytes = block_bytes(block);
         let mut txn = self.env.begin_rw_txn()?;
         txn.put(
             self.blocks_by_hash,
@@ -225,7 +277,7 @@ impl Storage {
     ) -> Result<(), StorageError> {
         let block_hash = block.hash();
 
-        for (index, transaction) in block.transactions.iter().enumerate() {
+        for (index, transaction) in protocol_transactions(block).into_iter().enumerate() {
             let tx_index_u32 = u32::try_from(index)
                 .map_err(|_| StorageError::Integrity("transaction index exceeds u32"))?;
             let tx_hash = transaction.hash();
@@ -233,43 +285,25 @@ impl Storage {
                 block_height: block.height(),
                 block_hash,
                 tx_index: tx_index_u32,
+                family: transaction.family(),
             };
             put_value(txn, self.tx_index, &tx_hash.0, &location)?;
+            put_value(txn, self.wtx_index, &transaction.wtxid().0, &location)?;
 
-            let sent_location = AddressTransactionLocation {
-                tx_hash,
-                block_height: block.height(),
-                block_hash,
-                tx_index: tx_index_u32,
-                sent: true,
-            };
-            put_value(
-                txn,
-                self.address_tx_index,
-                &address_tx_key(
-                    &transaction.transaction.from,
-                    block.height(),
-                    tx_index_u32,
-                    true,
-                ),
-                &sent_location,
-            )?;
-
-            if transaction.transaction.to != transaction.transaction.from {
-                let received_location = AddressTransactionLocation {
-                    sent: false,
-                    ..sent_location
+            for (address, sent) in transaction_addresses(&transaction) {
+                let address_location = AddressTransactionLocation {
+                    tx_hash,
+                    block_height: block.height(),
+                    block_hash,
+                    tx_index: tx_index_u32,
+                    sent,
+                    family: transaction.family(),
                 };
                 put_value(
                     txn,
                     self.address_tx_index,
-                    &address_tx_key(
-                        &transaction.transaction.to,
-                        block.height(),
-                        tx_index_u32,
-                        false,
-                    ),
-                    &received_location,
+                    &address_tx_key(&address, block.height(), tx_index_u32, sent),
+                    &address_location,
                 )?;
             }
         }
@@ -277,11 +311,109 @@ impl Storage {
         Ok(())
     }
 
+    fn index_protocol_events(
+        &self,
+        txn: &mut lmdb::RwTransaction<'_>,
+        events: &[ProtocolEvent],
+    ) -> Result<(), StorageError> {
+        for event in events {
+            if !event.validate() {
+                return Err(StorageError::Integrity("invalid protocol event"));
+            }
+            let id = event.id();
+            put_value(txn, self.events_by_id, &id.0, event)?;
+            put_value(
+                txn,
+                self.block_event_index,
+                &block_event_key(&event.block_hash, event.event_index),
+                &id,
+            )?;
+            if let Some(transaction_hash) = event.transaction_hash {
+                put_value(
+                    txn,
+                    self.transaction_event_index,
+                    &transaction_event_key(&transaction_hash, event.event_index),
+                    &id,
+                )?;
+            }
+            for address in event_addresses(&event.kind) {
+                put_value(
+                    txn,
+                    self.address_event_index,
+                    &address_event_key(&address, event.block_height, event.event_index),
+                    &id,
+                )?;
+            }
+        }
+        Ok(())
+    }
+
+    pub fn load_protocol_event(&self, id: &EventId) -> Result<Option<ProtocolEvent>, StorageError> {
+        let txn = self.env.begin_ro_txn()?;
+        let event: Option<ProtocolEvent> = read_value(&txn, self.events_by_id, &id.0)?;
+        if event
+            .as_ref()
+            .is_some_and(|event| !event.validate() || event.id() != *id)
+        {
+            return Err(StorageError::Integrity("stored protocol event is invalid"));
+        }
+        Ok(event)
+    }
+
+    pub fn load_block_events(
+        &self,
+        block_hash: &BlockHash,
+    ) -> Result<Vec<ProtocolEvent>, StorageError> {
+        self.load_indexed_events(self.block_event_index, &block_hash.0)
+    }
+
+    pub fn load_transaction_events(
+        &self,
+        transaction_hash: &TransactionHash,
+    ) -> Result<Vec<ProtocolEvent>, StorageError> {
+        self.load_indexed_events(self.transaction_event_index, &transaction_hash.0)
+    }
+
+    pub fn load_address_events(
+        &self,
+        address: &Address,
+    ) -> Result<Vec<ProtocolEvent>, StorageError> {
+        self.load_indexed_events(self.address_event_index, &address.0)
+    }
+
+    fn load_indexed_events(
+        &self,
+        database: Database,
+        prefix: &[u8],
+    ) -> Result<Vec<ProtocolEvent>, StorageError> {
+        let txn = self.env.begin_ro_txn()?;
+        let mut cursor = txn.open_ro_cursor(database)?;
+        let mut events = Vec::new();
+        for item in cursor.iter() {
+            let (key, bytes) = item?;
+            if key < prefix {
+                continue;
+            }
+            if !key.starts_with(prefix) {
+                break;
+            }
+            let id: EventId = decode(bytes)?;
+            let event: ProtocolEvent = read_value(&txn, self.events_by_id, &id.0)?
+                .ok_or(StorageError::Integrity("indexed protocol event is missing"))?;
+            if !event.validate() || event.id() != id {
+                return Err(StorageError::Integrity("indexed protocol event is invalid"));
+            }
+            events.push(event);
+        }
+        events.sort_by_key(|event| (event.block_height, event.event_index));
+        Ok(events)
+    }
+
     pub fn load_block_by_height(&self, height: BlockHeight) -> Result<Option<Block>, StorageError> {
         let txn = self.env.begin_ro_txn()?;
         read_bytes(&txn, self.blocks_by_height, &height_key(height))?
             .map(|bytes| {
-                let block: Block = decode(&bytes)?;
+                let block = decode_stored_block(&bytes)?;
                 if block.height() != height {
                     return Err(StorageError::Integrity(
                         "stored block height does not match height key",
@@ -296,7 +428,7 @@ impl Storage {
         let txn = self.env.begin_ro_txn()?;
         read_bytes(&txn, self.blocks_by_hash, &hash.0)?
             .map(|bytes| {
-                let block: Block = decode(&bytes)?;
+                let block = decode_stored_block(&bytes)?;
                 if block.hash() != *hash {
                     return Err(StorageError::Integrity(
                         "stored block hash does not match hash key",
@@ -311,8 +443,9 @@ impl Storage {
         let txn = self.env.begin_ro_txn()?;
         let mut cursor = txn.open_ro_cursor(self.blocks_by_hash)?;
         let mut blocks = Vec::new();
-        for (_key, bytes) in cursor.iter() {
-            let block: Block = decode(bytes)?;
+        for item in cursor.iter() {
+            let (_key, bytes) = item?;
+            let block = decode_stored_block(bytes)?;
             blocks.push(block);
         }
         Ok(blocks)
@@ -326,10 +459,32 @@ impl Storage {
         read_value(&txn, self.tx_index, &hash.0)
     }
 
+    pub fn load_witness_transaction_location(
+        &self,
+        hash: &WitnessTransactionHash,
+    ) -> Result<Option<TransactionLocation>, StorageError> {
+        let txn = self.env.begin_ro_txn()?;
+        read_value(&txn, self.wtx_index, &hash.0)
+    }
+
     pub fn load_transaction(
         &self,
         hash: &TransactionHash,
     ) -> Result<Option<(TransactionLocation, SignedTransaction)>, StorageError> {
+        let Some((location, transaction)) = self.load_protocol_transaction(hash)? else {
+            return Ok(None);
+        };
+        if let SignedProtocolTransaction::Transfer(transaction) = transaction {
+            Ok(Some((location, transaction)))
+        } else {
+            Ok(None)
+        }
+    }
+
+    pub fn load_protocol_transaction(
+        &self,
+        hash: &TransactionHash,
+    ) -> Result<Option<(TransactionLocation, SignedProtocolTransaction)>, StorageError> {
         let Some(location) = self.load_transaction_location(hash)? else {
             return Ok(None);
         };
@@ -343,16 +498,46 @@ impl Storage {
                 "indexed transaction block hash mismatch",
             ));
         }
-        let transaction = block
-            .transactions
+        let transaction = protocol_transactions(&block)
             .get(location.tx_index as usize)
             .ok_or(StorageError::Integrity(
                 "indexed transaction position is missing",
             ))?
             .clone();
-        if transaction.hash() != *hash {
+        if transaction.hash() != *hash || transaction.family() != location.family {
             return Err(StorageError::Integrity(
-                "indexed transaction hash does not match transaction",
+                "indexed transaction does not match its location",
+            ));
+        }
+        Ok(Some((location, transaction)))
+    }
+
+    pub fn load_protocol_transaction_by_wtxid(
+        &self,
+        hash: &WitnessTransactionHash,
+    ) -> Result<Option<(TransactionLocation, SignedProtocolTransaction)>, StorageError> {
+        let Some(location) = self.load_witness_transaction_location(hash)? else {
+            return Ok(None);
+        };
+        let Some(block) = self.load_block_by_height(location.block_height)? else {
+            return Err(StorageError::Integrity(
+                "indexed witness transaction block is missing",
+            ));
+        };
+        if block.hash() != location.block_hash {
+            return Err(StorageError::Integrity(
+                "indexed witness transaction block hash mismatch",
+            ));
+        }
+        let transaction = protocol_transactions(&block)
+            .get(location.tx_index as usize)
+            .ok_or(StorageError::Integrity(
+                "indexed witness transaction position is missing",
+            ))?
+            .clone();
+        if transaction.wtxid() != *hash || transaction.family() != location.family {
+            return Err(StorageError::Integrity(
+                "indexed witness transaction does not match its location",
             ));
         }
         Ok(Some((location, transaction)))
@@ -366,7 +551,8 @@ impl Storage {
         let mut locations = Vec::new();
         let txn = self.env.begin_ro_txn()?;
         let mut cursor = txn.open_ro_cursor(self.address_tx_index)?;
-        for (key, bytes) in cursor.iter() {
+        for item in cursor.iter() {
+            let (key, bytes) = item?;
             if key < prefix.as_slice() {
                 continue;
             }
@@ -389,7 +575,8 @@ impl Storage {
         let mut locations = Vec::new();
         let txn = self.env.begin_ro_txn()?;
         let mut cursor = txn.open_ro_cursor(self.miner_block_index)?;
-        for (key, bytes) in cursor.iter() {
+        for item in cursor.iter() {
+            let (key, bytes) = item?;
             if key < prefix.as_slice() {
                 continue;
             }
@@ -444,7 +631,7 @@ impl Storage {
             height,
             block_hash,
             state_root: ledger.state_root().into(),
-            accounts: ledger.accounts.clone(),
+            accounts: ledger.accounts().clone(),
         };
         let mut txn = self.env.begin_rw_txn()?;
         put_value(
@@ -518,15 +705,21 @@ impl Storage {
         txn.clear_db(self.accounts)?;
         txn.clear_db(self.state_snapshots)?;
         txn.clear_db(self.tx_index)?;
+        txn.clear_db(self.wtx_index)?;
         txn.clear_db(self.address_tx_index)?;
         txn.clear_db(self.miner_block_index)?;
+        txn.clear_db(self.events_by_id)?;
+        txn.clear_db(self.block_event_index)?;
+        txn.clear_db(self.transaction_event_index)?;
+        txn.clear_db(self.address_event_index)?;
 
-        for account in ledger.accounts.values() {
+        for account in ledger.accounts().values() {
             put_value(&mut txn, self.accounts, &account.address.0, account)?;
         }
 
         for block in ledger.chain.blocks.values() {
-            let bytes = encode(block)?;
+            validate_block_for_storage(block)?;
+            let bytes = block_bytes(block);
             txn.put(
                 self.blocks_by_height,
                 &height_key(block.height()),
@@ -541,6 +734,7 @@ impl Storage {
             )?;
             self.index_block_transactions(&mut txn, block)?;
             self.index_miner_block(&mut txn, block)?;
+            self.index_protocol_events(&mut txn, ledger.events_for_block(&block.hash()))?;
         }
 
         if let (Some(height), Some(hash)) = (ledger.tip_height(), ledger.tip_hash()) {
@@ -551,7 +745,7 @@ impl Storage {
                     height,
                     block_hash: hash,
                     state_root: ledger.state_root().into(),
-                    accounts: ledger.accounts.clone(),
+                    accounts: ledger.accounts().clone(),
                 };
                 put_value(
                     &mut txn,
@@ -561,6 +755,13 @@ impl Storage {
                 )?;
             }
         }
+
+        put_value(
+            &mut txn,
+            self.protocol_state,
+            PROTOCOL_STATE_KEY,
+            &StoredProtocolState::from_ledger(ledger),
+        )?;
 
         if let Some(snapshot) = genesis_snapshot {
             put_value(
@@ -587,17 +788,29 @@ impl Storage {
         self.validate_chain_integrity()?;
 
         let mut ledger = Ledger::new();
+        let mut accounts = BTreeMap::new();
         {
             let txn = self.env.begin_ro_txn()?;
             let mut cursor = txn.open_ro_cursor(self.accounts)?;
-            for (_key, bytes) in cursor.iter() {
+            for item in cursor.iter() {
+                let (_key, bytes) = item?;
                 let account: Account = decode(bytes)?;
                 if account.address.0.as_slice() != _key {
                     return Err(StorageError::Integrity(
                         "stored account address does not match account key",
                     ));
                 }
-                ledger.accounts.insert(account.address, account);
+                accounts.insert(account.address, account);
+            }
+        }
+        ledger.replace_accounts(accounts);
+
+        {
+            let txn = self.env.begin_ro_txn()?;
+            if let Some(state) =
+                read_value::<StoredProtocolState>(&txn, self.protocol_state, PROTOCOL_STATE_KEY)?
+            {
+                state.restore(&mut ledger);
             }
         }
 
@@ -746,6 +959,19 @@ impl Storage {
     }
 
     #[cfg(test)]
+    pub(crate) fn test_abort_tip_write(
+        &self,
+        height: BlockHeight,
+        hash: BlockHash,
+    ) -> Result<(), StorageError> {
+        let mut txn = self.env.begin_rw_txn()?;
+        put_value(&mut txn, self.meta, TIP_HEIGHT_KEY, &height)?;
+        put_value(&mut txn, self.meta, TIP_HASH_KEY, &hash)?;
+        txn.abort();
+        Ok(())
+    }
+
+    #[cfg(test)]
     fn test_put<T: BorshSerialize>(
         &self,
         db: Database,
@@ -761,6 +987,55 @@ impl Storage {
 
 fn height_key(height: BlockHeight) -> [u8; 8] {
     height.0.to_be_bytes()
+}
+
+fn protocol_transactions(block: &Block) -> Vec<SignedProtocolTransaction> {
+    block
+        .transactions
+        .iter()
+        .cloned()
+        .map(SignedProtocolTransaction::Transfer)
+        .chain(
+            block
+                .ecash_transactions
+                .iter()
+                .cloned()
+                .map(SignedProtocolTransaction::Ecash),
+        )
+        .collect()
+}
+
+fn transaction_addresses(transaction: &SignedProtocolTransaction) -> Vec<(Address, bool)> {
+    let signer = transaction.signer();
+    let mut addresses = vec![(signer, true)];
+    let recipient = match transaction {
+        SignedProtocolTransaction::Transfer(tx) => Some(tx.transaction.to),
+        SignedProtocolTransaction::Ecash(tx) => match &tx.transaction.kind {
+            paqus::transaction::EcashTransactionKind::DepositCash { recipient, .. } => {
+                Some(*recipient)
+            }
+            _ => None,
+        },
+    };
+    if recipient.is_some_and(|recipient| recipient != signer) {
+        addresses.push((recipient.unwrap(), false));
+    }
+    addresses
+}
+
+fn event_addresses(kind: &ProtocolEventKind) -> Vec<Address> {
+    let addresses = match kind {
+        ProtocolEventKind::Transfer { from, to, .. } => vec![*from, *to],
+        ProtocolEventKind::EcashWithdrawn { signer, .. } => vec![*signer],
+        ProtocolEventKind::EcashDeposited {
+            signer, recipient, ..
+        } => vec![*signer, *recipient],
+        ProtocolEventKind::GenesisAllocation { recipient, .. } => vec![*recipient],
+        ProtocolEventKind::CoinbasePaid { miner, .. } => vec![*miner],
+    };
+    let mut unique = std::collections::BTreeSet::new();
+    unique.extend(addresses);
+    unique.into_iter().collect()
 }
 
 fn genesis_snapshot_from_ledger(
@@ -779,7 +1054,7 @@ fn genesis_snapshot_from_ledger(
                 height: Height(0),
                 block_hash: block.hash(),
                 state_root: ledger.state_root().into(),
-                accounts: ledger.accounts.clone(),
+                accounts: ledger.accounts().clone(),
             });
         }
         return Err(StorageError::Integrity("stored genesis block is invalid"));
@@ -788,7 +1063,7 @@ fn genesis_snapshot_from_ledger(
         height: Height(0),
         block_hash: block.hash(),
         state_root: genesis_ledger.state_root().into(),
-        accounts: genesis_ledger.accounts,
+        accounts: genesis_ledger.accounts().clone(),
     })
 }
 
@@ -798,6 +1073,28 @@ fn address_tx_key(address: &Address, height: BlockHeight, tx_index: u32, sent: b
     key.extend_from_slice(&height.0.to_be_bytes());
     key.extend_from_slice(&tx_index.to_be_bytes());
     key.push(u8::from(sent));
+    key
+}
+
+fn block_event_key(block_hash: &BlockHash, event_index: u32) -> Vec<u8> {
+    let mut key = Vec::with_capacity(HASH_SIZE + 4);
+    key.extend_from_slice(&block_hash.0);
+    key.extend_from_slice(&event_index.to_be_bytes());
+    key
+}
+
+fn transaction_event_key(transaction_hash: &TransactionHash, event_index: u32) -> Vec<u8> {
+    let mut key = Vec::with_capacity(HASH_SIZE + 4);
+    key.extend_from_slice(&transaction_hash.0);
+    key.extend_from_slice(&event_index.to_be_bytes());
+    key
+}
+
+fn address_event_key(address: &Address, height: BlockHeight, event_index: u32) -> Vec<u8> {
+    let mut key = Vec::with_capacity(ADDRESS_SIZE + 8 + 4);
+    key.extend_from_slice(&address.0);
+    key.extend_from_slice(&height.0.to_be_bytes());
+    key.extend_from_slice(&event_index.to_be_bytes());
     key
 }
 
@@ -852,6 +1149,16 @@ fn encode<T: BorshSerialize>(value: &T) -> Result<Vec<u8>, StorageError> {
 
 fn decode<T: BorshDeserialize>(bytes: &[u8]) -> Result<T, StorageError> {
     Ok(T::try_from_slice(bytes)?)
+}
+
+fn validate_block_for_storage(block: &Block) -> Result<(), StorageError> {
+    block
+        .validate()
+        .map_err(|_| StorageError::Integrity("refusing to store an invalid block"))
+}
+
+fn decode_stored_block(bytes: &[u8]) -> Result<Block, StorageError> {
+    decode_block(bytes).map_err(|_| StorageError::Integrity("stored block failed validation"))
 }
 
 fn invalid_data(message: &'static str) -> StorageError {

@@ -1,17 +1,19 @@
 use crate::runtime::cache::CoreCache;
-use crate::runtime::mempool::Mempool;
+use crate::runtime::mempool::{ExtensionMempool, Mempool};
 use crate::runtime::miner::{MiningConfig, MiningResult, mine_candidate_block};
 use crate::runtime::node::error::NodeError;
-use crate::runtime::params::{DIFFICULTY_ADJUSTMENT_INTERVAL, HASH_SIZE};
+use crate::runtime::params::HASH_SIZE;
 use crate::runtime::storage::Storage;
 use paqus::block::{Block, BlockHeight, Height};
-use paqus::consensus::Consensus;
 use paqus::consensus::supply::{Amount, Balance};
+use paqus::consensus::{Consensus, MIN_DIFFICULTY};
 use paqus::crypto::{Address, BlockHash, Hash, TransactionHash};
-use paqus::genesis::{GENESIS_HASH, genesis_block};
+use paqus::genesis::{CURRENT_CHAIN_PARAMS, genesis_block, validate_genesis_identity};
 use paqus::ledger::fork_choice::ForkChoice;
 use paqus::ledger::{Chain, Ledger};
-use paqus::transaction::{AccountNonce, SignedTransaction};
+use paqus::transaction::{
+    AccountNonce, SignedEcashTransaction, SignedProtocolTransaction, SignedTransaction,
+};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -70,6 +72,7 @@ impl Default for BalanceSummary {
 pub struct Node {
     pub ledger: Ledger,
     pub mempool: Mempool,
+    pub extension_mempool: ExtensionMempool,
     pub storage: Storage,
     pub consensus: Consensus,
     pub cache: CoreCache,
@@ -80,12 +83,14 @@ pub struct Node {
     missing_parent_requests: VecDeque<BlockHash>,
     missing_parent_request_set: BTreeSet<BlockHash>,
     missing_parent_retry_at: BTreeMap<BlockHash, u64>,
+    block_validation_failures_total: u64,
+    reorgs_total: u64,
 }
 
 impl Node {
     pub fn new(ledger: Ledger, storage: Storage, consensus: Consensus) -> Self {
         let genesis_accounts = if ledger.tip_height() == Some(Height(0)) {
-            ledger.accounts.clone()
+            ledger.accounts().clone()
         } else {
             BTreeMap::new()
         };
@@ -108,6 +113,7 @@ impl Node {
         Self {
             ledger,
             mempool: Mempool::new(),
+            extension_mempool: ExtensionMempool::new(),
             storage,
             consensus,
             cache,
@@ -118,7 +124,24 @@ impl Node {
             missing_parent_requests: VecDeque::new(),
             missing_parent_request_set: BTreeSet::new(),
             missing_parent_retry_at: BTreeMap::new(),
+            block_validation_failures_total: 0,
+            reorgs_total: 0,
         }
+    }
+
+    pub fn block_validation_failures_total(&self) -> u64 {
+        self.block_validation_failures_total
+    }
+
+    pub fn reorgs_total(&self) -> u64 {
+        self.reorgs_total
+    }
+
+    pub fn submit_ecash_transaction(
+        &mut self,
+        transaction: SignedEcashTransaction,
+    ) -> Result<TransactionHash, NodeError> {
+        self.submit_protocol_transaction(SignedProtocolTransaction::Ecash(transaction))
     }
 
     pub fn temporary(ledger: Ledger, consensus: Consensus) -> Result<Self, NodeError> {
@@ -126,16 +149,16 @@ impl Node {
     }
 
     pub fn init_or_load(path: impl AsRef<Path>, consensus: Consensus) -> Result<Self, NodeError> {
+        validate_genesis_identity(CURRENT_CHAIN_PARAMS)?;
         let storage = Storage::open(path)?;
         let ledger = if storage.load_tip()?.is_some() {
             storage.load_ledger()?
         } else {
             let genesis = genesis_block();
-            assert_eq!(genesis.hash().0, GENESIS_HASH);
             let mut ledger = Ledger::new();
             ledger.apply_block(genesis)?;
             storage.save_ledger(&ledger)?;
-            storage.save_genesis_accounts(&ledger.accounts)?;
+            storage.save_genesis_accounts(ledger.accounts())?;
             ledger
         };
 
@@ -145,14 +168,14 @@ impl Node {
                 let accounts = if let Some(snapshot) = storage.load_state_snapshot(Height(0))? {
                     snapshot.accounts
                 } else if ledger.tip_height() == Some(Height(0)) {
-                    ledger.accounts.clone()
+                    ledger.accounts().clone()
                 } else {
                     let genesis = storage
                         .load_block_by_height(Height(0))?
                         .ok_or(NodeError::MissingGenesisState)?;
                     let mut genesis_ledger = Ledger::new();
                     genesis_ledger.apply_block(genesis)?;
-                    genesis_ledger.accounts
+                    genesis_ledger.accounts().clone()
                 };
                 storage.save_genesis_accounts(&accounts)?;
                 accounts
@@ -167,12 +190,37 @@ impl Node {
         &mut self,
         transaction: SignedTransaction,
     ) -> Result<TransactionHash, NodeError> {
+        if self
+            .extension_mempool
+            .contains_signer(transaction.transaction.from)
+        {
+            return Err(crate::runtime::mempool::MempoolError::DuplicateTransaction.into());
+        }
         Ok(self.mempool.insert_validated_at_with_cache(
             &self.ledger,
             transaction,
             current_unix_timestamp(),
             &mut self.cache,
         )?)
+    }
+
+    pub fn submit_protocol_transaction(
+        &mut self,
+        transaction: SignedProtocolTransaction,
+    ) -> Result<TransactionHash, NodeError> {
+        match transaction {
+            SignedProtocolTransaction::Transfer(transaction) => {
+                self.submit_transaction(transaction)
+            }
+            transaction => {
+                if self.mempool.contains_sender(transaction.signer()) {
+                    return Err(crate::runtime::mempool::MempoolError::DuplicateTransaction.into());
+                }
+                self.extension_mempool
+                    .insert_validated(&self.ledger, transaction)
+                    .map_err(NodeError::from)
+            }
+        }
     }
 
     pub fn apply_block(&mut self, block: Block) -> Result<(), NodeError> {
@@ -192,7 +240,11 @@ impl Node {
                 paqus::ledger::fork_choice::ForkChoiceError::DuplicateBlock,
             )) => Ok(()),
             Err(NodeError::Ledger(paqus::ledger::LedgerError::DuplicateBlock)) => Ok(()),
-            Err(error) => Err(error),
+            Err(error) => {
+                self.block_validation_failures_total =
+                    self.block_validation_failures_total.saturating_add(1);
+                Err(error)
+            }
         }
     }
 
@@ -223,6 +275,7 @@ impl Node {
             ledger
         });
         self.mempool.remove_confirmed(&block);
+        self.extension_mempool.remove_confirmed(&block);
         self.cache.insert_block(block.clone());
         for transaction in &block.transactions {
             if let Some(sender) = self.ledger.account(&transaction.transaction.from) {
@@ -254,10 +307,10 @@ impl Node {
             return;
         }
 
-        if self.orphan_blocks.len() >= MAX_ORPHAN_BLOCKS {
-            if let Some(evicted_hash) = self.orphan_blocks.keys().next().copied() {
-                self.remove_orphan(evicted_hash);
-            }
+        if self.orphan_blocks.len() >= MAX_ORPHAN_BLOCKS
+            && let Some(evicted_hash) = self.orphan_blocks.keys().next().copied()
+        {
+            self.remove_orphan(evicted_hash);
         }
 
         let parent = BlockHash::from(block.previous_hash().as_hash());
@@ -460,13 +513,17 @@ impl Node {
                 continue;
             }
             for transaction in old_block.transactions {
-                let _ = self.mempool.insert_validated(&self.ledger, transaction);
+                let _ = self.submit_protocol_transaction(transaction.into());
+            }
+            for transaction in old_block.ecash_transactions {
+                let _ = self.submit_protocol_transaction(transaction.into());
             }
         }
 
         // Keep the variable intentionally used for the common ancestor search, even when the
         // winning branch starts at genesis.
         let _ = winning_branch;
+        self.reorgs_total = self.reorgs_total.saturating_add(1);
         Ok(())
     }
 
@@ -483,10 +540,8 @@ impl Node {
             .ok_or(NodeError::ReorgRequired)?
             .block
             .clone();
-        let mut ledger = Ledger {
-            accounts: self.genesis_accounts.clone(),
-            chain: Chain::new(),
-        };
+        let mut ledger =
+            Ledger::from_accounts_and_chain(self.genesis_accounts.clone(), Chain::new());
         ledger.chain.insert_block(genesis)?;
 
         let branch = self
@@ -575,12 +630,14 @@ impl Node {
         let difficulty = self.next_difficulty()?;
         let result = mine_candidate_block(
             &self.mempool,
+            &self.extension_mempool,
             &self.ledger,
             &self.consensus,
             miner_address,
             timestamp,
             MiningConfig {
                 difficulty,
+                start_nonce: 0,
                 max_attempts,
                 transaction_limit,
                 min_fee_rate: self.mempool.dynamic_market_fee_rate(),
@@ -593,26 +650,36 @@ impl Node {
     }
 
     pub fn next_difficulty(&self) -> Result<u32, NodeError> {
+        if self.consensus.config.difficulty == 0 {
+            return Ok(MIN_DIFFICULTY);
+        }
         let Some(tip_height) = self.ledger.tip_height() else {
-            return Ok(self.consensus.config.difficulty);
+            return Ok(self.consensus.config.difficulty.max(MIN_DIFFICULTY));
         };
 
         self.next_difficulty_after_tip(tip_height)
+            .map(|difficulty| difficulty.max(MIN_DIFFICULTY))
     }
 
     fn next_difficulty_after_tip(&self, tip_height: BlockHeight) -> Result<u32, NodeError> {
-        let Some((first_timestamp, last_timestamp, block_count, current_difficulty)) = self
-            .storage
-            .difficulty_window(tip_height, DIFFICULTY_ADJUSTMENT_INTERVAL)?
-        else {
-            return Ok(self.consensus.config.difficulty);
-        };
+        if tip_height == Height(0) {
+            return Ok(self.consensus.config.difficulty.max(MIN_DIFFICULTY));
+        }
+        let tip = self
+            .ledger
+            .block(&tip_height)
+            .ok_or(NodeError::ReorgRequired)?;
+        let anchor = self
+            .ledger
+            .block(&Height(1))
+            .ok_or(NodeError::ReorgRequired)?;
 
-        Ok(self.consensus.retarget_difficulty(
-            current_difficulty,
-            first_timestamp,
-            last_timestamp,
-            block_count,
+        Ok(self.consensus.asert_difficulty(
+            anchor.difficulty(),
+            anchor.timestamp(),
+            anchor.height(),
+            tip.timestamp(),
+            tip.height(),
         )?)
     }
 
@@ -621,32 +688,30 @@ impl Node {
             .fork_choice
             .get(&tip_hash)
             .ok_or(paqus::ledger::fork_choice::ForkChoiceError::MissingParent)?;
-        if tip.height.0 < DIFFICULTY_ADJUSTMENT_INTERVAL {
-            return Ok(self.consensus.config.difficulty);
+        if tip.height == Height(0) {
+            return Ok(self.consensus.config.difficulty.max(MIN_DIFFICULTY));
         }
-
-        let first_height = Height(tip.height.0 - DIFFICULTY_ADJUSTMENT_INTERVAL);
-        let first_hash = self
+        let anchor_hash = self
             .fork_choice
             .ancestor_hashes(tip_hash)
             .into_iter()
             .find(|hash| {
                 self.fork_choice
                     .get(hash)
-                    .is_some_and(|node| node.height == first_height)
+                    .is_some_and(|node| node.height == Height(1))
             })
             .ok_or(NodeError::ReorgRequired)?;
-        let first = self
+        let anchor = self
             .fork_choice
-            .get(&first_hash)
+            .get(&anchor_hash)
             .ok_or(NodeError::ReorgRequired)?;
-        let block_count = tip.height.0.saturating_sub(first.height.0);
 
-        Ok(self.consensus.retarget_difficulty(
-            tip.block.difficulty(),
-            first.block.timestamp(),
+        Ok(self.consensus.asert_difficulty(
+            anchor.block.difficulty(),
+            anchor.block.timestamp(),
+            anchor.height,
             tip.block.timestamp(),
-            block_count,
+            tip.height,
         )?)
     }
 
@@ -769,10 +834,7 @@ mod tests {
         genesis_accounts.insert(sender, Account::new(sender, Amount(100)));
         genesis_accounts.insert(receiver, Account::new(receiver, Amount(0)));
         genesis_accounts.insert(address(9), Account::new(address(9), Amount(0)));
-        let mut ledger = Ledger {
-            accounts: genesis_accounts.clone(),
-            chain: Chain::new(),
-        };
+        let mut ledger = Ledger::from_accounts_and_chain(genesis_accounts.clone(), Chain::new());
         ledger.chain.insert_block(genesis.clone()).unwrap();
         let transaction = Transaction::new(
             sender,
@@ -837,10 +899,7 @@ mod tests {
             vec![],
         );
         let genesis_accounts = BTreeMap::new();
-        let mut ledger = Ledger {
-            accounts: genesis_accounts.clone(),
-            chain: Chain::new(),
-        };
+        let mut ledger = Ledger::from_accounts_and_chain(genesis_accounts.clone(), Chain::new());
         ledger.chain.insert_block(genesis).unwrap();
         active.set_state_root(ledger.state_root_after_block(&active).unwrap());
         side.set_state_root(ledger.state_root_after_block(&side).unwrap());
@@ -903,7 +962,7 @@ mod tests {
     }
 
     #[test]
-    fn branch_difficulty_uses_parent_branch_window() {
+    fn branch_difficulty_uses_asert_anchor_on_parent_branch() {
         let mut node = Node::temporary(
             Ledger::new(),
             Consensus {
@@ -922,13 +981,14 @@ mod tests {
         );
         let mut previous_hash = node.fork_choice.insert_block(genesis).unwrap();
 
-        for height in 1..=DIFFICULTY_ADJUSTMENT_INTERVAL {
+        let blocks = paqus::consensus::ASERT_HALF_LIFE / paqus::consensus::BLOCK_TIME as u64;
+        for height in 1..=blocks {
             let block = Block::with_difficulty(
                 Height(height),
                 previous_hash,
                 address(9),
                 1,
-                1_700_000_000 + height,
+                1_700_000_000,
                 Nonce(height),
                 vec![],
             );
@@ -938,7 +998,7 @@ mod tests {
         assert_eq!(
             node.next_difficulty_after_branch_tip(previous_hash)
                 .unwrap(),
-            5
+            2
         );
     }
 

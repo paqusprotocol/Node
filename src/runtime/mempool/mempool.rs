@@ -6,7 +6,9 @@ use crate::runtime::params::{
     MAX_RELAY_TRANSACTION_AGE_SECS, MAX_RELAY_TRANSACTION_FUTURE_SECS, MEMPOOL_EXPIRY_SECS,
     MIN_RELAY_FEE_FLOOR,
 };
-use paqus::block::{Block, BlockNonce, CoinbaseTransaction, Height, Nonce};
+use paqus::block::{
+    Block, BlockNonce, CoinbaseTransaction, Height, MAX_BLOCK_SIZE, MAX_BLOCK_WEIGHT, Nonce,
+};
 use paqus::consensus::supply::Amount;
 use paqus::crypto::{Address, BlockHash, Hash, TransactionHash};
 use paqus::ledger::{Ledger, LedgerError};
@@ -171,10 +173,10 @@ impl Mempool {
             return Err(MempoolError::DuplicateTransaction);
         }
         let sender_nonce = (transaction.transaction.from, transaction.transaction.nonce);
-        if let Some(existing) = self.by_sender_nonce.get(&sender_nonce) {
-            if Some(*existing) != replacement {
-                return Err(MempoolError::DuplicateTransaction);
-            }
+        if let Some(existing) = self.by_sender_nonce.get(&sender_nonce)
+            && Some(*existing) != replacement
+        {
+            return Err(MempoolError::DuplicateTransaction);
         }
         let transaction_size = transaction.serialized_size();
 
@@ -249,7 +251,7 @@ impl Mempool {
     fn validate_fee_policy(&self, transaction: &SignedTransaction) -> Result<(), MempoolError> {
         let min_relay_fee = required_fee_for_rate(
             self.config.min_relay_fee.max(MIN_RELAY_FEE_FLOOR),
-            transaction.serialized_size(),
+            transaction.virtual_size(),
         )
         .max(MIN_RELAY_FEE_FLOOR);
         if transaction.transaction.fee.0 < min_relay_fee {
@@ -259,10 +261,8 @@ impl Mempool {
     }
 
     fn transaction_ttl(&self, transaction: &SignedTransaction) -> u64 {
-        let market_fee = required_fee_for_rate(
-            self.dynamic_market_fee_rate(),
-            transaction.serialized_size(),
-        );
+        let market_fee =
+            required_fee_for_rate(self.dynamic_market_fee_rate(), transaction.virtual_size());
         if transaction.transaction.fee.0 < market_fee {
             self.config.low_fee_ttl_secs
         } else {
@@ -407,7 +407,7 @@ impl Mempool {
         let transaction = &self.transactions.get(&hash)?.transaction;
         let fee = transaction.transaction.fee.0;
         Some((
-            fee_rate_key(fee, transaction.serialized_size()),
+            fee_rate_key(fee, transaction.virtual_size()),
             fee,
             Reverse(transaction.transaction.nonce),
             Reverse(hash),
@@ -485,6 +485,13 @@ impl Mempool {
         self.transactions.contains_key(hash)
     }
 
+    pub fn contains_sender(&self, sender: Address) -> bool {
+        self.by_sender_nonce
+            .range((sender, Nonce(0))..=(sender, Nonce(u64::MAX)))
+            .next()
+            .is_some()
+    }
+
     pub fn len(&self) -> usize {
         self.transactions.len()
     }
@@ -547,6 +554,24 @@ impl Mempool {
         limit: usize,
         min_fee_rate: u64,
     ) -> Vec<SignedTransaction> {
+        self.select_for_block_with_policy(limit, min_fee_rate, None)
+    }
+
+    pub fn select_for_block_at_height(
+        &self,
+        limit: usize,
+        min_fee_rate: u64,
+        height: Height,
+    ) -> Vec<SignedTransaction> {
+        self.select_for_block_with_policy(limit, min_fee_rate, Some(height))
+    }
+
+    fn select_for_block_with_policy(
+        &self,
+        limit: usize,
+        min_fee_rate: u64,
+        height: Option<Height>,
+    ) -> Vec<SignedTransaction> {
         let mut heads_by_fee = self.heads_by_fee.clone();
         let mut head_by_sender = self.head_by_sender.clone();
         let mut selected = Vec::new();
@@ -558,9 +583,18 @@ impl Mempool {
             else {
                 continue;
             };
-            if fee_rate_key(transaction.transaction.fee.0, transaction.serialized_size())
+            if fee_rate_key(transaction.transaction.fee.0, transaction.virtual_size())
                 < min_fee_rate
             {
+                continue;
+            }
+            if height.is_some_and(|height| {
+                transaction
+                    .transaction
+                    .validity
+                    .validate_at(height)
+                    .is_err()
+            }) {
                 continue;
             }
             let sender = transaction.transaction.from;
@@ -581,11 +615,11 @@ impl Mempool {
                 )
                 .next()
                 .map(|(_, hash)| *hash);
-            if let Some(next_hash) = next_hash {
-                if let Some(next_key) = self.head_key(next_hash) {
-                    head_by_sender.insert(sender, (next_hash, next_key));
-                    heads_by_fee.insert(next_key, next_hash);
-                }
+            if let Some(next_hash) = next_hash
+                && let Some(next_key) = self.head_key(next_hash)
+            {
+                head_by_sender.insert(sender, (next_hash, next_key));
+                heads_by_fee.insert(next_key, next_hash);
             }
         }
 
@@ -625,7 +659,7 @@ impl Mempool {
             .unwrap_or(Height(0));
         let previous_hash = ledger.tip_hash().unwrap_or(BlockHash([0; HASH_SIZE]));
 
-        let transactions = self.select_for_block_with_min_fee_rate(transaction_limit, min_fee_rate);
+        let transactions = self.select_for_block_at_height(transaction_limit, min_fee_rate, height);
         let fees = Amount(
             transactions
                 .iter()
@@ -652,6 +686,21 @@ impl Mempool {
             coinbase,
             transactions,
         );
+        while block.serialized_size() > MAX_BLOCK_SIZE || block.weight() > MAX_BLOCK_WEIGHT {
+            if block.transactions.pop().is_none() {
+                break;
+            }
+            if let Some(coinbase) = &mut block.coinbase {
+                coinbase.fees = Amount(
+                    block
+                        .transactions
+                        .iter()
+                        .map(|transaction| transaction.transaction.fee.0)
+                        .sum(),
+                );
+            }
+            block.refresh_commitments();
+        }
         let state_root = ledger.state_root_after_block(&block)?;
         block.set_state_root(state_root);
         Ok(block)
@@ -701,7 +750,7 @@ mod tests {
     use paqus::block::Nonce;
     use paqus::crypto::{PublicKey, SecretKey, address_from_public_key, generate_keypair, sign};
     use paqus::ledger::Ledger;
-    use paqus::transaction::{SignedTransaction, Transaction};
+    use paqus::transaction::{SignedTransaction, Transaction, ValidityWindow};
 
     fn address(byte: u8) -> Address {
         Address([byte; 20])
@@ -760,7 +809,7 @@ mod tests {
         let template = signed_transaction_from_with_fee_at(
             secret_key, public_key, to, amount, 0, nonce, timestamp,
         );
-        let fee = required_fee_for_rate(fee_rate, template.serialized_size());
+        let fee = required_fee_for_rate(fee_rate, template.virtual_size());
         signed_transaction_from_with_fee_at(
             secret_key, public_key, to, amount, fee, nonce, timestamp,
         )
@@ -1032,6 +1081,44 @@ mod tests {
         assert_eq!(selected[2].transaction.from, first_sender);
         assert_eq!(selected[2].transaction.nonce, Nonce(1));
         assert_eq!(selected[2].transaction.fee, first_aggressive_fee);
+    }
+
+    #[test]
+    fn candidate_selection_respects_block_height_validity_window() {
+        let keypair = generate_keypair();
+        let sender = address_from_public_key(&keypair.public_key);
+        let payload = Transaction::new_at(
+            sender,
+            address(2),
+            Amount(1),
+            Amount(crate::runtime::params::DEFAULT_TRANSACTION_FEE),
+            Nonce(0),
+            current_unix_timestamp(),
+        )
+        .with_validity_window(ValidityWindow::new(Height(5), Height(7)).unwrap());
+        let signature = sign(&keypair.secret_key, &payload.signing_bytes());
+        let signed = SignedTransaction::new(payload, keypair.public_key, signature);
+        let mut mempool = Mempool::new();
+        mempool.insert(signed.clone()).unwrap();
+
+        assert!(
+            mempool
+                .select_for_block_at_height(1, 0, Height(4))
+                .is_empty()
+        );
+        assert_eq!(
+            mempool.select_for_block_at_height(1, 0, Height(5)),
+            vec![signed.clone()]
+        );
+        assert_eq!(
+            mempool.select_for_block_at_height(1, 0, Height(7)),
+            vec![signed]
+        );
+        assert!(
+            mempool
+                .select_for_block_at_height(1, 0, Height(8))
+                .is_empty()
+        );
     }
 
     #[test]

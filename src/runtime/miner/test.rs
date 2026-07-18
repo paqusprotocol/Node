@@ -1,9 +1,9 @@
 use super::{MiningConfig, mine_candidate_block};
-use crate::runtime::mempool::Mempool;
+use crate::runtime::mempool::{ExtensionMempool, Mempool};
 use crate::runtime::params::BASE_FEE;
 use paqus::block::{Block, Height, Nonce};
-use paqus::consensus::{Consensus, ConsensusConfig};
 use paqus::consensus::supply::Amount;
+use paqus::consensus::{Consensus, ConsensusConfig};
 use paqus::crypto::{Address, HASH_SIZE, Hash, address_from_public_key, generate_keypair, sign};
 use paqus::ledger::Ledger;
 use paqus::transaction::{SignedTransaction, Transaction};
@@ -31,15 +31,18 @@ fn mines_coinbase_only_candidate_without_user_transactions() {
     );
     ledger.apply_block(genesis).unwrap();
     let mempool = Mempool::new();
+    let extension_mempool = ExtensionMempool::new();
 
     let result = mine_candidate_block(
         &mempool,
+        &extension_mempool,
         &ledger,
         &consensus,
         miner,
         1_700_000_000,
         MiningConfig {
             difficulty: 0,
+            start_nonce: 42,
             max_attempts: 1,
             transaction_limit: 10,
             min_fee_rate: 0,
@@ -49,6 +52,7 @@ fn mines_coinbase_only_candidate_without_user_transactions() {
     .expect("coinbase-only block should be mineable");
 
     assert_eq!(result.block.transaction_count(), 0);
+    assert_eq!(result.block.header.nonce, Nonce(42));
     assert!(result.block.coinbase.is_some());
     assert_eq!(consensus.validate_proof_of_work(&result.block), Ok(()));
 }
@@ -66,6 +70,16 @@ fn mines_candidate_block_until_pow_is_valid() {
     ledger.create_account(sender, Amount(100)).unwrap();
     ledger.create_account(receiver, Amount(0)).unwrap();
     ledger.create_account(miner, Amount(0)).unwrap();
+    ledger
+        .apply_block(Block::new(
+            Height(0),
+            Hash([0; HASH_SIZE]),
+            miner,
+            1_700_000_000,
+            Nonce(0),
+            vec![],
+        ))
+        .unwrap();
 
     let transaction = {
         let payload = Transaction::new_at(
@@ -80,16 +94,19 @@ fn mines_candidate_block_until_pow_is_valid() {
         SignedTransaction::new(payload, keypair.public_key, signature)
     };
     let mut mempool = Mempool::new();
+    let extension_mempool = ExtensionMempool::new();
     mempool.insert_validated(&ledger, transaction).unwrap();
 
     let result = mine_candidate_block(
         &mempool,
+        &extension_mempool,
         &ledger,
         &consensus,
         miner,
         1_700_000_000,
         MiningConfig {
             difficulty: 0,
+            start_nonce: 0,
             max_attempts: 1,
             transaction_limit: 10,
             min_fee_rate: 0,

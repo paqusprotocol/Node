@@ -1,8 +1,12 @@
-use crate::network::{configure_stream, connect_peer, request_on_stream};
-use crate::paquscore::{
-    BlockHash, Height, InventoryItem, NetworkMessage, Node, PeerInfo, TipInfo, VersionInfo,
-};
+use crate::rpc::transport::{configure_stream, connect_peer, request_on_stream};
+
+pub mod gossip;
+pub mod libp2p;
+use crate::runtime::network::{InventoryItem, NetworkMessage, PeerInfo, TipInfo, VersionInfo};
+use crate::runtime::node::Node;
+use paqus::block::Height;
 use paqus::block::{Block, BlockHeader};
+use paqus::crypto::BlockHash;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashSet};
 use std::fs;
@@ -120,7 +124,7 @@ impl PeerConnection {
     }
 
     pub fn send(&mut self, message: NetworkMessage) -> Result<(), String> {
-        crate::paquscore::write_message(&mut self.stream, &message.to_envelope())
+        crate::runtime::network::write_message(&mut self.stream, &message.to_envelope())
             .map_err(|error| format!("send failed: {error}"))
     }
 }
@@ -411,7 +415,9 @@ pub fn sync_mempool_connection(
         items
             .into_iter()
             .filter_map(|item| match item {
-                InventoryItem::Transaction(hash) if !node.mempool.contains(&hash) => {
+                InventoryItem::Transaction(hash)
+                    if !node.mempool.contains(&hash) && !node.extension_mempool.contains(&hash) =>
+                {
                     Some(InventoryItem::Transaction(hash))
                 }
                 _ => None,
@@ -431,7 +437,7 @@ pub fn sync_mempool_connection(
         .lock()
         .map_err(|_| "node state lock poisoned".to_string())?;
     for transaction in transactions {
-        match node.submit_transaction(transaction) {
+        match node.submit_protocol_transaction(transaction) {
             Ok(_) => accepted += 1,
             Err(error) => eprintln!(
                 "mempool sync rejected transaction from {}: {error}",
@@ -779,10 +785,9 @@ fn block_locator(node: &Arc<Mutex<Node>>) -> Result<Vec<BlockHash>, String> {
         node.ledger
             .block(&Height(0))
             .is_some_and(|block| block.hash() != *hash)
-    }) {
-        if let Some(genesis) = node.ledger.block(&Height(0)) {
-            locator.push(genesis.hash());
-        }
+    }) && let Some(genesis) = node.ledger.block(&Height(0))
+    {
+        locator.push(genesis.hash());
     }
 
     Ok(locator)

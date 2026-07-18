@@ -1,4 +1,6 @@
-use crate::paquscore::{NetworkMessage, read_message, write_message};
+//! Synchronous HTTP/TCP helpers used by CLI and peer adapters.
+
+use crate::runtime::network::{NetworkMessage, read_message, write_message};
 use socket2::{Domain, Protocol, SockAddr, Socket, Type};
 use std::io::{ErrorKind, Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};

@@ -1,10 +1,10 @@
 use super::Node;
-use crate::runtime::params::{BASE_FEE, BLOCK_REWARD_MATURITY};
+use crate::runtime::params::{BASE_FEE, BLOCK_REWARD_MATURITY, CONFIRMATION_DEPTH};
 use paqus::block::{Block, BlockError, Height, Nonce};
-use paqus::consensus::{Consensus, ConsensusConfig, ConsensusError};
 use paqus::consensus::supply::Amount;
+use paqus::consensus::{Consensus, ConsensusConfig, ConsensusError, DIFFICULTY_START};
 use paqus::crypto::{
-    Address, HASH_SIZE, Hash, KeyPair, PublicKey, Signature, address_from_public_key,
+    Address, HASH_SIZE, Hash, KeyPair, PreviousHash, PublicKey, Signature, address_from_public_key,
     generate_keypair, sign,
 };
 use paqus::genesis::GENESIS_MINER_ADDRESS;
@@ -64,19 +64,18 @@ fn current_unix_timestamp() -> u64 {
         .unwrap_or(0)
 }
 
-fn block(height: u64, previous_hash: Hash, difficulty: u32, nonce: u64) -> Block {
-    block_with_transactions(
-        height,
-        previous_hash,
-        difficulty,
-        nonce,
-        vec![dummy_signed_transaction(height)],
-    )
+fn block(
+    height: u64,
+    previous_hash: impl Into<PreviousHash>,
+    difficulty: u32,
+    nonce: u64,
+) -> Block {
+    block_with_transactions(height, previous_hash, difficulty, nonce, vec![])
 }
 
 fn block_with_transactions(
     height: u64,
-    previous_hash: Hash,
+    previous_hash: impl Into<PreviousHash>,
     difficulty: u32,
     nonce: u64,
     transactions: Vec<SignedTransaction>,
@@ -97,7 +96,7 @@ fn submits_transaction_to_mempool() {
     let transaction = signed_transaction_to(address(2), 10, 0);
     let sender = transaction.transaction.from;
     let mut ledger = Ledger::new();
-    ledger.create_account(sender, Amount(25)).unwrap();
+    ledger.create_account(sender, Amount(100)).unwrap();
     ledger.create_account(address(2), Amount(0)).unwrap();
     let mut node = Node::temporary(
         ledger,
@@ -119,7 +118,7 @@ fn mines_and_applies_block_from_mempool() {
     let sender = transaction.transaction.from;
     let miner = address(9);
     let mut ledger = Ledger::new();
-    ledger.create_account(sender, Amount(25)).unwrap();
+    ledger.create_account(sender, Amount(100)).unwrap();
     ledger.create_account(address(2), Amount(0)).unwrap();
     ledger.create_account(miner, Amount(0)).unwrap();
     ledger
@@ -146,17 +145,18 @@ fn mines_and_applies_block_from_mempool() {
     assert_eq!(result.block.height(), Height(1));
     assert_eq!(node.tip_height(), Some(Height(1)));
     assert!(node.mempool.is_empty());
-    assert_eq!(node.balance(&sender), Some(Amount(13)));
+    assert_eq!(node.balance(&sender), Some(Amount(74)));
     assert_eq!(node.balance(&address(2)), Some(Amount(10)));
 }
 
 #[test]
-fn initializes_genesis_when_storage_is_empty() {
+fn initializes_empty_genesis_when_storage_is_empty() {
     let dir = tempfile_dir();
     let node = Node::init_or_load(&dir, Consensus::with_default_config()).unwrap();
 
     assert_eq!(node.tip_height(), Some(Height(0)));
-    assert!(node.balance(&GENESIS_MINER_ADDRESS).is_some());
+    assert_eq!(node.balance(&GENESIS_MINER_ADDRESS), None);
+    assert_eq!(node.next_difficulty().unwrap(), DIFFICULTY_START);
 }
 
 #[test]
@@ -169,20 +169,24 @@ fn stores_side_fork_without_changing_active_tip_when_work_is_lower() {
         Nonce(0),
         vec![],
     );
-    let active = block(1, genesis.hash(), 3, 1);
-    let side = block(1, genesis.hash(), 1, 2);
+    let mut active = block(1, genesis.hash(), 3, 1);
+    let mut side = block(1, genesis.hash(), 1, 2);
+    let genesis_accounts = BTreeMap::new();
+    let mut ledger = Ledger::from_accounts_and_chain(genesis_accounts.clone(), Default::default());
+    ledger.chain.insert_block(genesis).unwrap();
+    active.set_state_root(ledger.state_root_after_block(&active).unwrap());
+    side.set_state_root(ledger.state_root_after_block(&side).unwrap());
     let side_hash = side.hash();
     let active_hash = active.hash();
-    let mut ledger = Ledger::new();
-    ledger.chain.insert_block(genesis).unwrap();
-    ledger.chain.insert_block(active).unwrap();
-    let mut node = Node::temporary(
+    ledger.apply_block(active).unwrap();
+    let mut node = Node::with_genesis_accounts(
         ledger,
+        crate::runtime::storage::Storage::temporary().unwrap(),
         Consensus {
             config: ConsensusConfig { difficulty: 0 },
         },
-    )
-    .unwrap();
+        genesis_accounts,
+    );
 
     assert!(node.apply_block(side).is_ok());
     assert!(node.fork_choice.contains(&side_hash));
@@ -269,16 +273,13 @@ fn reorgs_state_when_side_fork_becomes_best_tip() {
         block_with_transactions(1, genesis.hash(), 1, 1, vec![active_transaction.clone()]);
     let mut side = block_with_transactions(1, genesis.hash(), 4, 2, vec![side_transaction]);
     let mut genesis_accounts = BTreeMap::new();
-    genesis_accounts.insert(active_sender, Account::new(active_sender, Amount(25)));
-    genesis_accounts.insert(side_sender, Account::new(side_sender, Amount(25)));
+    genesis_accounts.insert(active_sender, Account::new(active_sender, Amount(100)));
+    genesis_accounts.insert(side_sender, Account::new(side_sender, Amount(100)));
     genesis_accounts.insert(active_receiver, Account::new(active_receiver, Amount(0)));
     genesis_accounts.insert(side_receiver, Account::new(side_receiver, Amount(0)));
     genesis_accounts.insert(address(9), Account::new(address(9), Amount(0)));
 
-    let mut ledger = Ledger {
-        accounts: genesis_accounts.clone(),
-        chain: Default::default(),
-    };
+    let mut ledger = Ledger::from_accounts_and_chain(genesis_accounts.clone(), Default::default());
     ledger.chain.insert_block(genesis).unwrap();
     active.set_state_root(ledger.state_root_after_block(&active).unwrap());
     side.set_state_root(ledger.state_root_after_block(&side).unwrap());
@@ -299,9 +300,9 @@ fn reorgs_state_when_side_fork_becomes_best_tip() {
         Some(side_hash)
     );
     assert_eq!(node.tip_hash(), Some(side_hash));
-    assert_eq!(node.balance(&active_sender), Some(Amount(25)));
+    assert_eq!(node.balance(&active_sender), Some(Amount(100)));
     assert_eq!(node.balance(&active_receiver), Some(Amount(0)));
-    assert_eq!(node.balance(&side_sender), Some(Amount(13)));
+    assert_eq!(node.balance(&side_sender), Some(Amount(74)));
     assert_eq!(node.balance(&side_receiver), Some(Amount(10)));
     assert!(node.mempool.contains(&active_transaction.hash()));
 }
@@ -321,14 +322,11 @@ fn reports_confirmed_available_and_pending_balances() {
     let receiver = address(2);
     let miner = address(9);
     let mut genesis_accounts = BTreeMap::new();
-    genesis_accounts.insert(sender, Account::new(sender, Amount(100)));
+    genesis_accounts.insert(sender, Account::new(sender, Amount(300)));
     genesis_accounts.insert(receiver, Account::new(receiver, Amount(0)));
     genesis_accounts.insert(miner, Account::new(miner, Amount(0)));
 
-    let mut ledger = Ledger {
-        accounts: genesis_accounts.clone(),
-        chain: Default::default(),
-    };
+    let mut ledger = Ledger::from_accounts_and_chain(genesis_accounts.clone(), Default::default());
     ledger.chain.insert_block(genesis).unwrap();
 
     for height in 1..=11 {
@@ -356,22 +354,22 @@ fn reports_confirmed_available_and_pending_balances() {
 
     node.submit_transaction(pending_transaction).unwrap();
 
-    assert_eq!(node.confirmed_balance(&sender), Some(Amount(67)));
+    assert_eq!(node.confirmed_balance(&sender), Some(Amount(113)));
     assert_eq!(node.confirmed_balance(&receiver), Some(Amount(11)));
-    assert_eq!(node.available_balance(&sender), Some(Amount(67)));
-    assert_eq!(node.available_balance(&receiver), Some(Amount(10)));
+    assert_eq!(node.available_balance(&sender), Some(Amount(113)));
+    assert_eq!(node.available_balance(&receiver), Some(Amount(1)));
     assert_eq!(
         node.account_view(&receiver),
         Some(crate::runtime::node::AccountView {
-            balance: Amount(10),
-            unspendable: Amount(1),
+            balance: Amount(1),
+            unspendable: Amount(10),
             nonce: Nonce(0),
         })
     );
 
     let sender_pending = node.pending_balance(&sender);
     assert_eq!(sender_pending.incoming, Amount(0));
-    assert_eq!(sender_pending.outgoing, Amount(7));
+    assert_eq!(sender_pending.outgoing, Amount(21));
 
     let receiver_pending = node.pending_balance(&receiver);
     assert_eq!(receiver_pending.incoming, Amount(5));
@@ -380,7 +378,7 @@ fn reports_confirmed_available_and_pending_balances() {
     assert_eq!(
         node.account_view(&sender),
         Some(crate::runtime::node::AccountView {
-            balance: Amount(67),
+            balance: Amount(113),
             unspendable: Amount(0),
             nonce: Nonce(11),
         })
@@ -402,17 +400,14 @@ fn keeps_mining_rewards_unspendable_until_maturity() {
     let receiver = address(2);
     let miner = address(9);
     let mut genesis_accounts = BTreeMap::new();
-    genesis_accounts.insert(sender, Account::new(sender, Amount(1_000)));
+    genesis_accounts.insert(sender, Account::new(sender, Amount(2_500)));
     genesis_accounts.insert(receiver, Account::new(receiver, Amount(0)));
     genesis_accounts.insert(miner, Account::new(miner, Amount(0)));
 
-    let mut ledger = Ledger {
-        accounts: genesis_accounts.clone(),
-        chain: Default::default(),
-    };
+    let mut ledger = Ledger::from_accounts_and_chain(genesis_accounts.clone(), Default::default());
     ledger.chain.insert_block(genesis).unwrap();
 
-    for height in 1..=100 {
+    for height in 1..=120 {
         let transaction = signed_transaction_from_keypair(&keypair, receiver, 1, height - 1);
         let mut block = block_with_transactions(
             height,
@@ -435,29 +430,30 @@ fn keeps_mining_rewards_unspendable_until_maturity() {
     );
 
     let miner_view = node.account_view(&miner).unwrap();
-    let matured_at_100 = 100_u64.saturating_sub(BLOCK_REWARD_MATURITY as u64);
-    let matured_rewards_at_100 = (1..=matured_at_100)
+    let matured_at_120 = 120_u64.saturating_sub(BLOCK_REWARD_MATURITY as u64);
+    let matured_rewards_at_120 = (1..=matured_at_120)
         .map(|height| paqus::consensus::block_reward(Height(height)).0)
-        .sum::<u32>();
+        .sum::<u64>();
+    let matured_fees_at_120 = 120_u64.saturating_sub(CONFIRMATION_DEPTH as u64) * BASE_FEE;
     assert_eq!(
         miner_view.balance,
-        Amount(matured_rewards_at_100 + 100 * BASE_FEE)
+        Amount(matured_rewards_at_120 + matured_fees_at_120)
     );
     assert!(miner_view.unspendable.0 > 0);
 
-    let transaction = signed_transaction_from_keypair(&keypair, receiver, 1, 100);
+    let transaction = signed_transaction_from_keypair(&keypair, receiver, 1, 120);
     let mut block =
-        block_with_transactions(101, node.tip_hash().unwrap(), 1, 101, vec![transaction]);
+        block_with_transactions(121, node.tip_hash().unwrap(), 1, 121, vec![transaction]);
     block.set_state_root(node.ledger.state_root_after_block(&block).unwrap());
     node.apply_block(block).unwrap();
 
     assert_eq!(
         node.account_view(&miner).unwrap().balance,
         Amount(
-            (1..=101_u64.saturating_sub(BLOCK_REWARD_MATURITY as u64))
+            (1..=121_u64.saturating_sub(BLOCK_REWARD_MATURITY as u64))
                 .map(|height| paqus::consensus::block_reward(Height(height)).0)
-                .sum::<u32>()
-                + 101 * BASE_FEE
+                .sum::<u64>()
+                + 121_u64.saturating_sub(CONFIRMATION_DEPTH as u64) * BASE_FEE
         )
     );
 }
@@ -465,7 +461,7 @@ fn keeps_mining_rewards_unspendable_until_maturity() {
 fn tempfile_dir() -> std::path::PathBuf {
     let mut path = std::env::temp_dir();
     path.push(format!(
-        "paquscore-node-test-{}",
+        "full-node-test-{}",
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()

@@ -1,4 +1,7 @@
-use crate::paquscore::{CURRENT_CHAIN_PARAMS, PeerInfo};
+//! Gateway discovery adapter.
+
+use crate::runtime::network::PeerInfo;
+use paqus::genesis::CURRENT_CHAIN_PARAMS;
 use serde::{Deserialize, Serialize};
 use std::io::{ErrorKind, Read, Write};
 use std::net::{SocketAddr, TcpStream};

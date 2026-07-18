@@ -8,6 +8,7 @@ use paqus::crypto::{
 use paqus::ledger::{Ledger, LedgerError};
 use paqus::state::StateError;
 use paqus::transaction::{SignedTransaction, Transaction, TransactionError};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 fn address(byte: u8) -> Address {
     Address([byte; 20])
@@ -72,7 +73,7 @@ fn signed_transaction_from_with_fee(
     SignedTransaction::new(payload, public_key, signature)
 }
 
-fn ledger_with_accounts(from: Address, to: Address, balance: u32) -> Ledger {
+fn ledger_with_accounts(from: Address, to: Address, balance: u64) -> Ledger {
     let mut ledger = Ledger::new();
     ledger.create_account(from, Amount(balance)).unwrap();
     ledger.create_account(to, Amount(0)).unwrap();
@@ -248,26 +249,27 @@ fn prunes_expired_transactions() {
 #[test]
 fn prunes_low_fee_transactions_after_low_fee_expiry() {
     let keypair = generate_keypair();
+    let now = current_unix_timestamp();
     let low_fee = signed_transaction_from_with_fee(
         &keypair.secret_key,
         keypair.public_key,
         address(2),
         10,
-        1,
+        BASE_FEE,
         0,
     );
     let low_fee_hash = low_fee.hash();
     let mut mempool = Mempool::with_config(MempoolConfig {
         min_relay_fee: 1,
-        market_fee: 5,
+        market_fee: 20,
         low_fee_ttl_secs: LOW_FEE_EXPIRY_SECS,
         transaction_ttl_secs: MEMPOOL_EXPIRY_SECS,
         ..MempoolConfig::default()
     });
 
-    mempool.insert_at(low_fee, 1_000).unwrap();
+    mempool.insert_at(low_fee, now).unwrap();
 
-    assert_eq!(mempool.prune_expired(1_000 + LOW_FEE_EXPIRY_SECS + 1), 1);
+    assert_eq!(mempool.prune_expired(now + LOW_FEE_EXPIRY_SECS + 1), 1);
     assert!(!mempool.contains(&low_fee_hash));
 }
 
@@ -276,7 +278,7 @@ fn keeps_market_fee_transactions_until_full_mempool_expiry() {
     let transaction = signed_transaction_at(0, 1_000);
     let hash = transaction.hash();
     let mut mempool = Mempool::with_config(MempoolConfig {
-        market_fee: BASE_FEE,
+        market_fee: 2,
         low_fee_ttl_secs: LOW_FEE_EXPIRY_SECS,
         transaction_ttl_secs: MEMPOOL_EXPIRY_SECS,
         ..MempoolConfig::default()
@@ -322,9 +324,7 @@ fn rejects_transaction_with_expired_timestamp() {
             transaction,
             1_000 + crate::runtime::params::MAX_RELAY_TRANSACTION_AGE_SECS + 1
         ),
-        Err(MempoolError::InvalidTransaction(
-            TransactionError::Expired
-        ))
+        Err(MempoolError::InvalidTransaction(TransactionError::Expired))
     );
 }
 
@@ -363,7 +363,7 @@ fn inserts_transaction_validated_against_ledger_state() {
     let keypair = generate_keypair();
     let from = address_from_public_key(&keypair.public_key);
     let to = address(2);
-    let ledger = ledger_with_accounts(from, to, 25);
+    let ledger = ledger_with_accounts(from, to, 100);
     let transaction = signed_transaction_from(&keypair.secret_key, keypair.public_key, to, 10, 0);
     let hash = transaction.hash();
     let mut mempool = Mempool::new();
@@ -393,7 +393,7 @@ fn rejects_transaction_with_invalid_ledger_nonce() {
     let keypair = generate_keypair();
     let from = address_from_public_key(&keypair.public_key);
     let to = address(2);
-    let ledger = ledger_with_accounts(from, to, 25);
+    let ledger = ledger_with_accounts(from, to, 100);
     let transaction = signed_transaction_from(&keypair.secret_key, keypair.public_key, to, 10, 1);
     let mut mempool = Mempool::new();
 
@@ -410,7 +410,7 @@ fn accounts_for_pending_transactions_when_validating_ledger_state() {
     let keypair = generate_keypair();
     let from = address_from_public_key(&keypair.public_key);
     let to = address(2);
-    let ledger = ledger_with_accounts(from, to, 25);
+    let ledger = ledger_with_accounts(from, to, 60);
     let first = signed_transaction_from(&keypair.secret_key, keypair.public_key, to, 10, 0);
     let second = signed_transaction_from(&keypair.secret_key, keypair.public_key, to, 10, 1);
     let too_expensive = signed_transaction_from(&keypair.secret_key, keypair.public_key, to, 10, 2);
@@ -455,12 +455,15 @@ fn selects_transactions_by_fee_without_breaking_sender_nonce_order() {
     let second_sender = address_from_public_key(&second_keypair.public_key);
     let receiver = address(2);
     let mut mempool = Mempool::new();
+    let slow_fee = BASE_FEE;
+    let fast_fee = BASE_FEE * 2;
+    let aggressive_fee = BASE_FEE * 3;
     let first_slow = signed_transaction_from_with_fee(
         &first_keypair.secret_key,
         first_keypair.public_key,
         receiver,
         10,
-        crate::runtime::params::SLOW_FEE,
+        slow_fee,
         0,
     );
     let first_aggressive = signed_transaction_from_with_fee(
@@ -468,7 +471,7 @@ fn selects_transactions_by_fee_without_breaking_sender_nonce_order() {
         first_keypair.public_key,
         receiver,
         10,
-        crate::runtime::params::AGGRESSIVE_FEE,
+        aggressive_fee,
         1,
     );
     let second_fast = signed_transaction_from_with_fee(
@@ -476,7 +479,7 @@ fn selects_transactions_by_fee_without_breaking_sender_nonce_order() {
         second_keypair.public_key,
         receiver,
         10,
-        crate::runtime::params::FAST_FEE,
+        fast_fee,
         0,
     );
 
@@ -487,18 +490,19 @@ fn selects_transactions_by_fee_without_breaking_sender_nonce_order() {
     let selected = mempool.select_for_block(3);
 
     assert_eq!(selected[0].transaction.from, second_sender);
-    assert_eq!(
-        selected[0].transaction.fee,
-        Amount(crate::runtime::params::FAST_FEE)
-    );
+    assert_eq!(selected[0].transaction.fee, Amount(fast_fee));
     assert_eq!(selected[1].transaction.from, first_sender);
     assert_eq!(selected[1].transaction.nonce, Nonce(0));
     assert_eq!(selected[2].transaction.from, first_sender);
     assert_eq!(selected[2].transaction.nonce, Nonce(1));
-    assert_eq!(
-        selected[2].transaction.fee,
-        Amount(crate::runtime::params::AGGRESSIVE_FEE)
-    );
+    assert_eq!(selected[2].transaction.fee, Amount(aggressive_fee));
+}
+
+fn current_unix_timestamp() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_secs())
+        .unwrap_or(0)
 }
 
 #[test]
@@ -534,7 +538,7 @@ fn creates_candidate_block_from_mempool_transactions() {
     let from = address_from_public_key(&keypair.public_key);
     let to = address(2);
     let miner = address(9);
-    let mut ledger = ledger_with_accounts(from, to, 25);
+    let mut ledger = ledger_with_accounts(from, to, 100);
     ledger.create_account(miner, Amount(0)).unwrap();
     ledger
         .apply_block(Block::new(

@@ -1,4 +1,6 @@
-use crate::paquscore::{NetworkEnvelope, NetworkMessage};
+//! libp2p swarm adapter.
+
+use crate::runtime::network::{NetworkEnvelope, NetworkMessage};
 use libp2p::{
     Multiaddr, PeerId, StreamProtocol, Swarm, SwarmBuilder, gossipsub, identify, identity, ping,
     request_response, swarm::NetworkBehaviour,
@@ -69,6 +71,7 @@ pub struct PaqusBehaviour {
 }
 
 #[allow(dead_code)]
+#[allow(clippy::large_enum_variant)] // Variant sizes are fixed by libp2p event types.
 #[derive(Debug)]
 pub enum PaqusBehaviourEvent {
     Gossipsub(gossipsub::Event),

@@ -27,7 +27,7 @@ impl CoreCache {
     pub fn from_ledger(ledger: &Ledger) -> Self {
         let mut cache = Self::new();
 
-        for account in ledger.accounts.values() {
+        for account in ledger.accounts().values() {
             cache.insert_account(account.clone());
         }
 
@@ -72,7 +72,13 @@ impl CoreCache {
         &mut self,
         transaction: &SignedTransaction,
     ) -> Result<(), TransactionError> {
-        self.validate_signed_transaction_for_height(transaction, Height(0))
+        transaction.validate()?;
+        if self.address_for_public_key(&transaction.witness.public_key)?
+            != transaction.transaction.from
+        {
+            return Err(TransactionError::SenderAddressMismatch);
+        }
+        self.verify_transaction_signature(transaction)
     }
 
     pub fn validate_signed_transaction_for_height(
@@ -96,7 +102,13 @@ impl CoreCache {
         transaction: &SignedTransaction,
         now: u64,
     ) -> Result<(), TransactionError> {
-        self.validate_signed_transaction_at_height(transaction, now, Height(0))
+        transaction.validate_at(now)?;
+        if self.address_for_public_key(&transaction.witness.public_key)?
+            != transaction.transaction.from
+        {
+            return Err(TransactionError::SenderAddressMismatch);
+        }
+        self.verify_transaction_signature(transaction)
     }
 
     pub fn validate_signed_transaction_at_height(

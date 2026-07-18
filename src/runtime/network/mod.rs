@@ -11,3 +11,6 @@ pub use message::{
 };
 pub use peer::Peer;
 pub use transport::{read_message, write_message};
+
+#[cfg(test)]
+mod test;

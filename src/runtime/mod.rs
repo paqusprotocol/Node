@@ -12,8 +12,8 @@ pub mod params {
     pub use paqus::block::MAX_BLOCK_TXS;
     pub use paqus::consensus::supply::{BLOCK_REWARD, DECIMALS, TAIL_EMISSION, XPQ};
     pub use paqus::consensus::{
-        BLOCK_TIME, DIFFICULTY_ADJUSTMENT_INTERVAL, DIFFICULTY_START, MAX_FUTURE_TIME,
-        MIN_DIFFICULTY,
+        ASERT_HALF_LIFE, BLOCK_TIME, DIFFICULTY_ADJUSTMENT_INTERVAL, DIFFICULTY_START,
+        MAX_FUTURE_TIME, MIN_DIFFICULTY,
     };
     pub use paqus::crypto::{ADDRESS_SIZE, HASH_SIZE};
     pub use paqus::genesis::CURRENT_CHAIN_PARAMS;
@@ -30,6 +30,7 @@ pub mod params {
     const MINUTE: u64 = 60;
     const DAY: u64 = 24 * 60 * MINUTE;
 
+    // Initial storage schema for the SHA3-512 chain with per-block ASERT difficulty.
     pub const STORAGE_VERSION: u8 = 1;
     pub const MAX_RELAY_TRANSACTION_AGE_SECS: u64 = DAY;
     pub const MAX_RELAY_TRANSACTION_FUTURE_SECS: u64 = BLOCK_TIME as u64;

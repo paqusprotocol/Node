@@ -11,6 +11,8 @@ pub enum MempoolError {
     ReplacementFeeTooLow,
     InvalidTransaction(TransactionError),
     InvalidLedgerState(LedgerError),
+    CashCoinReserved,
+    UnsupportedFamily,
 }
 
 impl fmt::Display for MempoolError {
@@ -28,6 +30,12 @@ impl fmt::Display for MempoolError {
             MempoolError::InvalidLedgerState(error) => {
                 write!(f, "transaction does not fit ledger state: {error}")
             }
+            MempoolError::CashCoinReserved => {
+                f.write_str("cash coin is already reserved by another mempool transaction")
+            }
+            MempoolError::UnsupportedFamily => {
+                f.write_str("transaction family is not supported by this mempool lane")
+            }
         }
     }
 }
@@ -41,6 +49,8 @@ impl Error for MempoolError {
             MempoolError::ReplacementFeeTooLow => None,
             MempoolError::InvalidTransaction(error) => Some(error),
             MempoolError::InvalidLedgerState(error) => Some(error),
+            MempoolError::CashCoinReserved => None,
+            MempoolError::UnsupportedFamily => None,
         }
     }
 }

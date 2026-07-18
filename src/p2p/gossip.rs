@@ -1,6 +1,8 @@
-use crate::p2p::{PeerConnection, PeerState};
-use crate::paquscore::{BlockHash, NetworkMessage, TransactionHash};
+use super::{PeerConnection, PeerState};
+use crate::runtime::network::NetworkMessage;
+#[cfg(test)]
 use paqus::crypto::HASH_SIZE;
+use paqus::crypto::{BlockHash, TransactionHash};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
@@ -106,18 +108,19 @@ pub fn broadcast_to_peers(
                     continue;
                 }
             };
-            let connect_result = if !connections.contains_key(&peer) {
-                match PeerConnection::connect(peer) {
-                    Ok(connection) => {
-                        println!("p2p outbound:: |peer::{peer}|event::connected|");
-                        connections.insert(peer, connection);
-                        Ok(())
+            let connect_result =
+                if let std::collections::hash_map::Entry::Vacant(e) = connections.entry(peer) {
+                    match PeerConnection::connect(peer) {
+                        Ok(connection) => {
+                            println!("p2p outbound:: |peer::{peer}|event::connected|");
+                            e.insert(connection);
+                            Ok(())
+                        }
+                        Err(error) => Err(error),
                     }
-                    Err(error) => Err(error),
-                }
-            } else {
-                Ok(())
-            };
+                } else {
+                    Ok(())
+                };
             connect_result.and_then(|()| {
                 connections
                     .get_mut(&peer)

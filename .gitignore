@@ -1,6 +1,9 @@
 /target/
 /data/
+/paqus/
 wallet.json
 receiver.json
 *.wallet.json
 *.log
+paqus.cdx.json
+*.cdx.json

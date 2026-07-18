@@ -3,7 +3,7 @@ use crate::runtime::params::{CURRENT_CHAIN_PARAMS, MAX_NETWORK_MESSAGE_SIZE};
 use borsh::{BorshDeserialize, BorshSerialize};
 use paqus::block::{Block, BlockHeader, BlockHeight};
 use paqus::crypto::{BlockHash, TransactionHash};
-use paqus::transaction::SignedTransaction;
+use paqus::transaction::SignedProtocolTransaction;
 
 #[derive(BorshSerialize, BorshDeserialize, Clone, Debug, PartialEq, Eq)]
 pub struct PeerInfo {
@@ -22,6 +22,8 @@ pub struct VersionInfo {
     pub chain_id: u16,
     pub chain_name: String,
     pub protocol_stage: String,
+    pub pow_algorithm: String,
+    pub difficulty_algorithm: String,
     pub network_magic: [u8; 4],
     pub tip: Option<TipInfo>,
 }
@@ -33,6 +35,8 @@ impl VersionInfo {
             chain_id: CURRENT_CHAIN_PARAMS.chain_id,
             chain_name: CURRENT_CHAIN_PARAMS.chain_name.to_string(),
             protocol_stage: CURRENT_CHAIN_PARAMS.protocol_stage.to_string(),
+            pow_algorithm: CURRENT_CHAIN_PARAMS.pow_algorithm.to_string(),
+            difficulty_algorithm: CURRENT_CHAIN_PARAMS.difficulty_algorithm.to_string(),
             network_magic: CURRENT_CHAIN_PARAMS.network_magic,
             tip,
         }
@@ -51,6 +55,11 @@ impl VersionInfo {
         if self.protocol_version != CURRENT_CHAIN_PARAMS.protocol_version {
             return Err(RejectReason::ProtocolVersionMismatch);
         }
+        if self.pow_algorithm != CURRENT_CHAIN_PARAMS.pow_algorithm
+            || self.difficulty_algorithm != CURRENT_CHAIN_PARAMS.difficulty_algorithm
+        {
+            return Err(RejectReason::ConsensusMismatch);
+        }
         Ok(())
     }
 }
@@ -60,6 +69,7 @@ pub enum RejectReason {
     ProtocolVersionMismatch,
     ChainMismatch,
     NetworkMismatch,
+    ConsensusMismatch,
     InvalidMessage,
 }
 
@@ -70,6 +80,7 @@ pub enum InventoryItem {
 }
 
 #[derive(BorshSerialize, BorshDeserialize, Clone, Debug, PartialEq, Eq)]
+#[allow(clippy::large_enum_variant)] // Boxing would alter the public message construction API.
 pub enum NetworkMessage {
     Version(VersionInfo),
     VerAck(VersionInfo),
@@ -108,8 +119,8 @@ pub enum NetworkMessage {
     BlockHeaders(Vec<BlockHeader>),
     Inventory(Vec<InventoryItem>),
     GetData(Vec<InventoryItem>),
-    Transaction(SignedTransaction),
-    Transactions(Vec<SignedTransaction>),
+    Transaction(SignedProtocolTransaction),
+    Transactions(Vec<SignedProtocolTransaction>),
     GetMempoolInventory,
     GetPeers,
     Peers(Vec<PeerInfo>),
@@ -154,6 +165,7 @@ impl NetworkEnvelope {
 }
 
 impl NetworkMessage {
+    #[allow(clippy::wrong_self_convention)] // Conversion intentionally consumes the message.
     pub fn to_envelope(self) -> NetworkEnvelope {
         NetworkEnvelope::new(self)
     }

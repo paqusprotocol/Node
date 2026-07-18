@@ -6,8 +6,8 @@ use crate::runtime::node::Node;
 use crate::runtime::params::BASE_FEE;
 use crate::runtime::params::MAX_NETWORK_MESSAGE_SIZE;
 use paqus::block::{Block, Height, Nonce};
-use paqus::consensus::{Consensus, ConsensusConfig};
 use paqus::consensus::supply::Amount;
+use paqus::consensus::{Consensus, ConsensusConfig};
 use paqus::crypto::{
     Address, BlockHash, HASH_SIZE, Hash, TransactionHash, address_from_public_key,
     generate_keypair, sign,
@@ -77,7 +77,7 @@ fn roundtrips_peer_list() {
 fn roundtrips_version_handshake_messages() {
     let version = VersionInfo::local(Some(TipInfo {
         height: Height(7),
-        hash: Hash([7; HASH_SIZE]),
+        hash: Hash([7; HASH_SIZE]).into(),
     }));
     let messages = [
         NetworkMessage::Version(version.clone()),
@@ -154,7 +154,7 @@ fn rejects_partial_framed_message() {
 
     assert!(matches!(
         read_message(&mut cursor),
-        Err(NetworkError::Serialization(_))
+        Err(NetworkError::Io(_))
     ));
 }
 
@@ -193,6 +193,16 @@ fn handler_accepts_compatible_version_and_rejects_incompatible_version() {
         handle_message(&mut node, NetworkMessage::Version(incompatible)).unwrap(),
         Some(NetworkMessage::Reject {
             reason: RejectReason::ProtocolVersionMismatch,
+            message: "incompatible peer version".to_string()
+        })
+    );
+
+    let mut incompatible_pow = VersionInfo::local(None);
+    incompatible_pow.pow_algorithm = "argon2id".to_string();
+    assert_eq!(
+        handle_message(&mut node, NetworkMessage::Version(incompatible_pow)).unwrap(),
+        Some(NetworkMessage::Reject {
+            reason: RejectReason::ConsensusMismatch,
             message: "incompatible peer version".to_string()
         })
     );
@@ -325,9 +335,9 @@ fn handler_requests_missing_inventory_data() {
             NetworkMessage::Inventory(vec![InventoryItem::Block(BlockHash([9; HASH_SIZE]))])
         )
         .unwrap(),
-        Some(NetworkMessage::GetData(vec![InventoryItem::Block(BlockHash([
-            9; 64
-        ]))]))
+        Some(NetworkMessage::GetData(vec![InventoryItem::Block(
+            BlockHash([9; HASH_SIZE])
+        )]))
     );
 }
 
@@ -337,7 +347,7 @@ fn handler_returns_mempool_inventory_and_data_by_hash() {
     let hash = transaction.hash();
     let sender = transaction.transaction.from;
     let mut ledger = Ledger::new();
-    ledger.create_account(sender, Amount(25)).unwrap();
+    ledger.create_account(sender, Amount(100)).unwrap();
     ledger.create_account(address(2), Amount(0)).unwrap();
     let mut node = Node::temporary(
         ledger,
@@ -360,7 +370,7 @@ fn handler_returns_mempool_inventory_and_data_by_hash() {
             NetworkMessage::GetData(vec![InventoryItem::Transaction(hash)])
         )
         .unwrap(),
-        Some(NetworkMessage::Transactions(vec![transaction]))
+        Some(NetworkMessage::Transactions(vec![transaction.into()]))
     );
 }
 
@@ -370,7 +380,7 @@ fn handler_submits_transaction_to_node_mempool() {
     let hash = transaction.hash();
     let sender = transaction.transaction.from;
     let mut ledger = Ledger::new();
-    ledger.create_account(sender, Amount(25)).unwrap();
+    ledger.create_account(sender, Amount(100)).unwrap();
     ledger.create_account(address(2), Amount(0)).unwrap();
     let mut node = Node::temporary(
         ledger,
@@ -381,7 +391,7 @@ fn handler_submits_transaction_to_node_mempool() {
     .unwrap();
 
     assert_eq!(
-        handle_message(&mut node, NetworkMessage::Transaction(transaction)).unwrap(),
+        handle_message(&mut node, NetworkMessage::Transaction(transaction.into())).unwrap(),
         None
     );
     assert!(node.mempool.contains(&hash));

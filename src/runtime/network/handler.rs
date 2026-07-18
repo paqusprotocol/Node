@@ -79,7 +79,9 @@ pub fn handle_message(
                 .into_iter()
                 .filter(|item| match item {
                     InventoryItem::Block(hash) => node.cache.block_by_hash(hash).is_none(),
-                    InventoryItem::Transaction(hash) => !node.mempool.contains(hash),
+                    InventoryItem::Transaction(hash) => {
+                        !node.mempool.contains(hash) && !node.extension_mempool.contains(hash)
+                    }
                 })
                 .collect::<Vec<_>>();
             if missing.is_empty() {
@@ -99,7 +101,13 @@ pub fn handle_message(
                         }
                     }
                     InventoryItem::Transaction(hash) => {
-                        if let Some(transaction) = node.mempool.get(&hash).cloned() {
+                        if let Some(transaction) = node
+                            .mempool
+                            .get(&hash)
+                            .cloned()
+                            .map(paqus::transaction::SignedProtocolTransaction::Transfer)
+                            .or_else(|| node.extension_mempool.get(&hash).cloned())
+                        {
                             transactions.push(transaction);
                         }
                     }
@@ -114,12 +122,12 @@ pub fn handle_message(
             Ok(None)
         }
         NetworkMessage::Transaction(transaction) => {
-            node.submit_transaction(transaction)?;
+            node.submit_protocol_transaction(transaction)?;
             Ok(None)
         }
         NetworkMessage::Transactions(transactions) => {
             for transaction in transactions {
-                node.submit_transaction(transaction)?;
+                node.submit_protocol_transaction(transaction)?;
             }
             Ok(None)
         }
@@ -127,6 +135,11 @@ pub fn handle_message(
             node.mempool
                 .transactions()
                 .map(|transaction| InventoryItem::Transaction(transaction.hash()))
+                .chain(
+                    node.extension_mempool
+                        .transactions()
+                        .map(|transaction| InventoryItem::Transaction(transaction.hash())),
+                )
                 .collect(),
         ))),
         NetworkMessage::GetPeers => Ok(Some(NetworkMessage::Peers(vec![]))),

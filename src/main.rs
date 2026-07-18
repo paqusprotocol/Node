@@ -1,46 +1,59 @@
 mod gateway;
-mod gossip;
-mod libp2p_node;
-mod mempool;
-mod network;
 mod p2p;
-mod paquscore;
+mod rpc;
 mod runtime;
 
 use axum::{
     Json, Router,
-    extract::{Path as AxumPath, State},
-    http::StatusCode,
-    response::IntoResponse,
+    body::Body,
+    extract::{Path as AxumPath, Query, State},
+    http::{Request, StatusCode, header},
+    middleware::{self, Next},
+    response::{
+        IntoResponse, Sse,
+        sse::{Event as SseEvent, KeepAlive},
+    },
     routing::{get, post},
 };
 use borsh::BorshDeserialize;
+use futures_util::stream;
 use gateway::{heartbeat_peer, register_peer, request_gateway_peers};
-use gossip::{BroadcastReport, broadcast_to_peers};
-use mempool::resolve_wallet_nonce;
-use network::{bind_nonblocking, configure_stream, http_get, http_post_json};
+use p2p::gossip::{BroadcastReport, broadcast_to_peers};
 use p2p::{
     PERSISTENT_PEER_TIMEOUT, PeerConnection, PeerPoll, PeerState, dedupe_peers, load_peers_file,
     poll_peer_connection, request_peers_connection, save_peers_file, sync_from_peers_parallel,
     sync_mempool_connection,
 };
-use paquscore::{
-    Address, Amount, Block, BlockHash, Consensus, GENESIS_PREMINE_ADDRESS, Hash, Height,
-    InventoryItem, NetworkMessage, Node, Nonce, PeerInfo, SecretKey, SignedTransaction,
-    Transaction, TransactionHash, Wallet, address_from_public_key, address_from_string,
-    address_to_string, derive_public_key, handle_message, read_message, write_message,
+use paqus::block::{Block, Height, Nonce};
+use paqus::codec::{block_bytes, decode_block};
+use paqus::consensus::supply::Amount;
+use paqus::consensus::{ASERT_HALF_LIFE, Consensus, DIFFICULTY_START};
+use paqus::crypto::{
+    Address, BlockHash, Hash, SecretKey, TransactionHash, WitnessTransactionHash,
+    address_from_public_key, address_from_string, address_to_string, derive_public_key,
 };
-use paquscore::{
-    BLOCK_REWARD_MATURITY, BLOCK_TIME, CHAIN_ID, CHAIN_NAME, COIN_NAME, CONFIRMATION_DEPTH,
-    DEFAULT_TRANSACTION_FEE, DIFFICULTY_ADJUSTMENT_INTERVAL, DIFFICULTY_START, FINALITY_DEPTH,
-    GENESIS_PREMINE, MAX_BLOCK_TXS, NETWORK_MAGIC, PROTOCOL_STAGE, PROTOCOL_VERSION,
-    STORAGE_VERSION,
-};
+use paqus::event::{EventId, ProtocolEvent, ProtocolEventKind};
+use paqus::genesis::{CURRENT_CHAIN_PARAMS, GENESIS_MINER_ADDRESS as GENESIS_PREMINE_ADDRESS};
+use paqus::ledger::{BLOCK_REWARD_MATURITY, CONFIRMATION_DEPTH, FINALITY_DEPTH};
+use paqus::transaction::{SignedEcashTransaction, SignedProtocolTransaction};
+use paqus::transaction::{SignedTransaction, Transaction};
+use rpc::transport::{bind_nonblocking, configure_stream, http_get, http_post_json};
+use rpc::wallet_nonce::resolve_wallet_nonce;
 use runtime::mempool::MempoolConfig;
 use runtime::miner::{MiningConfig, mine_prepared_block, prepare_candidate_block};
 use runtime::network::NetworkError;
+use runtime::network::{
+    InventoryItem, NetworkMessage, PeerInfo, handle_message, read_message, write_message,
+};
+use runtime::node::Node;
+use runtime::params::{
+    BLOCK_TIME, CHAIN_ID, CHAIN_NAME, COIN_NAME, DEFAULT_TRANSACTION_FEE, GENESIS_PREMINE,
+    MAX_BLOCK_TXS, NETWORK_MAGIC, PROTOCOL_STAGE, PROTOCOL_VERSION, STORAGE_VERSION,
+};
+use runtime::wallet::Wallet;
 use serde::{Deserialize, Serialize};
-use std::collections::{HashMap, HashSet, hash_map::Entry};
+use std::collections::{HashMap, HashSet, VecDeque, hash_map::Entry};
+use std::convert::Infallible;
 use std::env;
 use std::fs;
 use std::io;
@@ -55,12 +68,11 @@ use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const DEFAULT_NODE_DB: &str = "./data/paqus";
-const DEFAULT_LISTEN_ADDR: &str = "0.0.0.0:5555";
-const DEFAULT_RPC_ADDR: &str = "[2404:8000:1044:4d8:1202:b5ff:feb0:7020]:6666";
-const DEFAULT_BOOTSTRAP_PEER: &str = "[2404:8000:1044:4d8:1202:b5ff:feb0:7020]:5555";
+const DEFAULT_LISTEN_ADDR: &str = "[::]:5555";
+const DEFAULT_RPC_ADDR: &str = "127.0.0.1:6666";
 const DEFAULT_CONFIG_FILE: &str = "./data/paqus/node.json";
 const DEFAULT_PEERS_FILE: &str = "./data/paqus/peers.json";
-const DEFAULT_MINING_INTERVAL: Duration = Duration::from_secs(BLOCK_TIME as u64);
+const DEFAULT_MINING_INTERVAL: Duration = Duration::ZERO;
 const DEFAULT_MAX_PEERS: usize = 128;
 const DEFAULT_SHUTDOWN_FILE: &str = "./data/paqus/STOP";
 const DEFAULT_GATEWAY_HEARTBEAT: Duration = Duration::from_secs(60);
@@ -128,28 +140,15 @@ fn interactive_menu() -> Result<(), String> {
 }
 
 fn menu_create_wallet() -> Result<(), String> {
-    let path = prompt_default("Wallet file", "wallet.json")?;
-    if std::path::Path::new(&path).exists() && !prompt_yes_no("File exists. Overwrite?")? {
-        return Ok(());
-    }
-    let wallet = Wallet::generate();
-    save_wallet_file(&path, &wallet)?;
-    println!("wallet: {path}");
-    println!("address: {}", wallet.wallet_address());
-    Ok(())
+    Err(
+        "wallet creation moved to wallet-cli so secrets are encrypted; run `wallet-cli new <path>`"
+            .to_string(),
+    )
 }
 
 fn menu_import_wallet() -> Result<(), String> {
-    let secret_key = parse_secret_key(Some(&prompt("Secret key hex")?))?;
-    let wallet = Wallet::from_secret_key(secret_key);
-    let path = prompt_default("Wallet file", "wallet.json")?;
-    if std::path::Path::new(&path).exists() && !prompt_yes_no("File exists. Overwrite?")? {
-        return Ok(());
-    }
-    save_wallet_file(&path, &wallet)?;
-    println!("wallet imported: {path}");
-    println!("address: {}", wallet.wallet_address());
-    Ok(())
+    Err("wallet import moved to wallet-cli so secrets are encrypted; run `wallet-cli import <path>`"
+        .to_string())
 }
 
 fn menu_check_balance() -> Result<(), String> {
@@ -277,18 +276,6 @@ fn discover_wallets() -> Vec<(String, Wallet)> {
     wallets
 }
 
-fn save_wallet_file(path: &str, wallet: &Wallet) -> Result<(), String> {
-    let json_data = serde_json::json!({
-        "address": wallet.wallet_address(),
-        "public_key": hex::encode(wallet.public_key.0),
-        "secret_key": hex::encode(wallet.secret_key.0),
-    });
-    let json_str = serde_json::to_string_pretty(&json_data)
-        .map_err(|error| format!("failed to serialize wallet: {error}"))?;
-    fs::write(path, json_str)
-        .map_err(|error| format!("failed to write wallet file `{path}`: {error}"))
-}
-
 fn prompt(label: &str) -> Result<String, String> {
     print!("{label}: ");
     io::stdout()
@@ -310,11 +297,6 @@ fn prompt_default(label: &str, default: &str) -> Result<String, String> {
     }
 }
 
-fn prompt_yes_no(label: &str) -> Result<bool, String> {
-    let value = prompt(&format!("{label} [y/N]"))?;
-    Ok(matches!(value.to_ascii_lowercase().as_str(), "y" | "yes"))
-}
-
 fn wallet_command(args: &[String]) -> Result<(), String> {
     match args.first().map(String::as_str) {
         Some("new") => {
@@ -327,20 +309,9 @@ fn wallet_command(args: &[String]) -> Result<(), String> {
             let secret_key_hex = hex::encode(wallet.secret_key.0);
 
             if let Some(path) = output_path {
-                let json_data = serde_json::json!({
-                    "address": address_str,
-                    "public_key": public_key_hex,
-                    "secret_key": secret_key_hex,
-                });
-                let json_str = serde_json::to_string_pretty(&json_data)
-                    .map_err(|error| format!("failed to serialize wallet: {error}"))?;
-                fs::write(path, json_str)
-                    .map_err(|error| format!("failed to write wallet file `{path}`: {error}"))?;
-                println!("Wallet successfully saved to `{path}`");
-                println!("address: {address_str}");
-                if show_secret {
-                    println!("secret_key: {secret_key_hex}");
-                }
+                return Err(format!(
+                    "refusing to write plaintext wallet `{path}`; use `wallet-cli new {path}`"
+                ));
             } else {
                 println!("address: {address_str}");
                 println!("public_key: {public_key_hex}");
@@ -532,7 +503,7 @@ fn submit_wallet_transaction(
 
     if submit {
         let body = format!("{{\"tx\":\"{tx_hex}\"}}");
-        let response = http_post_json(&rpc_addr, "/tx", &body)?;
+        let response = http_post_json(rpc_addr, "/tx", &body)?;
         println!("{response}");
     } else {
         println!(
@@ -574,6 +545,7 @@ fn node_command(args: &[String]) -> Result<(), String> {
             Ok(())
         }
         Some("run") => run_node(&args[1..]),
+        Some("db") => node_db_command(&args[1..]),
         Some("config") => node_config_command(&args[1..]),
         Some("libp2p-info") => {
             print_libp2p_info()?;
@@ -583,8 +555,91 @@ fn node_command(args: &[String]) -> Result<(), String> {
             print_network_info();
             Ok(())
         }
-        _ => Err("usage: paqus node <info|libp2p-info|init|config|run> [options]".to_string()),
+        _ => Err("usage: paqus node <info|libp2p-info|init|config|run|db> [options]".to_string()),
     }
+}
+
+fn node_db_command(args: &[String]) -> Result<(), String> {
+    match args.first().map(String::as_str) {
+        Some("check") => {
+            let path = args.get(1).map(String::as_str).unwrap_or(DEFAULT_NODE_DB);
+            let node = open_node(path, Address([9; 20]))?;
+            node.storage
+                .validate_chain_integrity()
+                .map_err(|error| format!("database integrity check failed: {error}"))?;
+            println!("database integrity ok: {path}");
+            Ok(())
+        }
+        Some("backup") => {
+            let source = args.get(1).map(String::as_str).unwrap_or(DEFAULT_NODE_DB);
+            let destination = args
+                .get(2)
+                .ok_or_else(|| "usage: paqus node db backup <database> <backup>".to_string())?;
+            backup_node_database(source, destination)
+        }
+        Some("restore") => {
+            let backup = args
+                .get(1)
+                .ok_or_else(|| "usage: paqus node db restore <backup> <database>".to_string())?;
+            let destination = args
+                .get(2)
+                .ok_or_else(|| "usage: paqus node db restore <backup> <database>".to_string())?;
+            restore_node_database(backup, destination)
+        }
+        _ => Err("usage: paqus node db <check|backup|restore> [paths]".to_string()),
+    }
+}
+
+fn backup_node_database(source: &str, destination: &str) -> Result<(), String> {
+    let node = open_node(source, Address([9; 20]))?;
+    node.flush_to_storage()
+        .map_err(|error| format!("failed to flush database before backup: {error}"))?;
+    node.storage
+        .validate_chain_integrity()
+        .map_err(|error| format!("refusing to back up invalid database: {error}"))?;
+    drop(node);
+
+    let destination = std::path::Path::new(destination);
+    if destination.exists() {
+        return Err("backup destination already exists".to_string());
+    }
+    fs::create_dir_all(destination)
+        .map_err(|error| format!("failed to create backup directory: {error}"))?;
+    fs::copy(
+        std::path::Path::new(source).join("data.mdb"),
+        destination.join("data.mdb"),
+    )
+    .map_err(|error| format!("failed to copy database backup: {error}"))?;
+    println!("database backup created: {}", destination.display());
+    Ok(())
+}
+
+fn restore_node_database(backup: &str, destination: &str) -> Result<(), String> {
+    let backup_node = open_node(backup, Address([9; 20]))?;
+    backup_node
+        .storage
+        .validate_chain_integrity()
+        .map_err(|error| format!("refusing to restore invalid backup: {error}"))?;
+    drop(backup_node);
+
+    let destination = std::path::Path::new(destination);
+    if destination.exists() {
+        return Err("restore destination already exists".to_string());
+    }
+    fs::create_dir_all(destination)
+        .map_err(|error| format!("failed to create restore directory: {error}"))?;
+    fs::copy(
+        std::path::Path::new(backup).join("data.mdb"),
+        destination.join("data.mdb"),
+    )
+    .map_err(|error| format!("failed to restore database: {error}"))?;
+    let restored = open_node(destination.to_string_lossy().as_ref(), Address([9; 20]))?;
+    restored
+        .storage
+        .validate_chain_integrity()
+        .map_err(|error| format!("restored database failed integrity check: {error}"))?;
+    println!("database restored: {}", destination.display());
+    Ok(())
 }
 
 fn open_node(path: &str, miner_address: Address) -> Result<Node, String> {
@@ -675,14 +730,35 @@ impl<T> OneOrMany<T> {
 }
 
 #[derive(Debug, Deserialize)]
-struct WalletFile {
-    address: String,
-    secret_key: String,
+struct SubmitTxRequest {
+    tx: String,
 }
 
 #[derive(Debug, Deserialize)]
-struct SubmitTxRequest {
-    tx: String,
+struct MiningTemplateQuery {
+    miner: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct SubmitBlockRequest {
+    block: String,
+}
+
+#[derive(Serialize)]
+struct MiningTemplateResponse {
+    job_id: String,
+    block: String,
+    height: u64,
+    previous_hash: String,
+    difficulty: u32,
+    algorithm: &'static str,
+}
+
+#[derive(Serialize)]
+struct SubmitBlockResponse {
+    accepted: bool,
+    height: u64,
+    hash: String,
 }
 
 #[derive(Clone)]
@@ -694,6 +770,15 @@ struct RpcState {
     mining: bool,
     log_counters: Arc<LogCounters>,
     mining_stats: Arc<MiningStats>,
+    metrics: Arc<RpcMetrics>,
+    db_path: String,
+}
+
+#[derive(Default)]
+struct RpcMetrics {
+    requests_total: AtomicU64,
+    errors_total: AtomicU64,
+    latency_micros_total: AtomicU64,
 }
 
 #[derive(Default)]
@@ -706,6 +791,7 @@ struct LogCounters {
 struct MiningStats {
     last_hashrate_hps: AtomicU64,
     last_attempts: AtomicU64,
+    next_nonce: AtomicU64,
 }
 
 #[derive(Serialize)]
@@ -713,6 +799,8 @@ struct StatusResponse {
     chain: &'static str,
     stage: &'static str,
     protocol_version: u8,
+    pow_algorithm: &'static str,
+    difficulty_algorithm: &'static str,
     height: u64,
     tip_hash: String,
     peers: usize,
@@ -740,6 +828,7 @@ struct PeerResponse {
 struct SubmitTxResponse {
     accepted: bool,
     hash: String,
+    wtxid: String,
 }
 
 #[derive(Serialize)]
@@ -753,6 +842,9 @@ struct ChainResponse {
     coin: &'static str,
     stage: &'static str,
     protocol_version: u8,
+    pow_algorithm: &'static str,
+    difficulty_algorithm: &'static str,
+    asert_half_life_secs: u64,
     block_time_secs: u32,
     confirmation_depth: u32,
     finality_depth: u32,
@@ -781,15 +873,24 @@ struct ChainStatsResponse {
 }
 
 #[derive(Serialize)]
-struct TxResponse {
-    hash: String,
-    from: String,
-    to: String,
-    amount: u64,
+struct ProtocolTxResponse {
+    family: &'static str,
+    operation: &'static str,
+    txid: String,
+    wtxid: String,
+    signer: String,
+    witness_addresses: Vec<String>,
+    recipient: Option<String>,
+    amount: Option<u64>,
     fee: u64,
     nonce: u64,
-    timestamp: u64,
-    age_secs: u64,
+    valid_from: u64,
+    valid_until: u64,
+    timestamp: Option<u64>,
+    age_secs: Option<u64>,
+    stripped_size: usize,
+    witness_size: usize,
+    virtual_size: usize,
     block_height: Option<u64>,
     block_hash: Option<String>,
     status: &'static str,
@@ -811,11 +912,13 @@ struct GenesisAllocationResponse {
 
 #[derive(Serialize)]
 struct BlockResponse {
+    version: u8,
     height: u64,
     hash: String,
     short_hash: String,
     previous_hash: String,
     merkle_root: String,
+    witness_root: String,
     state_root: String,
     miner_address: String,
     difficulty: u32,
@@ -829,9 +932,12 @@ struct BlockResponse {
     nonce: u64,
     tx_count: usize,
     size: usize,
+    stripped_size: usize,
+    witness_size: usize,
+    weight: usize,
     coinbase: Option<CoinbaseResponse>,
     genesis_allocations: Vec<GenesisAllocationResponse>,
-    transactions: Vec<TxResponse>,
+    transactions: Vec<ProtocolTxResponse>,
 }
 
 #[derive(Serialize)]
@@ -850,7 +956,7 @@ struct MinedBlockResponse {
 
 struct AddressActivity {
     mined_blocks: Vec<MinedBlockResponse>,
-    transactions: Vec<TxResponse>,
+    transactions: Vec<ProtocolTxResponse>,
 }
 
 #[derive(Serialize)]
@@ -858,7 +964,7 @@ struct AddressResponse {
     address: String,
     balance: serde_json::Value,
     mined_blocks: Vec<MinedBlockResponse>,
-    transactions: Vec<TxResponse>,
+    transactions: Vec<ProtocolTxResponse>,
 }
 
 #[derive(Serialize)]
@@ -876,7 +982,46 @@ struct AccountResponse {
 #[derive(Serialize)]
 struct MempoolResponse {
     size: usize,
-    transactions: Vec<TxResponse>,
+    transactions: Vec<ProtocolTxResponse>,
+}
+
+#[derive(Serialize)]
+struct ProtocolEventResponse {
+    id: String,
+    event: ProtocolEvent,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct EventQuery {
+    offset: Option<usize>,
+    limit: Option<usize>,
+    kind: Option<String>,
+    from_height: Option<u64>,
+    to_height: Option<u64>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct EventStreamQuery {
+    from_height: Option<u64>,
+    kind: Option<String>,
+    address: Option<String>,
+}
+
+struct ProtocolEventStreamState {
+    rpc: RpcState,
+    next_height: u64,
+    kind: Option<String>,
+    address: Option<Address>,
+    pending: VecDeque<ProtocolEvent>,
+    poll_immediately: bool,
+}
+
+#[derive(Serialize)]
+struct ProtocolEventListResponse {
+    total: usize,
+    offset: usize,
+    limit: usize,
+    events: Vec<ProtocolEventResponse>,
 }
 
 impl Default for RunConfig {
@@ -891,11 +1036,7 @@ impl Default for RunConfig {
             rpc_addr: DEFAULT_RPC_ADDR
                 .parse()
                 .expect("default rpc address must be valid"),
-            peers: vec![
-                DEFAULT_BOOTSTRAP_PEER
-                    .parse()
-                    .expect("default bootstrap peer must be valid"),
-            ],
+            peers: Vec::new(),
             peers_file: Some(DEFAULT_PEERS_FILE.to_string()),
             gateway_url: None,
             public_addrs: Vec::new(),
@@ -911,7 +1052,7 @@ impl Default for RunConfig {
             miner_min_fee_rate: None,
             mine: false,
             mine_interval: DEFAULT_MINING_INTERVAL,
-            mine_attempts: 10_000,
+            mine_attempts: 100_000,
         }
     }
 }
@@ -1043,7 +1184,7 @@ impl NodeService {
                 "mining requires --wallet or --miner-secret-key so the miner identity is explicit"
                     .to_string()
             })?;
-            let public_key = derive_public_key(&secret_key);
+            let public_key = derive_public_key(secret_key);
             let derived_address = address_from_public_key(&public_key);
             if derived_address != self.config.miner_address {
                 return Err(format!(
@@ -1089,10 +1230,10 @@ impl NodeService {
                         let _ = self.save_peers();
                     }
                 }
-                if let Ok(accepted) = sync_mempool_connection(&mut connection, &self.node) {
-                    if accepted > 0 {
-                        println!("preflight mempool synced:: |peer::{peer}|txs::{accepted}|");
-                    }
+                if let Ok(accepted) = sync_mempool_connection(&mut connection, &self.node)
+                    && accepted > 0
+                {
+                    println!("preflight mempool synced:: |peer::{peer}|txs::{accepted}|");
                 }
                 Ok(poll)
             });
@@ -1102,10 +1243,10 @@ impl NodeService {
                         "preflight peer {peer} ok:: |remote_tip::{}|state::idle|",
                         remote_tip.0
                     );
-                    if let Ok(mut peers) = self.peers.lock() {
-                        if let Some(state) = peers.get_mut(&peer) {
-                            state.mark_ok(Some(remote_tip));
-                        }
+                    if let Ok(mut peers) = self.peers.lock()
+                        && let Some(state) = peers.get_mut(&peer)
+                    {
+                        state.mark_ok(Some(remote_tip));
                     }
                 }
                 Ok(PeerPoll::Synced {
@@ -1116,17 +1257,17 @@ impl NodeService {
                         "preflight peer {peer} synced:: |remote_tip::{}|blocks::{}|",
                         remote_tip.0, synced_blocks
                     );
-                    if let Ok(mut peers) = self.peers.lock() {
-                        if let Some(state) = peers.get_mut(&peer) {
-                            state.mark_synced(remote_tip, synced_blocks);
-                        }
+                    if let Ok(mut peers) = self.peers.lock()
+                        && let Some(state) = peers.get_mut(&peer)
+                    {
+                        state.mark_synced(remote_tip, synced_blocks);
                     }
                 }
                 Err(error) => {
-                    if let Ok(mut peers) = self.peers.lock() {
-                        if let Some(state) = peers.get_mut(&peer) {
-                            state.mark_failed();
-                        }
+                    if let Ok(mut peers) = self.peers.lock()
+                        && let Some(state) = peers.get_mut(&peer)
+                    {
+                        state.mark_failed();
                     }
                     eprintln!("preflight peer {peer} failed: {error}");
                 }
@@ -1143,7 +1284,7 @@ impl NodeService {
             node.tip_height().unwrap_or(Height(0)).0,
             short_hash(node.tip_hash()),
             format_difficulty(node.next_difficulty()),
-            node.mempool.len(),
+            node.mempool.len() + node.extension_mempool.len(),
             self.config.mine
         );
 
@@ -1255,7 +1396,7 @@ impl NodeService {
                 .lock()
                 .map_err(|_| "node state lock poisoned".to_string())?;
             (
-                node.mempool.len(),
+                node.mempool.len() + node.extension_mempool.len(),
                 self.config.mine,
                 node.has_pending_sync_work(),
             )
@@ -1415,6 +1556,7 @@ impl NodeService {
         }
     }
 
+    #[allow(clippy::too_many_arguments)] // Detached connection task receives its owned context.
     fn handle_p2p_stream_task(
         mut stream: TcpStream,
         peer: SocketAddr,
@@ -1526,10 +1668,10 @@ impl NodeService {
             let result = self.poll_persistent_peer(peer);
             match result {
                 Ok(PeerPoll::Idle { remote_tip }) => {
-                    if let Ok(mut peers) = self.peers.lock() {
-                        if let Some(state) = peers.get_mut(&peer) {
-                            state.mark_ok(Some(remote_tip));
-                        }
+                    if let Ok(mut peers) = self.peers.lock()
+                        && let Some(state) = peers.get_mut(&peer)
+                    {
+                        state.mark_ok(Some(remote_tip));
                     }
                     let infos = match self.peer_connections.lock() {
                         Ok(mut connections) => connections
@@ -1540,10 +1682,10 @@ impl NodeService {
                             None
                         }
                     };
-                    if let Some(infos) = infos {
-                        if self.add_peer_infos(infos) {
-                            let _ = self.save_peers();
-                        }
+                    if let Some(infos) = infos
+                        && self.add_peer_infos(infos)
+                    {
+                        let _ = self.save_peers();
                     }
                     self.sync_mempool_from_peer(peer);
                 }
@@ -1551,10 +1693,10 @@ impl NodeService {
                     remote_tip,
                     synced_blocks,
                 }) => {
-                    if let Ok(mut peers) = self.peers.lock() {
-                        if let Some(state) = peers.get_mut(&peer) {
-                            state.mark_synced(remote_tip, synced_blocks);
-                        }
+                    if let Ok(mut peers) = self.peers.lock()
+                        && let Some(state) = peers.get_mut(&peer)
+                    {
+                        state.mark_synced(remote_tip, synced_blocks);
                     }
                     let infos = match self.peer_connections.lock() {
                         Ok(mut connections) => connections
@@ -1565,22 +1707,22 @@ impl NodeService {
                             None
                         }
                     };
-                    if let Some(infos) = infos {
-                        if self.add_peer_infos(infos) {
-                            let _ = self.save_peers();
-                        }
+                    if let Some(infos) = infos
+                        && self.add_peer_infos(infos)
+                    {
+                        let _ = self.save_peers();
                     }
                     self.sync_mempool_from_peer(peer);
                 }
                 Err(error) => {
                     let mut dropped = false;
-                    if let Ok(mut peers) = self.peers.lock() {
-                        if let Some(state) = peers.get_mut(&peer) {
-                            state.mark_failed();
-                            if state.failures >= MAX_PEER_FAILURES {
-                                peers.remove(&peer);
-                                dropped = true;
-                            }
+                    if let Ok(mut peers) = self.peers.lock()
+                        && let Some(state) = peers.get_mut(&peer)
+                    {
+                        state.mark_failed();
+                        if state.failures >= MAX_PEER_FAILURES {
+                            peers.remove(&peer);
+                            dropped = true;
                         }
                     }
                     if dropped {
@@ -1904,12 +2046,12 @@ fn inbound_message_log(message: &NetworkMessage, peer: SocketAddr) -> Option<Str
             block.transactions.len()
         )),
         NetworkMessage::Transaction(transaction) => Some(format!(
-            "received tx:: |from::{}|hash::{}|amount::{}|fee::{}|nonce::{}|",
+            "received tx:: |peer::{}|family::{:?}|hash::{}|fee::{}|nonce::{}|",
             peer,
+            transaction.family(),
             short_hash(Some(transaction.hash())),
-            transaction.transaction.amount.0,
-            transaction.transaction.fee.0,
-            transaction.transaction.nonce.0
+            transaction.fee().0,
+            transaction.nonce().0
         )),
         _ => None,
     }
@@ -1988,10 +2130,12 @@ fn balance_json(node: &Node, address: &Address) -> String {
 }
 
 fn start_rpc_server(state: RpcState, addr: SocketAddr) -> Result<thread::JoinHandle<()>, String> {
+    let metrics = state.metrics.clone();
     let app = Router::new()
         .route("/", get(rpc_status))
         .route("/status", get(rpc_status))
         .route("/health", get(rpc_health))
+        .route("/metrics", get(rpc_metrics))
         .route("/chain", get(rpc_chain))
         .route("/stats", get(rpc_stats))
         .route("/chain/stats", get(rpc_stats))
@@ -2000,12 +2144,23 @@ fn start_rpc_server(state: RpcState, addr: SocketAddr) -> Result<thread::JoinHan
         .route("/blocks/latest", get(rpc_latest_blocks))
         .route("/blocks/{height}", get(rpc_block_by_height))
         .route("/blocks/hash/{hash}", get(rpc_block_by_hash))
+        .route("/blocks/{height}/events", get(rpc_block_events))
         .route("/tx/{hash}", get(rpc_tx))
+        .route("/tx/{hash}/events", get(rpc_transaction_events))
         .route("/address/{address}", get(rpc_address))
+        .route("/address/{address}/events", get(rpc_address_events))
+        .route("/events/stream", get(rpc_event_stream))
+        .route("/events/{id}", get(rpc_event))
         .route("/accounts", get(rpc_accounts))
         .route("/mempool", get(rpc_mempool))
+        .route("/ecash/mempool", get(rpc_ecash_mempool))
+        .route("/mining/template", get(rpc_mining_template))
+        .route("/mining/submit", post(rpc_submit_mined_block))
         .route("/tx", post(rpc_submit_tx))
         .route("/transaction", post(rpc_submit_tx))
+        .route("/protocol/transaction", post(rpc_submit_protocol_tx))
+        .route("/ecash/tx", post(rpc_submit_ecash_tx))
+        .layer(middleware::from_fn_with_state(metrics, track_rpc_request))
         .with_state(state);
 
     thread::Builder::new()
@@ -2035,6 +2190,78 @@ fn start_rpc_server(state: RpcState, addr: SocketAddr) -> Result<thread::JoinHan
         .map_err(|error| format!("failed to spawn rpc server: {error}"))
 }
 
+async fn track_rpc_request(
+    State(metrics): State<Arc<RpcMetrics>>,
+    request: Request<Body>,
+    next: Next,
+) -> axum::response::Response {
+    let started = Instant::now();
+    let response = next.run(request).await;
+    metrics.requests_total.fetch_add(1, Ordering::Relaxed);
+    metrics.latency_micros_total.fetch_add(
+        started.elapsed().as_micros().min(u128::from(u64::MAX)) as u64,
+        Ordering::Relaxed,
+    );
+    if response.status().is_client_error() || response.status().is_server_error() {
+        metrics.errors_total.fetch_add(1, Ordering::Relaxed);
+    }
+    response
+}
+
+async fn rpc_metrics(State(state): State<RpcState>) -> impl IntoResponse {
+    let (height, mempool_size, validation_failures, reorgs) = state
+        .node
+        .lock()
+        .map(|node| {
+            (
+                node.tip_height().unwrap_or(Height(0)).0,
+                node.mempool.len() + node.extension_mempool.len(),
+                node.block_validation_failures_total(),
+                node.reorgs_total(),
+            )
+        })
+        .unwrap_or_default();
+    let peer_count = state
+        .peer_connections
+        .lock()
+        .map(|peers| peers.len())
+        .unwrap_or_default()
+        + state
+            .inbound_connections
+            .lock()
+            .map(|peers| peers.len())
+            .unwrap_or_default();
+    let database_bytes = fs::metadata(std::path::Path::new(&state.db_path).join("data.mdb"))
+        .map(|metadata| metadata.len())
+        .unwrap_or_default();
+    let body = format!(
+        concat!(
+            "# TYPE paqus_chain_height gauge\npaqus_chain_height {height}\n",
+            "# TYPE paqus_peer_count gauge\npaqus_peer_count {peer_count}\n",
+            "# TYPE paqus_mempool_size gauge\npaqus_mempool_size {mempool_size}\n",
+            "# TYPE paqus_block_validation_failures_total counter\npaqus_block_validation_failures_total {validation_failures}\n",
+            "# TYPE paqus_reorgs_total counter\npaqus_reorgs_total {reorgs}\n",
+            "# TYPE paqus_rpc_requests_total counter\npaqus_rpc_requests_total {requests}\n",
+            "# TYPE paqus_rpc_errors_total counter\npaqus_rpc_errors_total {errors}\n",
+            "# TYPE paqus_rpc_latency_seconds summary\npaqus_rpc_latency_seconds_sum {latency_seconds:.6}\npaqus_rpc_latency_seconds_count {requests}\n",
+            "# TYPE paqus_mining_hashrate_hps gauge\npaqus_mining_hashrate_hps {hashrate}\n",
+            "# TYPE paqus_database_size_bytes gauge\npaqus_database_size_bytes {database_bytes}\n"
+        ),
+        height = height,
+        peer_count = peer_count,
+        mempool_size = mempool_size,
+        validation_failures = validation_failures,
+        reorgs = reorgs,
+        requests = state.metrics.requests_total.load(Ordering::Relaxed),
+        errors = state.metrics.errors_total.load(Ordering::Relaxed),
+        latency_seconds =
+            state.metrics.latency_micros_total.load(Ordering::Relaxed) as f64 / 1_000_000.0,
+        hashrate = state.mining_stats.last_hashrate_hps.load(Ordering::Relaxed),
+        database_bytes = database_bytes,
+    );
+    ([(header::CONTENT_TYPE, "text/plain; version=0.0.4")], body)
+}
+
 async fn rpc_status(State(state): State<RpcState>) -> impl IntoResponse {
     match (
         state.node.lock(),
@@ -2046,6 +2273,8 @@ async fn rpc_status(State(state): State<RpcState>) -> impl IntoResponse {
             chain: CHAIN_NAME,
             stage: PROTOCOL_STAGE,
             protocol_version: PROTOCOL_VERSION,
+            pow_algorithm: CURRENT_CHAIN_PARAMS.pow_algorithm,
+            difficulty_algorithm: CURRENT_CHAIN_PARAMS.difficulty_algorithm,
             height: node.tip_height().unwrap_or(Height(0)).0,
             tip_hash: format_hash(node.tip_hash()),
             peers: peers.len(),
@@ -2071,6 +2300,9 @@ async fn rpc_chain() -> impl IntoResponse {
         coin: COIN_NAME,
         stage: PROTOCOL_STAGE,
         protocol_version: PROTOCOL_VERSION,
+        pow_algorithm: CURRENT_CHAIN_PARAMS.pow_algorithm,
+        difficulty_algorithm: CURRENT_CHAIN_PARAMS.difficulty_algorithm,
+        asert_half_life_secs: ASERT_HALF_LIFE,
         block_time_secs: BLOCK_TIME,
         confirmation_depth: CONFIRMATION_DEPTH,
         finality_depth: FINALITY_DEPTH,
@@ -2188,6 +2420,311 @@ async fn rpc_block_by_hash(
     }
 }
 
+fn protocol_event_response(event: ProtocolEvent) -> ProtocolEventResponse {
+    ProtocolEventResponse {
+        id: hex::encode(event.id().0),
+        event,
+    }
+}
+
+fn protocol_event_kind_name(kind: &ProtocolEventKind) -> &'static str {
+    match kind {
+        ProtocolEventKind::Transfer { .. } => "transfer",
+        ProtocolEventKind::EcashWithdrawn { .. } => "ecash_withdrawn",
+        ProtocolEventKind::EcashDeposited { .. } => "ecash_deposited",
+        ProtocolEventKind::GenesisAllocation { .. } => "genesis_allocation",
+        ProtocolEventKind::CoinbasePaid { .. } => "coinbase_paid",
+    }
+}
+
+fn is_protocol_event_kind(kind: &str) -> bool {
+    matches!(
+        kind,
+        "transfer" | "ecash_withdrawn" | "ecash_deposited" | "genesis_allocation" | "coinbase_paid"
+    )
+}
+
+fn protocol_event_list(
+    events: Vec<ProtocolEvent>,
+    query: EventQuery,
+) -> Result<ProtocolEventListResponse, &'static str> {
+    const DEFAULT_LIMIT: usize = 100;
+    const MAX_LIMIT: usize = 500;
+
+    let offset = query.offset.unwrap_or(0);
+    let limit = query.limit.unwrap_or(DEFAULT_LIMIT);
+    if limit == 0 || limit > MAX_LIMIT {
+        return Err("event_limit_must_be_between_1_and_500");
+    }
+    if query
+        .from_height
+        .zip(query.to_height)
+        .is_some_and(|(from, to)| from > to)
+    {
+        return Err("event_height_range_is_invalid");
+    }
+    let kind = query.kind.map(|kind| kind.to_ascii_lowercase());
+    if kind
+        .as_deref()
+        .is_some_and(|kind| !is_protocol_event_kind(kind))
+    {
+        return Err("unknown_event_kind");
+    }
+
+    let filtered: Vec<_> = events
+        .into_iter()
+        .filter(|event| {
+            query
+                .from_height
+                .is_none_or(|height| event.block_height.0 >= height)
+                && query
+                    .to_height
+                    .is_none_or(|height| event.block_height.0 <= height)
+                && kind
+                    .as_deref()
+                    .is_none_or(|kind| protocol_event_kind_name(&event.kind) == kind)
+        })
+        .collect();
+    let total = filtered.len();
+    let events = filtered
+        .into_iter()
+        .skip(offset)
+        .take(limit)
+        .map(protocol_event_response)
+        .collect();
+    Ok(ProtocolEventListResponse {
+        total,
+        offset,
+        limit,
+        events,
+    })
+}
+
+fn protocol_event_involves_address(kind: &ProtocolEventKind, address: &Address) -> bool {
+    match kind {
+        ProtocolEventKind::Transfer { from, to, .. } => from == address || to == address,
+        ProtocolEventKind::EcashWithdrawn { signer, .. } => signer == address,
+        ProtocolEventKind::EcashDeposited {
+            signer, recipient, ..
+        } => signer == address || recipient == address,
+        ProtocolEventKind::GenesisAllocation { recipient, .. } => recipient == address,
+        ProtocolEventKind::CoinbasePaid { miner, .. } => miner == address,
+    }
+}
+
+fn finalized_event_height(tip: Option<Height>) -> Option<u64> {
+    tip.and_then(|height| height.0.checked_sub(u64::from(FINALITY_DEPTH)))
+}
+
+async fn rpc_event_stream(
+    State(state): State<RpcState>,
+    Query(query): Query<EventStreamQuery>,
+) -> impl IntoResponse {
+    let kind = query.kind.map(|kind| kind.to_ascii_lowercase());
+    if kind
+        .as_deref()
+        .is_some_and(|kind| !is_protocol_event_kind(kind))
+    {
+        return rpc_error(StatusCode::BAD_REQUEST, "unknown_event_kind");
+    }
+    let address = match query.address {
+        Some(address) => match parse_address_string(&address) {
+            Ok(address) => Some(address),
+            Err(error) => return rpc_error(StatusCode::BAD_REQUEST, error),
+        },
+        None => None,
+    };
+    let next_height = match query.from_height {
+        Some(height) => height,
+        None => match state.node.lock() {
+            Ok(node) => finalized_event_height(node.tip_height())
+                .map(|height| height.saturating_add(1))
+                .unwrap_or(0),
+            Err(_) => {
+                return rpc_error(StatusCode::INTERNAL_SERVER_ERROR, "state_lock_failed");
+            }
+        },
+    };
+    let stream_state = ProtocolEventStreamState {
+        rpc: state,
+        next_height,
+        kind,
+        address,
+        pending: VecDeque::new(),
+        poll_immediately: true,
+    };
+    let events = stream::unfold(stream_state, |mut state| async move {
+        loop {
+            if let Some(event) = state.pending.pop_front() {
+                let id = hex::encode(event.id().0);
+                let event_name = protocol_event_kind_name(&event.kind);
+                let data = serde_json::to_string(&protocol_event_response(event))
+                    .unwrap_or_else(|_| "{\"error\":\"event_encode_failed\"}".to_string());
+                let message = SseEvent::default().id(id).event(event_name).data(data);
+                return Some((Ok::<_, Infallible>(message), state));
+            }
+
+            if !state.poll_immediately {
+                tokio::time::sleep(Duration::from_secs(1)).await;
+            }
+            state.poll_immediately = false;
+
+            let reached_tip = {
+                let node = match state.rpc.node.lock() {
+                    Ok(node) => node,
+                    Err(_) => return None,
+                };
+                let finalized_height = finalized_event_height(node.tip_height());
+                if finalized_height.is_none_or(|height| state.next_height > height) {
+                    true
+                } else {
+                    let height = Height(state.next_height);
+                    state.next_height = state.next_height.saturating_add(1);
+                    match node.storage.load_block_by_height(height) {
+                        Ok(Some(block)) => match node.storage.load_block_events(&block.hash()) {
+                            Ok(events) => {
+                                state.pending.extend(events.into_iter().filter(|event| {
+                                    state.kind.as_deref().is_none_or(|kind| {
+                                        protocol_event_kind_name(&event.kind) == kind
+                                    }) && state.address.as_ref().is_none_or(|address| {
+                                        protocol_event_involves_address(&event.kind, address)
+                                    })
+                                }));
+                            }
+                            Err(error) => eprintln!(
+                                "failed to load protocol events at height {}: {error}",
+                                height.0
+                            ),
+                        },
+                        Ok(None) => {}
+                        Err(error) => eprintln!(
+                            "failed to load protocol event block at height {}: {error}",
+                            height.0
+                        ),
+                    }
+                    false
+                }
+            };
+
+            if !state.pending.is_empty() {
+                continue;
+            }
+            if !reached_tip {
+                state.poll_immediately = true;
+            }
+        }
+    });
+
+    Sse::new(events)
+        .keep_alive(
+            KeepAlive::new()
+                .interval(Duration::from_secs(15))
+                .text("keep-alive"),
+        )
+        .into_response()
+}
+
+async fn rpc_event(
+    State(state): State<RpcState>,
+    AxumPath(id): AxumPath<String>,
+) -> impl IntoResponse {
+    let id = match parse_hash_hex(&id) {
+        Ok(hash) => EventId(hash.0),
+        Err(error) => return rpc_error(StatusCode::BAD_REQUEST, error),
+    };
+    match state.node.lock() {
+        Ok(node) => match node.storage.load_protocol_event(&id) {
+            Ok(Some(event)) => Json(protocol_event_response(event)).into_response(),
+            Ok(None) => rpc_error(StatusCode::NOT_FOUND, "event_not_found"),
+            Err(error) => rpc_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("failed to load event: {error}"),
+            ),
+        },
+        Err(_) => rpc_error(StatusCode::INTERNAL_SERVER_ERROR, "state_lock_failed"),
+    }
+}
+
+async fn rpc_block_events(
+    State(state): State<RpcState>,
+    AxumPath(height): AxumPath<u64>,
+    Query(query): Query<EventQuery>,
+) -> impl IntoResponse {
+    match state.node.lock() {
+        Ok(node) => {
+            let block = match node.storage.load_block_by_height(Height(height)) {
+                Ok(Some(block)) => block,
+                Ok(None) => return rpc_error(StatusCode::NOT_FOUND, "block_not_found"),
+                Err(error) => {
+                    return rpc_error(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        format!("failed to load block: {error}"),
+                    );
+                }
+            };
+            match node.storage.load_block_events(&block.hash()) {
+                Ok(events) => match protocol_event_list(events, query) {
+                    Ok(response) => Json(response).into_response(),
+                    Err(error) => rpc_error(StatusCode::BAD_REQUEST, error),
+                },
+                Err(error) => rpc_error(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("failed to load block events: {error}"),
+                ),
+            }
+        }
+        Err(_) => rpc_error(StatusCode::INTERNAL_SERVER_ERROR, "state_lock_failed"),
+    }
+}
+
+async fn rpc_transaction_events(
+    State(state): State<RpcState>,
+    AxumPath(hash): AxumPath<String>,
+    Query(query): Query<EventQuery>,
+) -> impl IntoResponse {
+    let hash = match parse_hash_hex(&hash) {
+        Ok(hash) => TransactionHash::from(hash),
+        Err(error) => return rpc_error(StatusCode::BAD_REQUEST, error),
+    };
+    match state.node.lock() {
+        Ok(node) => match node.storage.load_transaction_events(&hash) {
+            Ok(events) => match protocol_event_list(events, query) {
+                Ok(response) => Json(response).into_response(),
+                Err(error) => rpc_error(StatusCode::BAD_REQUEST, error),
+            },
+            Err(error) => rpc_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("failed to load transaction events: {error}"),
+            ),
+        },
+        Err(_) => rpc_error(StatusCode::INTERNAL_SERVER_ERROR, "state_lock_failed"),
+    }
+}
+
+async fn rpc_address_events(
+    State(state): State<RpcState>,
+    AxumPath(address): AxumPath<String>,
+    Query(query): Query<EventQuery>,
+) -> impl IntoResponse {
+    let address = match parse_address_string(&address) {
+        Ok(address) => address,
+        Err(error) => return rpc_error(StatusCode::BAD_REQUEST, error),
+    };
+    match state.node.lock() {
+        Ok(node) => match node.storage.load_address_events(&address) {
+            Ok(events) => match protocol_event_list(events, query) {
+                Ok(response) => Json(response).into_response(),
+                Err(error) => rpc_error(StatusCode::BAD_REQUEST, error),
+            },
+            Err(error) => rpc_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("failed to load address events: {error}"),
+            ),
+        },
+        Err(_) => rpc_error(StatusCode::INTERNAL_SERVER_ERROR, "state_lock_failed"),
+    }
+}
+
 async fn rpc_tx(
     State(state): State<RpcState>,
     AxumPath(hash): AxumPath<String>,
@@ -2241,7 +2778,7 @@ async fn rpc_accounts(State(state): State<RpcState>) -> impl IntoResponse {
             let height = node.tip_height().unwrap_or(Height(0));
             let accounts = node
                 .ledger
-                .accounts
+                .accounts()
                 .values()
                 .map(|account| {
                     let pending = node.pending_balance(&account.address);
@@ -2269,16 +2806,82 @@ async fn rpc_mempool(State(state): State<RpcState>) -> impl IntoResponse {
             let transactions = node
                 .mempool
                 .transactions()
-                .map(|transaction| tx_response(transaction, None, None, "pending"))
+                .cloned()
+                .map(SignedProtocolTransaction::Transfer)
+                .chain(node.extension_mempool.transactions().cloned())
+                .map(|transaction| protocol_tx_response(&transaction, None, None, "pending"))
                 .collect::<Vec<_>>();
             Json(MempoolResponse {
-                size: node.mempool.len(),
+                size: node.mempool.len() + node.extension_mempool.len(),
                 transactions,
             })
             .into_response()
         }
         Err(_) => rpc_error(StatusCode::INTERNAL_SERVER_ERROR, "state_lock_failed"),
     }
+}
+
+async fn rpc_ecash_mempool(State(state): State<RpcState>) -> impl IntoResponse {
+    match state.node.lock() {
+        Ok(node) => {
+            let transactions = node
+                .extension_mempool
+                .transactions_for_family(paqus::transaction::TransactionFamily::Ecash)
+                .filter_map(|transaction| match transaction {
+                    paqus::transaction::SignedProtocolTransaction::Ecash(signed) => Some(signed),
+                    _ => None,
+                })
+                .map(|signed| {
+                    serde_json::json!({
+                        "hash": hex::encode(signed.hash().0),
+                        "signer": address_to_string(&signed.transaction.signer),
+                        "nonce": signed.transaction.nonce.0,
+                        "fee": signed.transaction.fee.0,
+                        "kind": match signed.transaction.kind {
+                            paqus::transaction::EcashTransactionKind::WithdrawCash { .. } => "withdraw",
+                            paqus::transaction::EcashTransactionKind::DepositCash { .. } => "deposit",
+                        },
+                    })
+                })
+                .collect::<Vec<_>>();
+            Json(serde_json::json!({
+                "size": transactions.len(),
+                "transactions": transactions,
+            }))
+            .into_response()
+        }
+        Err(_) => rpc_error(StatusCode::INTERNAL_SERVER_ERROR, "state_lock_failed"),
+    }
+}
+
+async fn rpc_submit_ecash_tx(
+    State(state): State<RpcState>,
+    Json(request): Json<SubmitTxRequest>,
+) -> impl IntoResponse {
+    let transaction = match signed_ecash_transaction_from_hex(&request.tx) {
+        Ok(transaction) => transaction,
+        Err(error) => return rpc_error(StatusCode::BAD_REQUEST, error),
+    };
+    let hash = transaction.hash();
+    let wtxid = transaction.wtxid();
+    match state.node.lock() {
+        Ok(mut node) => {
+            if let Err(error) = node.submit_ecash_transaction(transaction) {
+                return rpc_error(
+                    StatusCode::BAD_REQUEST,
+                    format!("failed to submit eCash transaction: {error}"),
+                );
+            }
+        }
+        Err(_) => return rpc_error(StatusCode::INTERNAL_SERVER_ERROR, "state_lock_failed"),
+    }
+    Json(serde_json::json!({
+        "accepted": true,
+        "hash": hex::encode(hash.0),
+        "wtxid": hex::encode(wtxid.0),
+        "status": "pending",
+    }))
+    .into_response()
 }
 
 async fn rpc_submit_tx(
@@ -2290,6 +2893,7 @@ async fn rpc_submit_tx(
         Err(error) => return rpc_error(StatusCode::BAD_REQUEST, error),
     };
     let hash = transaction.hash();
+    let wtxid = transaction.wtxid();
     match state.node.lock() {
         Ok(mut node) => {
             if let Err(error) = node.submit_transaction(transaction.clone()) {
@@ -2315,7 +2919,7 @@ async fn rpc_submit_tx(
         &state.peers,
         &state.peer_connections,
         &state.inbound_connections,
-        NetworkMessage::Transaction(transaction),
+        NetworkMessage::Transaction(transaction.into()),
     );
     state
         .log_counters
@@ -2324,6 +2928,149 @@ async fn rpc_submit_tx(
     Json(SubmitTxResponse {
         accepted: true,
         hash: hex::encode(hash.0),
+        wtxid: hex::encode(wtxid.0),
+    })
+    .into_response()
+}
+
+async fn rpc_mining_template(
+    State(state): State<RpcState>,
+    Query(query): Query<MiningTemplateQuery>,
+) -> impl IntoResponse {
+    let miner = match address_from_string(&query.miner) {
+        Ok(miner) => miner,
+        Err(_) => return rpc_error(StatusCode::BAD_REQUEST, "invalid_miner_address"),
+    };
+    let timestamp = match unix_timestamp() {
+        Ok(timestamp) => timestamp,
+        Err(error) => return rpc_error(StatusCode::INTERNAL_SERVER_ERROR, error),
+    };
+    let candidate = match state.node.lock() {
+        Ok(mut node) => {
+            node.mempool.prune_expired(timestamp);
+            let difficulty = match node.next_difficulty() {
+                Ok(difficulty) => difficulty,
+                Err(error) => {
+                    return rpc_error(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        format!("difficulty_unavailable: {error}"),
+                    );
+                }
+            };
+            match prepare_candidate_block(
+                &node.mempool,
+                &node.extension_mempool,
+                &node.ledger,
+                miner,
+                timestamp,
+                MAX_BLOCK_TXS,
+                node.mempool.dynamic_market_fee_rate(),
+                difficulty,
+            ) {
+                Ok(candidate) => candidate,
+                Err(error) => {
+                    return rpc_error(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        format!("template_failed: {error}"),
+                    );
+                }
+            }
+        }
+        Err(_) => return rpc_error(StatusCode::INTERNAL_SERVER_ERROR, "state_lock_failed"),
+    };
+    let job_id = hex::encode(candidate.hash().0);
+    Json(MiningTemplateResponse {
+        job_id,
+        block: hex::encode(block_bytes(&candidate)),
+        height: candidate.height().0,
+        previous_hash: hex::encode(candidate.previous_hash().0),
+        difficulty: candidate.difficulty(),
+        algorithm: CURRENT_CHAIN_PARAMS.pow_algorithm,
+    })
+    .into_response()
+}
+
+async fn rpc_submit_mined_block(
+    State(state): State<RpcState>,
+    Json(request): Json<SubmitBlockRequest>,
+) -> impl IntoResponse {
+    let bytes = match hex::decode(&request.block) {
+        Ok(bytes) => bytes,
+        Err(_) => return rpc_error(StatusCode::BAD_REQUEST, "invalid_block_hex"),
+    };
+    let block = match decode_block(&bytes) {
+        Ok(block) => block,
+        Err(error) => {
+            return rpc_error(StatusCode::BAD_REQUEST, format!("invalid_block: {error}"));
+        }
+    };
+    let height = block.height().0;
+    let hash = block.hash();
+    match state.node.lock() {
+        Ok(mut node) => {
+            if let Err(error) = node.apply_block(block.clone()) {
+                return rpc_error(StatusCode::BAD_REQUEST, format!("block_rejected: {error}"));
+            }
+            if let Err(error) = node.flush_to_storage() {
+                return rpc_error(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("block_flush_failed: {error}"),
+                );
+            }
+        }
+        Err(_) => return rpc_error(StatusCode::INTERNAL_SERVER_ERROR, "state_lock_failed"),
+    }
+    let _report = broadcast_to_peers(
+        &state.peers,
+        &state.peer_connections,
+        &state.inbound_connections,
+        NetworkMessage::Block(block),
+    );
+    Json(SubmitBlockResponse {
+        accepted: true,
+        height,
+        hash: hex::encode(hash.0),
+    })
+    .into_response()
+}
+
+async fn rpc_submit_protocol_tx(
+    State(state): State<RpcState>,
+    Json(request): Json<SubmitTxRequest>,
+) -> impl IntoResponse {
+    let transaction = match signed_protocol_transaction_from_hex(&request.tx) {
+        Ok(transaction) => transaction,
+        Err(error) => return rpc_error(StatusCode::BAD_REQUEST, error),
+    };
+    let hash = transaction.hash();
+    let wtxid = transaction.wtxid();
+    match state.node.lock() {
+        Ok(mut node) => {
+            if let Err(error) = node.submit_protocol_transaction(transaction.clone()) {
+                return rpc_error(
+                    StatusCode::BAD_REQUEST,
+                    format!("failed to submit protocol transaction: {error}"),
+                );
+            }
+            if let Err(error) = node.flush_to_storage() {
+                return rpc_error(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("failed to flush transaction: {error}"),
+                );
+            }
+        }
+        Err(_) => return rpc_error(StatusCode::INTERNAL_SERVER_ERROR, "state_lock_failed"),
+    }
+    let _report = broadcast_to_peers(
+        &state.peers,
+        &state.peer_connections,
+        &state.inbound_connections,
+        NetworkMessage::Transaction(transaction),
+    );
+    Json(SubmitTxResponse {
+        accepted: true,
+        hash: hex::encode(hash.0),
+        wtxid: hex::encode(wtxid.0),
     })
     .into_response()
 }
@@ -2353,11 +3100,13 @@ fn block_response(node: &Node, block: &Block, status: Option<&'static str>) -> B
         .flatten()
         .map(|previous_block| previous_block.timestamp());
     BlockResponse {
+        version: block.header.version,
         height,
         hash: hex::encode(block_hash.0),
         short_hash: short_hash(Some(block_hash)),
         previous_hash: hex::encode(block.previous_hash().0),
         merkle_root: hex::encode(block.header.merkle_root.0),
+        witness_root: hex::encode(block.header.witness_root.0),
         state_root: hex::encode(block.state_root().0),
         miner_address: address_to_string(&block.miner_address()),
         difficulty: block.difficulty(),
@@ -2370,14 +3119,16 @@ fn block_response(node: &Node, block: &Block, status: Option<&'static str>) -> B
         block_time_delta_secs: previous_timestamp.map(|timestamp| {
             block.timestamp().saturating_sub(timestamp) as i64 - BLOCK_TIME as i64
         }),
-        value_moved: block
-            .transactions
+        value_moved: block_protocol_transactions(block)
             .iter()
-            .map(|transaction| transaction.transaction.amount.0)
+            .filter_map(|transaction| protocol_transaction_summary(transaction).2)
             .sum(),
         nonce: block.header.nonce.0,
         tx_count: block.transaction_count(),
         size: block.serialized_size(),
+        stripped_size: block.stripped_size(),
+        witness_size: block.witness_size(),
+        weight: block.weight(),
         coinbase: block.coinbase.as_ref().map(|coinbase| CoinbaseResponse {
             to: address_to_string(&coinbase.to),
             subsidy: coinbase.subsidy.0,
@@ -2392,11 +3143,10 @@ fn block_response(node: &Node, block: &Block, status: Option<&'static str>) -> B
                 amount: allocation.amount.0,
             })
             .collect(),
-        transactions: block
-            .transactions
+        transactions: block_protocol_transactions(block)
             .iter()
             .map(|transaction| {
-                tx_response(
+                protocol_tx_response(
                     transaction,
                     Some(block.height()),
                     Some(block_hash.into()),
@@ -2407,42 +3157,150 @@ fn block_response(node: &Node, block: &Block, status: Option<&'static str>) -> B
     }
 }
 
-fn tx_response(
-    transaction: &SignedTransaction,
+fn protocol_tx_response(
+    transaction: &SignedProtocolTransaction,
     block_height: Option<Height>,
     block_hash: Option<Hash>,
     status: &'static str,
-) -> TxResponse {
-    let now = unix_timestamp().unwrap_or(transaction.transaction.timestamp);
-    TxResponse {
-        hash: hex::encode(transaction.hash().0),
-        from: address_to_string(&transaction.transaction.from),
-        to: address_to_string(&transaction.transaction.to),
-        amount: transaction.transaction.amount.0,
-        fee: transaction.transaction.fee.0,
-        nonce: transaction.transaction.nonce.0,
-        timestamp: transaction.transaction.timestamp,
-        age_secs: now.saturating_sub(transaction.transaction.timestamp),
+) -> ProtocolTxResponse {
+    let (operation, recipient, amount, timestamp) = protocol_transaction_summary(transaction);
+    let now = unix_timestamp().unwrap_or(timestamp.unwrap_or(0));
+    let validity = transaction.validity();
+    ProtocolTxResponse {
+        family: transaction_family_name(transaction.family()),
+        operation,
+        txid: hex::encode(transaction.hash().0),
+        wtxid: hex::encode(transaction.wtxid().0),
+        signer: address_to_string(&transaction.signer()),
+        witness_addresses: transaction
+            .witness_addresses()
+            .iter()
+            .map(address_to_string)
+            .collect(),
+        recipient: recipient.map(|address| address_to_string(&address)),
+        amount,
+        fee: transaction.fee().0,
+        nonce: transaction.nonce().0,
+        valid_from: validity.valid_from.0,
+        valid_until: validity.valid_until.0,
+        timestamp,
+        age_secs: timestamp.map(|timestamp| now.saturating_sub(timestamp)),
+        stripped_size: transaction.stripped_size(),
+        witness_size: transaction.witness_size(),
+        virtual_size: transaction.virtual_size(),
         block_height: block_height.map(|height| height.0),
         block_hash: block_hash.map(|hash| hex::encode(hash.0)),
         status,
     }
 }
 
-fn find_transaction(node: &Node, hash: &Hash) -> Result<Option<TxResponse>, String> {
+fn transaction_family_name(family: paqus::transaction::TransactionFamily) -> &'static str {
+    use paqus::transaction::TransactionFamily;
+    match family {
+        TransactionFamily::Transfer => "transfer",
+        TransactionFamily::Ecash => "ecash",
+    }
+}
+
+fn protocol_transaction_summary(
+    transaction: &SignedProtocolTransaction,
+) -> (&'static str, Option<Address>, Option<u64>, Option<u64>) {
+    match transaction {
+        SignedProtocolTransaction::Transfer(tx) => (
+            "transfer",
+            Some(tx.transaction.to),
+            Some(tx.transaction.amount.0),
+            Some(tx.transaction.timestamp),
+        ),
+        SignedProtocolTransaction::Ecash(tx) => match &tx.transaction.kind {
+            paqus::transaction::EcashTransactionKind::WithdrawCash { amount, .. } => (
+                "withdraw_cash",
+                None,
+                Some(amount.0),
+                Some(tx.transaction.timestamp),
+            ),
+            paqus::transaction::EcashTransactionKind::DepositCash {
+                recipient,
+                metadata,
+            } => (
+                "deposit_cash",
+                Some(*recipient),
+                metadata.amount().ok().map(|amount| amount.0),
+                Some(tx.transaction.timestamp),
+            ),
+        },
+    }
+}
+
+fn protocol_transaction_addresses(transaction: &SignedProtocolTransaction) -> Vec<Address> {
+    let mut addresses = vec![transaction.signer()];
+    if let Some(recipient) = protocol_transaction_summary(transaction).1
+        && recipient != transaction.signer()
+    {
+        addresses.push(recipient);
+    }
+    addresses
+}
+
+fn block_protocol_transactions(block: &Block) -> Vec<SignedProtocolTransaction> {
+    block
+        .transactions
+        .iter()
+        .cloned()
+        .map(SignedProtocolTransaction::Transfer)
+        .chain(
+            block
+                .ecash_transactions
+                .iter()
+                .cloned()
+                .map(SignedProtocolTransaction::Ecash),
+        )
+        .collect()
+}
+
+fn find_transaction(node: &Node, hash: &Hash) -> Result<Option<ProtocolTxResponse>, String> {
     for transaction in node.mempool.transactions() {
-        if transaction.hash() == *hash {
-            return Ok(Some(tx_response(transaction, None, None, "pending")));
+        let transaction = SignedProtocolTransaction::Transfer(transaction.clone());
+        if transaction.hash() == *hash || transaction.wtxid().0 == hash.0 {
+            return Ok(Some(protocol_tx_response(
+                &transaction,
+                None,
+                None,
+                "pending",
+            )));
+        }
+    }
+    for transaction in node.extension_mempool.transactions() {
+        if transaction.hash() == *hash || transaction.wtxid().0 == hash.0 {
+            return Ok(Some(protocol_tx_response(
+                transaction,
+                None,
+                None,
+                "pending",
+            )));
         }
     }
 
-    let hash = TransactionHash(hash.0);
+    let txid = TransactionHash(hash.0);
     if let Some((location, transaction)) = node
         .storage
-        .load_transaction(&hash)
+        .load_protocol_transaction(&txid)
         .map_err(|error| format!("failed to load indexed transaction: {error}"))?
     {
-        return Ok(Some(tx_response(
+        return Ok(Some(protocol_tx_response(
+            &transaction,
+            Some(location.block_height),
+            Some(location.block_hash.into()),
+            "confirmed",
+        )));
+    }
+    let wtxid = WitnessTransactionHash(hash.0);
+    if let Some((location, transaction)) =
+        node.storage
+            .load_protocol_transaction_by_wtxid(&wtxid)
+            .map_err(|error| format!("failed to load indexed witness transaction: {error}"))?
+    {
+        return Ok(Some(protocol_tx_response(
             &transaction,
             Some(location.block_height),
             Some(location.block_hash.into()),
@@ -2496,10 +3354,10 @@ fn address_activity(node: &Node, address: &Address) -> Result<AddressActivity, S
     for location in locations {
         if let Some((_, transaction)) = node
             .storage
-            .load_transaction(&location.tx_hash)
+            .load_protocol_transaction(&location.tx_hash)
             .map_err(|error| format!("failed to load indexed transaction: {error}"))?
         {
-            transactions.push(tx_response(
+            transactions.push(protocol_tx_response(
                 &transaction,
                 Some(location.block_height),
                 Some(location.block_hash.into()),
@@ -2509,7 +3367,17 @@ fn address_activity(node: &Node, address: &Address) -> Result<AddressActivity, S
     }
 
     for transaction in node.mempool.transactions_for_address(address) {
-        transactions.push(tx_response(transaction, None, None, "pending"));
+        transactions.push(protocol_tx_response(
+            &SignedProtocolTransaction::Transfer(transaction.clone()),
+            None,
+            None,
+            "pending",
+        ));
+    }
+    for transaction in node.extension_mempool.transactions() {
+        if protocol_transaction_addresses(transaction).contains(address) {
+            transactions.push(protocol_tx_response(transaction, None, None, "pending"));
+        }
     }
 
     mined_blocks.reverse();
@@ -2549,32 +3417,25 @@ fn chain_stats(node: &Node) -> Result<ChainStatsResponse, String> {
         }
         previous_timestamp = Some(block.timestamp());
         if let Some(coinbase) = block.coinbase.as_ref() {
-            mined_supply = mined_supply.saturating_add(coinbase.subsidy.0 as u64);
-            total_fees_collected = total_fees_collected.saturating_add(coinbase.fees.0 as u64);
-            total_coinbase_rewards =
-                total_coinbase_rewards.saturating_add(coinbase.total().0 as u64);
+            mined_supply = mined_supply.saturating_add(coinbase.subsidy.0);
+            total_fees_collected = total_fees_collected.saturating_add(coinbase.fees.0);
+            total_coinbase_rewards = total_coinbase_rewards.saturating_add(coinbase.total().0);
         }
+        total_transactions = total_transactions.saturating_add(block.transaction_count() as u64);
+        total_transaction_fees = total_transaction_fees
+            .saturating_add(block.checked_total_fees().map(|fees| fees.0).unwrap_or(0));
         for transaction in &block.transactions {
-            total_transactions = total_transactions.saturating_add(1);
             total_transfer_volume =
-                total_transfer_volume.saturating_add(transaction.transaction.amount.0 as u64);
-            total_transaction_fees =
-                total_transaction_fees.saturating_add(transaction.transaction.fee.0 as u64);
+                total_transfer_volume.saturating_add(transaction.transaction.amount.0);
         }
     }
 
-    let pending_transactions = node.mempool.len() as u64;
-    let average_transfer_amount = if total_transactions == 0 {
-        0
-    } else {
-        total_transfer_volume / total_transactions
-    };
-    let current_supply = (GENESIS_PREMINE as u64).saturating_add(mined_supply);
-    let average_block_time_secs = if block_time_samples == 0 {
-        None
-    } else {
-        Some(total_block_time_secs / block_time_samples)
-    };
+    let pending_transactions = (node.mempool.len() + node.extension_mempool.len()) as u64;
+    let average_transfer_amount = total_transfer_volume
+        .checked_div(total_transactions)
+        .unwrap_or(0);
+    let current_supply = GENESIS_PREMINE.saturating_add(mined_supply);
+    let average_block_time_secs = total_block_time_secs.checked_div(block_time_samples);
 
     Ok(ChainStatsResponse {
         chain: CHAIN_NAME,
@@ -2583,7 +3444,7 @@ fn chain_stats(node: &Node) -> Result<ChainStatsResponse, String> {
         blocks,
         average_block_time_secs,
         target_block_time_secs: BLOCK_TIME,
-        genesis_premine: GENESIS_PREMINE as u64,
+        genesis_premine: GENESIS_PREMINE,
         mined_supply,
         current_supply,
         total_coinbase_rewards,
@@ -2686,6 +3547,8 @@ fn run_node(args: &[String]) -> Result<(), String> {
         mining: service.config.mine,
         log_counters,
         mining_stats,
+        metrics: Arc::new(RpcMetrics::default()),
+        db_path: service.config.db_path.clone(),
     };
     let _rpc_handle = start_rpc_server(rpc_state, service.config.rpc_addr)?;
     service.run()
@@ -2742,13 +3605,13 @@ fn print_core_startup_info() {
         hex::encode(NETWORK_MAGIC)
     );
     println!(
-        "consensus: block_time::{}s|confirmation::{}|finality::{}|reward_maturity::{}|difficulty_start::{}|retarget_window::{}",
+        "consensus: block_time::{}s|confirmation::{}|finality::{}|reward_maturity::{}|difficulty_start::{}|asert_half_life::{}s",
         BLOCK_TIME,
         CONFIRMATION_DEPTH,
         FINALITY_DEPTH,
         BLOCK_REWARD_MATURITY,
         DIFFICULTY_START,
-        DIFFICULTY_ADJUSTMENT_INTERVAL
+        ASERT_HALF_LIFE
     );
 }
 
@@ -3068,19 +3931,9 @@ fn apply_wallet_file(config: &mut RunConfig, path: Option<&String>) -> Result<()
 }
 
 fn load_wallet(path: &str) -> Result<Wallet, String> {
-    let contents = fs::read_to_string(path)
-        .map_err(|error| format!("failed to read wallet file {path}: {error}"))?;
-    let wallet: WalletFile = serde_json::from_str(&contents)
-        .map_err(|error| format!("failed to parse wallet file {path}: {error}"))?;
-    let address_arg = Some(wallet.address);
-    let secret_key_arg = Some(wallet.secret_key);
-    let address = parse_address(address_arg.as_ref())?;
-    let secret_key = parse_secret_key(secret_key_arg.as_ref())?;
-    let wallet = Wallet::from_secret_key(secret_key);
-    if wallet.address != address {
-        return Err("wallet address does not match secret key".to_string());
-    }
-    Ok(wallet)
+    Err(format!(
+        "refusing wallet file `{path}` in full-node: legacy files contain plaintext secrets; use wallet-cli for wallet operations"
+    ))
 }
 
 fn parse_socket(value: Option<&String>, flag: &str) -> Result<SocketAddr, String> {
@@ -3102,12 +3955,12 @@ fn mine_once_unlocked(
             .map_err(|_| "node state lock poisoned".to_string())?;
         node.mempool.prune_expired(timestamp);
         let difficulty = node.next_difficulty().map_err(|error| error.to_string())?;
-        let mempool_len = node.mempool.len();
+        let mempool_len = node.mempool.len() + node.extension_mempool.len();
         let miner_min_fee_rate = config
             .miner_min_fee_rate
             .unwrap_or_else(|| node.mempool.dynamic_market_fee_rate());
         println!(
-            "pow:: |algo::argon2id|difficulty_bits::{}|target::{}|",
+            "pow:: |algo::sha3-512|difficulty_bits::{}|target::{}|",
             difficulty,
             pow_target_description(difficulty)
         );
@@ -3117,6 +3970,7 @@ fn mine_once_unlocked(
         );
         let candidate = prepare_candidate_block(
             &node.mempool,
+            &node.extension_mempool,
             &node.ledger,
             config.miner_address,
             timestamp,
@@ -3130,6 +3984,9 @@ fn mine_once_unlocked(
             node.consensus,
             MiningConfig {
                 difficulty,
+                start_nonce: mining_stats
+                    .next_nonce
+                    .fetch_add(config.mine_attempts, Ordering::Relaxed),
                 max_attempts: config.mine_attempts,
                 transaction_limit: MAX_BLOCK_TXS,
                 min_fee_rate: miner_min_fee_rate,
@@ -3144,14 +4001,10 @@ fn mine_once_unlocked(
     let elapsed = started.elapsed();
     let Some(result) = mined else {
         update_mining_stats(mining_stats, mining_config.max_attempts, elapsed);
-        let node = node_state
-            .lock()
-            .map_err(|_| "node state lock poisoned".to_string())?;
-        if node.mempool.is_empty() {
-            println!("mining waiting:: |reason::empty_mempool|");
-        } else {
-            eprintln!("mining skipped: exhausted attempts");
-        }
+        println!(
+            "mining batch:: |result::exhausted|start_nonce::{}|attempts::{}|",
+            mining_config.start_nonce, mining_config.max_attempts
+        );
         return Ok(None);
     };
     update_mining_stats(mining_stats, result.attempts, elapsed);
@@ -3228,6 +4081,18 @@ fn signed_transaction_from_hex(value: &str) -> Result<SignedTransaction, String>
     let bytes = hex::decode(value).map_err(|_| "invalid transaction hex".to_string())?;
     SignedTransaction::try_from_slice(&bytes)
         .map_err(|error| format!("invalid signed transaction bytes: {error}"))
+}
+
+fn signed_ecash_transaction_from_hex(value: &str) -> Result<SignedEcashTransaction, String> {
+    let bytes = hex::decode(value).map_err(|_| "invalid eCash transaction hex".to_string())?;
+    SignedEcashTransaction::try_from_slice(&bytes)
+        .map_err(|error| format!("invalid signed eCash transaction bytes: {error}"))
+}
+
+fn signed_protocol_transaction_from_hex(value: &str) -> Result<SignedProtocolTransaction, String> {
+    let bytes = hex::decode(value).map_err(|_| "invalid protocol transaction hex".to_string())?;
+    SignedProtocolTransaction::try_from_slice(&bytes)
+        .map_err(|error| format!("invalid signed protocol transaction bytes: {error}"))
 }
 
 fn parse_address(value: Option<&String>) -> Result<Address, String> {
@@ -3319,6 +4184,9 @@ Usage:
   paqus node libp2p-info
   paqus node config [config-path]
   paqus node init [db-path] [miner-address]
+  paqus node db check [db-path]
+  paqus node db backup <db-path> <backup-path>
+  paqus node db restore <backup-path> <db-path>
   paqus node run [db-path] [--config path] [--listen addr] [--rpc-listen addr] [--peer addr] [--peers-file path] [--gateway host:port] [--public-addr host:port] [--min-relay-fee units-per-kib] [--market-fee units-per-kib] [--miner-min-fee-rate units-per-kib] [--low-fee-expiry-secs n] [--mempool-expiry-secs n] [--wallet path] [--miner address] [--miner-secret-key key-hex] [--mine]
   paqus wallet new [wallet-path] [--show-secret]
   paqus wallet address <secret-key-hex>
@@ -3330,6 +4198,7 @@ Usage:
 RPC:
   GET  /status
   GET  /health
+  GET  /metrics
   GET  /chain
   GET  /stats
   GET  /peers
@@ -3341,7 +4210,9 @@ RPC:
   GET  /address/<address>
   GET  /accounts
   GET  /mempool
+  GET  /ecash/mempool
   POST /tx              JSON: {{\"tx\":\"signed-transaction-hex\"}}
+  POST /ecash/tx        JSON: {{\"tx\":\"signed-ecash-transaction-hex\"}}
 
 To bootstrap mining with your own account:
   1. Create a wallet: paqus wallet new wallet.json
@@ -3374,11 +4245,11 @@ fn print_network_info() {
 }
 
 fn print_libp2p_info() -> Result<(), String> {
-    let swarm = libp2p_node::build_swarm()?;
+    let swarm = p2p::libp2p::build_swarm()?;
     println!("peer_id: {}", swarm.local_peer_id());
-    println!("block_topic: {}", libp2p_node::PAQUS_BLOCK_TOPIC);
-    println!("tx_topic: {}", libp2p_node::PAQUS_TX_TOPIC);
-    println!("request_protocol: {}", libp2p_node::PAQUS_REQUEST_PROTOCOL);
+    println!("block_topic: {}", p2p::libp2p::PAQUS_BLOCK_TOPIC);
+    println!("tx_topic: {}", p2p::libp2p::PAQUS_TX_TOPIC);
+    println!("request_protocol: {}", p2p::libp2p::PAQUS_REQUEST_PROTOCOL);
     Ok(())
 }
 
@@ -3410,7 +4281,7 @@ mod tests {
     fn parse_run_config_accepts_pasted_flags_with_surrounding_spaces() {
         let config = parse_run_config(&args(&[
             "--config",
-            "/tmp/paqus-node-missing-test-config.json",
+            "/tmp/full-node-missing-test-config.json",
             "./data/paqus",
             " --listen",
             "0.0.0.0:5555",
@@ -3432,10 +4303,195 @@ mod tests {
 
         assert_eq!(config.db_path, "./data/paqus");
         assert_eq!(config.listen_addrs.len(), 2);
-        assert_eq!(config.peers.len(), 3);
+        assert_eq!(config.peers.len(), 2);
         assert_eq!(config.public_addrs.len(), 1);
         assert_eq!(config.rpc_addr, "127.0.0.1:6666".parse().unwrap());
         assert!(config.mine);
         assert_eq!(config.mine_attempts, 100000);
+    }
+
+    #[test]
+    fn run_config_defaults_to_local_rpc_without_bootstrap_peer() {
+        let config = RunConfig::default();
+
+        assert_eq!(config.rpc_addr, "127.0.0.1:6666".parse().unwrap());
+        assert!(config.peers.is_empty());
+    }
+
+    #[test]
+    fn database_backup_restore_roundtrip_and_refuse_overwrite() {
+        let root = std::env::temp_dir().join(format!(
+            "paqus-db-ops-{}-{}",
+            std::process::id(),
+            unix_timestamp().unwrap()
+        ));
+        let source = root.join("source");
+        let backup = root.join("backup");
+        let restored = root.join("restored");
+        let _ = fs::remove_dir_all(&root);
+
+        let source_node = open_node(source.to_string_lossy().as_ref(), Address([9; 20])).unwrap();
+        let expected_tip = source_node.tip_hash();
+        drop(source_node);
+        backup_node_database(
+            source.to_string_lossy().as_ref(),
+            backup.to_string_lossy().as_ref(),
+        )
+        .unwrap();
+        assert!(
+            backup_node_database(
+                source.to_string_lossy().as_ref(),
+                backup.to_string_lossy().as_ref(),
+            )
+            .is_err()
+        );
+        restore_node_database(
+            backup.to_string_lossy().as_ref(),
+            restored.to_string_lossy().as_ref(),
+        )
+        .unwrap();
+        let restored_node =
+            open_node(restored.to_string_lossy().as_ref(), Address([9; 20])).unwrap();
+        assert_eq!(restored_node.tip_hash(), expected_tip);
+        drop(restored_node);
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn protocol_event_query_filters_height_kind_and_paginates() {
+        let owner = Address([1; 20]);
+        let events = vec![
+            ProtocolEvent::new(
+                Height(3),
+                BlockHash([3; 32]),
+                None,
+                0,
+                ProtocolEventKind::CoinbasePaid {
+                    miner: owner,
+                    subsidy: Amount(1),
+                    fees: Amount(0),
+                },
+            ),
+            ProtocolEvent::new(
+                Height(4),
+                BlockHash([4; 32]),
+                None,
+                0,
+                ProtocolEventKind::EcashWithdrawn {
+                    signer: owner,
+                    amount: Amount(1),
+                },
+            ),
+            ProtocolEvent::new(
+                Height(5),
+                BlockHash([5; 32]),
+                None,
+                0,
+                ProtocolEventKind::CoinbasePaid {
+                    miner: owner,
+                    subsidy: Amount(1),
+                    fees: Amount(0),
+                },
+            ),
+        ];
+
+        let response = protocol_event_list(
+            events,
+            EventQuery {
+                offset: Some(1),
+                limit: Some(1),
+                kind: Some("coinbase_paid".to_string()),
+                from_height: Some(3),
+                to_height: Some(5),
+            },
+        )
+        .unwrap();
+
+        assert_eq!(response.total, 2);
+        assert_eq!(response.events.len(), 1);
+        assert_eq!(response.events[0].event.block_height, Height(5));
+    }
+
+    #[test]
+    fn protocol_event_query_rejects_invalid_limits_and_kinds() {
+        assert!(matches!(
+            protocol_event_list(
+                vec![],
+                EventQuery {
+                    limit: Some(0),
+                    ..EventQuery::default()
+                }
+            ),
+            Err("event_limit_must_be_between_1_and_500")
+        ));
+        assert!(matches!(
+            protocol_event_list(
+                vec![],
+                EventQuery {
+                    kind: Some("unknown".to_string()),
+                    ..EventQuery::default()
+                }
+            ),
+            Err("unknown_event_kind")
+        ));
+    }
+
+    #[test]
+    fn event_stream_waits_for_finality_depth() {
+        assert_eq!(finalized_event_height(Some(Height(1))), None);
+        assert_eq!(
+            finalized_event_height(Some(Height(u64::from(FINALITY_DEPTH)))),
+            Some(0)
+        );
+        assert_eq!(
+            finalized_event_height(Some(Height(u64::from(FINALITY_DEPTH) + 7))),
+            Some(7)
+        );
+    }
+
+    #[test]
+    fn event_stream_address_filter_covers_transfer_participants() {
+        let sender = Address([7; 20]);
+        let recipient = Address([8; 20]);
+        let unrelated = Address([9; 20]);
+        let event = ProtocolEventKind::Transfer {
+            from: sender,
+            to: recipient,
+            amount: Amount(10),
+            fee: Amount(1),
+        };
+
+        assert!(protocol_event_involves_address(&event, &sender));
+        assert!(protocol_event_involves_address(&event, &recipient));
+        assert!(!protocol_event_involves_address(&event, &unrelated));
+    }
+
+    #[test]
+    fn generic_explorer_response_exposes_txid_wtxid_and_witness_identity() {
+        let keypair = paqus::crypto::generate_keypair();
+        let signer = address_from_public_key(&keypair.public_key);
+        let payload = Transaction::new(signer, Address([2; 20]), Amount(10), Amount(2), Nonce(3));
+        let signature = paqus::crypto::sign(&keypair.secret_key, &payload.signing_bytes());
+        let transaction = SignedProtocolTransaction::Transfer(SignedTransaction::new(
+            payload,
+            keypair.public_key,
+            signature,
+        ));
+
+        let response = protocol_tx_response(&transaction, Some(Height(7)), None, "confirmed");
+        let json = serde_json::to_value(response).unwrap();
+
+        assert_eq!(json["family"], "transfer");
+        assert_eq!(json["operation"], "transfer");
+        assert_eq!(json["txid"], hex::encode(transaction.hash().0));
+        assert_eq!(json["wtxid"], hex::encode(transaction.wtxid().0));
+        assert_eq!(json["signer"], address_to_string(&signer));
+        assert_eq!(json["witness_addresses"][0], address_to_string(&signer));
+        assert_eq!(json["block_height"], 7);
+        assert!(
+            json["virtual_size"].as_u64().unwrap()
+                < json["stripped_size"].as_u64().unwrap() + json["witness_size"].as_u64().unwrap()
+        );
     }
 }

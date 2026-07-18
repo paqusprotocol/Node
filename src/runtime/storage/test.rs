@@ -5,9 +5,12 @@ use paqus::consensus::supply::Amount;
 use paqus::crypto::{
     Address, BlockHash, HASH_SIZE, Hash, address_from_public_key, generate_keypair, sign,
 };
+use paqus::event::{ProtocolEvent, ProtocolEventKind};
 use paqus::ledger::Ledger;
 use paqus::state::Account;
-use paqus::transaction::{SignedTransaction, Transaction};
+use paqus::transaction::{
+    SignedProtocolTransaction, SignedTransaction, Transaction, TransactionFamily,
+};
 
 fn address(byte: u8) -> Address {
     Address([byte; 20])
@@ -85,6 +88,7 @@ fn indexes_transactions_by_hash_and_address() {
     let storage = Storage::temporary().unwrap();
     let transaction = signed_transaction(address(2), 10, 0);
     let tx_hash = transaction.hash();
+    let wtxid = transaction.wtxid();
     let sender = transaction.transaction.from;
     let receiver = transaction.transaction.to;
     let block = Block::with_difficulty(
@@ -105,6 +109,12 @@ fn indexes_transactions_by_hash_and_address() {
     assert_eq!(location.block_hash, block_hash);
     assert_eq!(location.tx_index, 0);
     assert_eq!(loaded, transaction);
+    let (witness_location, witness_transaction) = storage
+        .load_protocol_transaction_by_wtxid(&wtxid)
+        .unwrap()
+        .unwrap();
+    assert_eq!(witness_location, location);
+    assert_eq!(witness_transaction.wtxid(), wtxid);
 
     let sent = storage.load_address_transaction_locations(&sender).unwrap();
     assert_eq!(sent.len(), 1);
@@ -117,6 +127,72 @@ fn indexes_transactions_by_hash_and_address() {
     assert_eq!(received.len(), 1);
     assert_eq!(received[0].tx_hash, tx_hash);
     assert!(!received[0].sent);
+}
+
+#[test]
+fn persists_and_indexes_protocol_events() {
+    let storage = Storage::temporary().unwrap();
+    let transaction = signed_transaction(address(2), 10, 0);
+    let sender = transaction.transaction.from;
+    let receiver = transaction.transaction.to;
+    let transaction_hash = transaction.hash();
+    let genesis = block(0, Hash([0; HASH_SIZE]));
+    let next = Block::with_difficulty(
+        Height(1),
+        genesis.hash(),
+        address(9),
+        1,
+        1_700_000_001,
+        Nonce(0),
+        vec![transaction],
+    );
+    let block_hash = next.hash();
+    let event = ProtocolEvent::new(
+        Height(1),
+        block_hash,
+        Some(transaction_hash),
+        0,
+        ProtocolEventKind::Transfer {
+            from: sender,
+            to: receiver,
+            amount: Amount(10),
+            fee: Amount(DEFAULT_TRANSACTION_FEE),
+        },
+    );
+    let event_id = event.id();
+    let mut ledger = Ledger::new();
+    ledger.chain.insert_block(genesis).unwrap();
+    ledger.chain.insert_block(next).unwrap();
+    ledger
+        .events_by_block
+        .insert(block_hash, vec![event.clone()]);
+
+    storage.save_ledger(&ledger).unwrap();
+
+    assert_eq!(
+        storage.load_protocol_event(&event_id).unwrap(),
+        Some(event.clone())
+    );
+    assert_eq!(
+        storage.load_block_events(&block_hash).unwrap(),
+        vec![event.clone()]
+    );
+    assert_eq!(
+        storage.load_transaction_events(&transaction_hash).unwrap(),
+        vec![event.clone()]
+    );
+    assert_eq!(
+        storage.load_address_events(&sender).unwrap(),
+        vec![event.clone()]
+    );
+    assert_eq!(
+        storage.load_address_events(&receiver).unwrap(),
+        vec![event.clone()]
+    );
+    assert_eq!(
+        storage.load_ledger().unwrap().events_for_block(&block_hash),
+        &[event]
+    );
 }
 
 #[test]
@@ -372,6 +448,30 @@ fn rejects_block_loaded_from_wrong_hash_key() {
 }
 
 #[test]
+fn rejects_stored_block_with_tampered_witness() {
+    let storage = Storage::temporary().unwrap();
+    let mut block = Block::with_difficulty(
+        Height(1),
+        Hash([0; HASH_SIZE]),
+        address(9),
+        1,
+        1_700_000_001,
+        Nonce(0),
+        vec![signed_transaction(address(2), 10, 0)],
+    );
+    block.transactions[0].witness.signature.0[0] ^= 0xff;
+
+    storage
+        .test_put_blocks_by_height(&Height(1).0.to_be_bytes(), &block)
+        .unwrap();
+
+    assert!(matches!(
+        storage.load_block_by_height(Height(1)),
+        Err(StorageError::Integrity("stored block failed validation"))
+    ));
+}
+
+#[test]
 fn stores_and_loads_accounts() {
     let storage = Storage::temporary().unwrap();
     let account = Account::trusted_with_nonce(address(1), Amount(25), Nonce(7));
@@ -392,6 +492,19 @@ fn stores_and_loads_chain_tip() {
     storage.save_tip(Height(3), &hash).unwrap();
 
     assert_eq!(storage.load_tip().unwrap(), Some((Height(3), hash)));
+}
+
+#[test]
+fn aborted_write_does_not_corrupt_committed_tip() {
+    let storage = Storage::temporary().unwrap();
+    let committed = BlockHash([7; HASH_SIZE]);
+    storage.save_tip(Height(3), &committed).unwrap();
+
+    storage
+        .test_abort_tip_write(Height(99), BlockHash([9; HASH_SIZE]))
+        .unwrap();
+
+    assert_eq!(storage.load_tip().unwrap(), Some((Height(3), committed)));
 }
 
 #[test]

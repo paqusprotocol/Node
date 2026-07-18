@@ -1,5 +1,6 @@
-use crate::network::http_get;
-use crate::paquscore::{Address, Nonce, address_to_string};
+use crate::rpc::transport::http_get;
+use paqus::block::Nonce;
+use paqus::crypto::{Address, address_to_string};
 use serde::Deserialize;
 
 #[derive(Debug, Deserialize)]
