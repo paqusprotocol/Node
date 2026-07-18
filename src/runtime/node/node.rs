@@ -6,7 +6,7 @@ use crate::runtime::params::HASH_SIZE;
 use crate::runtime::storage::Storage;
 use paqus::block::{Block, BlockHeight, Height};
 use paqus::consensus::supply::{Amount, Balance};
-use paqus::consensus::{Consensus, MIN_DIFFICULTY};
+use paqus::consensus::{Consensus, ConsensusConfig, MIN_DIFFICULTY};
 use paqus::crypto::{Address, BlockHash, Hash, TransactionHash};
 use paqus::genesis::{CURRENT_CHAIN_PARAMS, genesis_block, validate_genesis_identity};
 use paqus::ledger::fork_choice::ForkChoice;
@@ -608,14 +608,18 @@ impl Node {
             .fork_choice
             .get(&BlockHash::from(block.previous_hash().as_hash()))
             .ok_or(paqus::ledger::fork_choice::ForkChoiceError::MissingParent)?;
-        if self.consensus.config.difficulty != 0 {
+        let validation_consensus = if self.consensus.config.difficulty != 0 {
             let expected_difficulty = self.next_difficulty_after_branch_tip(parent.hash)?;
             if block.difficulty() != expected_difficulty {
                 return Err(paqus::consensus::ConsensusError::UnexpectedDifficulty.into());
             }
-        }
-        self.consensus
-            .validate_next_block_with_tip_at(block, &parent.block, now)?;
+            Consensus::new(ConsensusConfig {
+                difficulty: expected_difficulty,
+            })?
+        } else {
+            self.consensus
+        };
+        validation_consensus.validate_next_block_with_tip_at(block, &parent.block, now)?;
         Ok(())
     }
 
@@ -1000,6 +1004,21 @@ mod tests {
                 .unwrap(),
             2
         );
+
+        let mut candidate = Block::with_difficulty(
+            Height(blocks + 1),
+            previous_hash,
+            address(9),
+            2,
+            1_700_000_000,
+            Nonce(0),
+            vec![],
+        );
+        let difficulty_two = Consensus::new(ConsensusConfig { difficulty: 2 }).unwrap();
+        while difficulty_two.validate_proof_of_work(&candidate).is_err() {
+            candidate.header.nonce = Nonce(candidate.header.nonce.0 + 1);
+        }
+        node.validate_block_for_known_parent(&candidate).unwrap();
     }
 
     #[test]

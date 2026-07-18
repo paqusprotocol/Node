@@ -1,6 +1,6 @@
 [package]
 name = "full-node"
-version = "0.2.1"
+version = "0.2.2"
 edition = "2024"
 license = "MIT"
 
@@ -17,4 +17,4 @@ lmdb = { package = "lmdb-rkv", version = "0.14" }
 tokio = { version = "1", features = ["full"] }
 tracing = "0.1"
 tracing-subscriber = "0.3"
-paqus = { version = "=0.2.5", path = "../core" }
+paqus = "=0.2.5"
