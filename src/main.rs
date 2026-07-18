@@ -1180,17 +1180,15 @@ impl NodeService {
         }
 
         if self.config.mine {
-            let secret_key = self.config.miner_secret_key.as_ref().ok_or_else(|| {
-                "mining requires --wallet or --miner-secret-key so the miner identity is explicit"
-                    .to_string()
-            })?;
-            let public_key = derive_public_key(secret_key);
-            let derived_address = address_from_public_key(&public_key);
-            if derived_address != self.config.miner_address {
-                return Err(format!(
-                    "miner secret key does not match miner address {}",
-                    address_to_string(&self.config.miner_address)
-                ));
+            if let Some(secret_key) = self.config.miner_secret_key.as_ref() {
+                let public_key = derive_public_key(secret_key);
+                let derived_address = address_from_public_key(&public_key);
+                if derived_address != self.config.miner_address {
+                    return Err(format!(
+                        "miner secret key does not match miner address {}",
+                        address_to_string(&self.config.miner_address)
+                    ));
+                }
             }
         }
 
@@ -3923,11 +3921,27 @@ fn normalize_mempool_policy(config: &mut RunConfig) {
 
 fn apply_wallet_file(config: &mut RunConfig, path: Option<&String>) -> Result<(), String> {
     let path = path.ok_or_else(|| "missing value for --wallet".to_string())?;
-    let wallet = load_wallet(path)?;
-
-    config.miner_address = wallet.address;
-    config.miner_secret_key = Some(wallet.secret_key);
+    config.miner_address = load_encrypted_wallet_address(path)?;
     Ok(())
+}
+
+#[derive(Deserialize)]
+struct EncryptedMiningWalletFile {
+    version: u8,
+    address: String,
+    kdf: String,
+}
+
+fn load_encrypted_wallet_address(path: &str) -> Result<Address, String> {
+    let bytes = fs::read(path)
+        .map_err(|error| format!("failed to read mining wallet `{path}`: {error}"))?;
+    let wallet: EncryptedMiningWalletFile = serde_json::from_slice(&bytes)
+        .map_err(|error| format!("invalid encrypted mining wallet `{path}`: {error}"))?;
+    if wallet.version != 1 || wallet.kdf != "argon2id" {
+        return Err(format!("unsupported encrypted mining wallet `{path}`"));
+    }
+    address_from_string(&wallet.address)
+        .map_err(|_| format!("invalid address in mining wallet `{path}`"))
 }
 
 fn load_wallet(path: &str) -> Result<Wallet, String> {
@@ -4275,6 +4289,31 @@ mod tests {
         let encoded = hex::encode(address.0);
 
         assert_eq!(parse_address_string(&encoded), Ok(address));
+    }
+
+    #[test]
+    fn mining_reads_only_address_from_encrypted_wallet() {
+        let address = Address([0xcd; 20]);
+        let path = std::env::temp_dir().join(format!(
+            "paqus-mining-wallet-address-only-{}.json",
+            std::process::id()
+        ));
+        let contents = serde_json::json!({
+            "version": 1,
+            "address": address_to_string(&address),
+            "public_key": "not-read-by-node",
+            "kdf": "argon2id",
+            "salt": "not-read-by-node",
+            "nonce": "not-read-by-node",
+            "ciphertext": "not-read-by-node"
+        });
+        fs::write(&path, serde_json::to_vec(&contents).unwrap()).unwrap();
+
+        assert_eq!(
+            load_encrypted_wallet_address(path.to_str().unwrap()),
+            Ok(address)
+        );
+        fs::remove_file(path).unwrap();
     }
 
     #[test]

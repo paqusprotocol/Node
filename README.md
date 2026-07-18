@@ -21,7 +21,7 @@ curl http://127.0.0.1:6666/status
 Run with mining:
 
 ```bash
-cargo run -- node run ./data/paqus --miner <PX1_MINER_ADDRESS> --mine
+cargo run -- node run ./data/paqus --wallet ../wallet-cli/wallet.json --mine
 ```
 
 Stop the default node:
@@ -383,27 +383,14 @@ The template response includes `job_id`, canonical block bytes, height, parent,
 difficulty, and `sha3-512` algorithm identity. A submitted block is fully
 validated, stored, and announced to peers.
 
-Run the workspace reference miner against the node RPC:
+For normal solo mining, use the internal miner with an encrypted wallet file.
+The node reads only its public address; it does not request the PIN or decrypt
+the private key:
 
 ```bash
-cd /home/debian/PaqusBlockchain
-cargo run -p miner-cli --release -- \
-  --backend auto \
-  --miner <PX1_MINER_ADDRESS> \
-  --rpc 127.0.0.1:6666
-```
-
-It uses all available CPU threads by default. Use `--threads` and `--batch` to
-tune worker count and the nonce range scanned before refreshing a potentially
-stale job.
-
-For a machine with a vendor OpenCL runtime:
-
-```bash
-cargo run -p miner-cli --release -- \
-  --backend opencl \
-  --miner <PX1_MINER_ADDRESS> \
-  --rpc 127.0.0.1:6666
+cargo run --release -- node run ./data/paqus \
+  --wallet ../wallet-cli/wallet.json \
+  --mine
 ```
 
 Start a pool gateway in front of the node:
