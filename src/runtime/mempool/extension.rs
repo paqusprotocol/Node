@@ -4,7 +4,7 @@ use paqus::block::{Block, BlockHeight, MAX_BLOCK_SIZE, MAX_BLOCK_WEIGHT};
 use paqus::crypto::{Address, TransactionHash};
 use paqus::ledger::Ledger;
 use paqus::state::CashCoinId;
-use paqus::transaction::{EcashTransactionKind, SignedProtocolTransaction, TransactionFamily};
+use paqus::transaction::{QCashTransactionKind, SignedProtocolTransaction, TransactionFamily};
 use std::collections::{BTreeMap, BTreeSet};
 
 /// Pool for every non-transfer SegWit transaction family.
@@ -144,7 +144,7 @@ impl ExtensionMempool {
             let family = transaction.family();
             match transaction {
                 SignedProtocolTransaction::Transfer(_) => unreachable!("transfer uses main pool"),
-                SignedProtocolTransaction::Ecash(tx) => block.ecash_transactions.push(tx),
+                SignedProtocolTransaction::QCash(tx) => block.qcash_transactions.push(tx),
             }
             refresh_block_fees_and_commitments(block);
             if block.serialized_size() > MAX_BLOCK_SIZE || block.weight() > MAX_BLOCK_WEIGHT {
@@ -157,7 +157,7 @@ impl ExtensionMempool {
 
     pub fn remove_confirmed(&mut self, block: &Block) {
         let hashes = block
-            .ecash_transactions
+            .qcash_transactions
             .iter()
             .map(|tx| tx.hash())
             .collect::<BTreeSet<_>>();
@@ -186,8 +186,8 @@ fn refresh_block_fees_and_commitments(block: &mut Block) {
 fn pop_last_family_transaction(block: &mut Block, family: TransactionFamily) {
     match family {
         TransactionFamily::Transfer => unreachable!("transfer uses main pool"),
-        TransactionFamily::Ecash => {
-            block.ecash_transactions.pop();
+        TransactionFamily::QCash => {
+            block.qcash_transactions.pop();
         }
     }
 }
@@ -200,8 +200,8 @@ fn apply_extension(
     let mut staged = ledger.clone();
     match transaction {
         SignedProtocolTransaction::Transfer(_) => return Err(MempoolError::UnsupportedFamily),
-        SignedProtocolTransaction::Ecash(tx) => {
-            staged.apply_signed_ecash_transaction(tx, height)?;
+        SignedProtocolTransaction::QCash(tx) => {
+            staged.apply_signed_qcash_transaction(tx, height)?;
         }
     }
     Ok(())
@@ -209,13 +209,13 @@ fn apply_extension(
 
 fn deposit_coin_ids(transaction: &SignedProtocolTransaction) -> Vec<CashCoinId> {
     match transaction {
-        SignedProtocolTransaction::Ecash(tx) => match &tx.transaction.kind {
-            EcashTransactionKind::DepositCash { metadata, .. } => metadata
+        SignedProtocolTransaction::QCash(tx) => match &tx.transaction.kind {
+            QCashTransactionKind::DepositCash { metadata, .. } => metadata
                 .inputs
                 .iter()
                 .map(|input| CashCoinId(input.coin_id))
                 .collect(),
-            EcashTransactionKind::WithdrawCash { .. } => Vec::new(),
+            QCashTransactionKind::WithdrawCash { .. } => Vec::new(),
         },
         _ => Vec::new(),
     }
@@ -229,24 +229,24 @@ mod tests {
     use paqus::crypto::{
         Address, TransactionHash, address_from_public_key, generate_keypair, sign,
     };
-    use paqus::ecash::{
+    use paqus::qcash::{
         CashCoinFile, CashDenomination, DepositCashMetadata, WithdrawCashMetadata,
         cash_coin_commitment,
     };
-    use paqus::transaction::{EcashTransaction, SignedEcashTransaction};
+    use paqus::transaction::{QCashTransaction, SignedQCashTransaction};
 
     fn signed_deposit(
         keypair: &paqus::crypto::KeyPair,
         metadata: DepositCashMetadata,
     ) -> SignedProtocolTransaction {
         let signer = address_from_public_key(&keypair.public_key);
-        let transaction = EcashTransaction::deposit(signer, signer, Amount(0), Nonce(0), metadata);
+        let transaction = QCashTransaction::deposit(signer, signer, Amount(0), Nonce(0), metadata);
         let signature = sign(&keypair.secret_key, &transaction.signing_bytes());
-        SignedEcashTransaction::new(transaction, keypair.public_key, signature).into()
+        SignedQCashTransaction::new(transaction, keypair.public_key, signature).into()
     }
 
     #[test]
-    fn reserves_ecash_coin_across_the_unified_extension_pool() {
+    fn reserves_qcash_coin_across_the_unified_extension_pool() {
         let secret = [11; 32];
         let withdraw = WithdrawCashMetadata::with_denominations(
             Amount(XPQ),
@@ -257,10 +257,10 @@ mod tests {
         let withdraw_hash = TransactionHash([12; 32]);
         let mut ledger = Ledger::new();
         ledger
-            .offchain_coins
+            .qcash_utxos
             .apply_withdraw(Address([13; 20]), withdraw_hash, &withdraw, Height(0))
             .unwrap();
-        ledger.finalize_ecash_at(Height(100));
+        ledger.finalize_qcash_at(Height(100));
         ledger.chain.tip_height = Some(Height(0));
         let file = CashCoinFile::new(withdraw_hash, &withdraw.outputs[0], secret).unwrap();
         let first_keypair = generate_keypair();

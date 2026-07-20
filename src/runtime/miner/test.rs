@@ -67,7 +67,7 @@ fn mines_candidate_block_until_pow_is_valid() {
     let receiver = address(2);
     let miner = address(9);
     let mut ledger = Ledger::new();
-    ledger.create_account(sender, Amount(100)).unwrap();
+    ledger.create_account(sender, Amount(100_000)).unwrap();
     ledger.create_account(receiver, Amount(0)).unwrap();
     ledger.create_account(miner, Amount(0)).unwrap();
     ledger
@@ -82,11 +82,22 @@ fn mines_candidate_block_until_pow_is_valid() {
         .unwrap();
 
     let transaction = {
+        let template = Transaction::new_at(
+            sender,
+            receiver,
+            Amount(10),
+            Amount(0),
+            Nonce(0),
+            current_unix_timestamp(),
+        );
+        let template_signature = sign(&keypair.secret_key, &template.signing_bytes());
+        let virtual_size =
+            SignedTransaction::new(template, keypair.public_key, template_signature).virtual_size();
         let payload = Transaction::new_at(
             sender,
             receiver,
             Amount(10),
-            Amount(BASE_FEE),
+            Amount(BASE_FEE.saturating_mul(virtual_size as u64)),
             Nonce(0),
             current_unix_timestamp(),
         );

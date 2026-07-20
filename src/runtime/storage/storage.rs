@@ -6,9 +6,8 @@ use paqus::block::{Block, BlockHeight, Height};
 use paqus::codec::{block_bytes, decode_block};
 use paqus::crypto::{Address, BlockHash, Hash, TransactionHash, WitnessTransactionHash};
 use paqus::event::{EventId, ProtocolEvent, ProtocolEventKind};
-use paqus::ledger::{Ledger, calculate_state_root};
-use paqus::snapshot::is_snapshot_height;
-use paqus::state::{Account, OffchainCoinState};
+use paqus::ledger::Ledger;
+use paqus::state::{Account, QCashUtxoSet};
 use paqus::transaction::{SignedProtocolTransaction, SignedTransaction, TransactionFamily};
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -19,7 +18,6 @@ const BLOCKS_BY_HEIGHT: &str = "blocks_by_height";
 const BLOCKS_BY_HASH: &str = "blocks_by_hash";
 const ACCOUNTS: &str = "accounts";
 const GENESIS_ACCOUNTS: &str = "genesis_accounts";
-const STATE_SNAPSHOTS: &str = "state_snapshots";
 const TX_INDEX: &str = "tx_index";
 const WTX_INDEX: &str = "wtx_index";
 const ADDRESS_TX_INDEX: &str = "address_tx_index";
@@ -34,14 +32,6 @@ const PROTOCOL_STATE_KEY: &[u8] = b"current";
 const TIP_HEIGHT_KEY: &[u8] = b"tip_height";
 const TIP_HASH_KEY: &[u8] = b"tip_hash";
 const STORAGE_VERSION_KEY: &[u8] = b"storage_version";
-
-#[derive(BorshSerialize, BorshDeserialize, Clone, Debug, PartialEq, Eq)]
-pub struct StateSnapshot {
-    pub height: BlockHeight,
-    pub block_hash: BlockHash,
-    pub state_root: Hash,
-    pub accounts: BTreeMap<Address, Account>,
-}
 
 #[derive(BorshSerialize, BorshDeserialize, Clone, Copy, Debug, PartialEq, Eq)]
 pub struct TransactionLocation {
@@ -69,34 +59,21 @@ pub struct MinerBlockLocation {
 
 #[derive(BorshSerialize, BorshDeserialize, Clone, Debug, PartialEq, Eq)]
 struct StoredProtocolState {
-    offchain_coins: OffchainCoinState,
+    qcash_utxos: QCashUtxoSet,
     events_by_block: BTreeMap<BlockHash, Vec<ProtocolEvent>>,
 }
 
 impl StoredProtocolState {
     fn from_ledger(ledger: &Ledger) -> Self {
         Self {
-            offchain_coins: ledger.offchain_coins.clone(),
+            qcash_utxos: ledger.qcash_utxos.clone(),
             events_by_block: ledger.events_by_block.clone(),
         }
     }
 
     fn restore(self, ledger: &mut Ledger) {
-        ledger.offchain_coins = self.offchain_coins;
+        ledger.qcash_utxos = self.qcash_utxos;
         ledger.events_by_block = self.events_by_block;
-    }
-}
-
-impl StateSnapshot {
-    pub fn verify_state_root(&self) -> bool {
-        calculate_state_root(&self.accounts) == self.state_root
-    }
-
-    pub fn verify_against_block(&self, block: &Block) -> bool {
-        block.height() == self.height
-            && block.hash() == self.block_hash
-            && block.state_root() == self.state_root
-            && self.verify_state_root()
     }
 }
 
@@ -107,7 +84,6 @@ pub struct Storage {
     blocks_by_hash: Database,
     accounts: Database,
     genesis_accounts: Database,
-    state_snapshots: Database,
     tx_index: Database,
     wtx_index: Database,
     address_tx_index: Database,
@@ -152,7 +128,6 @@ impl Storage {
             blocks_by_hash: env.create_db(Some(BLOCKS_BY_HASH), DatabaseFlags::empty())?,
             accounts: env.create_db(Some(ACCOUNTS), DatabaseFlags::empty())?,
             genesis_accounts: env.create_db(Some(GENESIS_ACCOUNTS), DatabaseFlags::empty())?,
-            state_snapshots: env.create_db(Some(STATE_SNAPSHOTS), DatabaseFlags::empty())?,
             tx_index: env.create_db(Some(TX_INDEX), DatabaseFlags::empty())?,
             wtx_index: env.create_db(Some(WTX_INDEX), DatabaseFlags::empty())?,
             address_tx_index: env.create_db(Some(ADDRESS_TX_INDEX), DatabaseFlags::empty())?,
@@ -202,7 +177,6 @@ impl Storage {
             && is_db_empty(&txn, self.blocks_by_hash)?
             && is_db_empty(&txn, self.accounts)?
             && is_db_empty(&txn, self.genesis_accounts)?
-            && is_db_empty(&txn, self.state_snapshots)?
             && is_db_empty(&txn, self.tx_index)?
             && is_db_empty(&txn, self.wtx_index)?
             && is_db_empty(&txn, self.address_tx_index)?
@@ -618,55 +592,6 @@ impl Storage {
         read_value(&txn, self.genesis_accounts, b"accounts")
     }
 
-    pub fn save_state_snapshot(&self, ledger: &Ledger) -> Result<(), StorageError> {
-        let (Some(height), Some(block_hash)) = (ledger.tip_height(), ledger.tip_hash()) else {
-            return Ok(());
-        };
-        if height.0 != 0 && !is_snapshot_height(height) {
-            return Err(StorageError::Integrity(
-                "state snapshot height is not a protocol snapshot height",
-            ));
-        }
-        let snapshot = StateSnapshot {
-            height,
-            block_hash,
-            state_root: ledger.state_root().into(),
-            accounts: ledger.accounts().clone(),
-        };
-        let mut txn = self.env.begin_rw_txn()?;
-        put_value(
-            &mut txn,
-            self.state_snapshots,
-            &height_key(height),
-            &snapshot,
-        )?;
-        txn.commit()?;
-        Ok(())
-    }
-
-    pub fn load_state_snapshot(
-        &self,
-        height: BlockHeight,
-    ) -> Result<Option<StateSnapshot>, StorageError> {
-        let txn = self.env.begin_ro_txn()?;
-        read_bytes(&txn, self.state_snapshots, &height_key(height))?
-            .map(|bytes| {
-                let snapshot: StateSnapshot = decode(&bytes)?;
-                if snapshot.height != height {
-                    return Err(StorageError::Integrity(
-                        "stored state snapshot height does not match height key",
-                    ));
-                }
-                if !snapshot.verify_state_root() {
-                    return Err(StorageError::Integrity(
-                        "stored state snapshot root does not match accounts",
-                    ));
-                }
-                Ok(snapshot)
-            })
-            .transpose()
-    }
-
     pub fn save_tip(&self, height: BlockHeight, hash: &BlockHash) -> Result<(), StorageError> {
         let mut txn = self.env.begin_rw_txn()?;
         put_value(&mut txn, self.meta, TIP_HEIGHT_KEY, &height)?;
@@ -695,15 +620,14 @@ impl Storage {
     }
 
     pub fn save_ledger(&self, ledger: &Ledger) -> Result<(), StorageError> {
-        let genesis_snapshot = ledger
+        let genesis_accounts = ledger
             .chain
             .block(&Height(0))
-            .map(|block| genesis_snapshot_from_ledger(ledger, block))
+            .map(|block| genesis_accounts_from_ledger(ledger, block))
             .transpose()?;
         let mut txn = self.env.begin_rw_txn()?;
         txn.clear_db(self.blocks_by_height)?;
         txn.clear_db(self.accounts)?;
-        txn.clear_db(self.state_snapshots)?;
         txn.clear_db(self.tx_index)?;
         txn.clear_db(self.wtx_index)?;
         txn.clear_db(self.address_tx_index)?;
@@ -740,20 +664,6 @@ impl Storage {
         if let (Some(height), Some(hash)) = (ledger.tip_height(), ledger.tip_hash()) {
             put_value(&mut txn, self.meta, TIP_HEIGHT_KEY, &height)?;
             txn.put(self.meta, &TIP_HASH_KEY, &hash.0, WriteFlags::empty())?;
-            if height.0 == 0 || is_snapshot_height(height) {
-                let snapshot = StateSnapshot {
-                    height,
-                    block_hash: hash,
-                    state_root: ledger.state_root().into(),
-                    accounts: ledger.accounts().clone(),
-                };
-                put_value(
-                    &mut txn,
-                    self.state_snapshots,
-                    &height_key(height),
-                    &snapshot,
-                )?;
-            }
         }
 
         put_value(
@@ -763,19 +673,8 @@ impl Storage {
             &StoredProtocolState::from_ledger(ledger),
         )?;
 
-        if let Some(snapshot) = genesis_snapshot {
-            put_value(
-                &mut txn,
-                self.genesis_accounts,
-                b"accounts",
-                &snapshot.accounts,
-            )?;
-            put_value(
-                &mut txn,
-                self.state_snapshots,
-                &height_key(Height(0)),
-                &snapshot,
-            )?;
+        if let Some(accounts) = genesis_accounts {
+            put_value(&mut txn, self.genesis_accounts, b"accounts", &accounts)?;
         }
 
         txn.commit()?;
@@ -930,15 +829,6 @@ impl Storage {
     }
 
     #[cfg(test)]
-    pub(crate) fn test_put_state_snapshot<T: BorshSerialize>(
-        &self,
-        key: &[u8],
-        value: &T,
-    ) -> Result<(), StorageError> {
-        self.test_put(self.state_snapshots, key, value)
-    }
-
-    #[cfg(test)]
     pub(crate) fn test_put_meta<T: BorshSerialize>(
         &self,
         key: &[u8],
@@ -997,10 +887,10 @@ fn protocol_transactions(block: &Block) -> Vec<SignedProtocolTransaction> {
         .map(SignedProtocolTransaction::Transfer)
         .chain(
             block
-                .ecash_transactions
+                .qcash_transactions
                 .iter()
                 .cloned()
-                .map(SignedProtocolTransaction::Ecash),
+                .map(SignedProtocolTransaction::QCash),
         )
         .collect()
 }
@@ -1012,8 +902,8 @@ fn transaction_addresses(transaction: &SignedProtocolTransaction) -> Vec<(Addres
         SignedProtocolTransaction::Transfer(tx) => {
             tx.transaction.outputs().map(|output| output.to).collect()
         }
-        SignedProtocolTransaction::Ecash(tx) => match &tx.transaction.kind {
-            paqus::transaction::EcashTransactionKind::DepositCash { recipient, .. } => {
+        SignedProtocolTransaction::QCash(tx) => match &tx.transaction.kind {
+            paqus::transaction::QCashTransactionKind::DepositCash { recipient, .. } => {
                 vec![*recipient]
             }
             _ => Vec::new(),
@@ -1030,8 +920,8 @@ fn transaction_addresses(transaction: &SignedProtocolTransaction) -> Vec<(Addres
 fn event_addresses(kind: &ProtocolEventKind) -> Vec<Address> {
     let addresses = match kind {
         ProtocolEventKind::Transfer { from, to, .. } => vec![*from, *to],
-        ProtocolEventKind::EcashWithdrawn { signer, .. } => vec![*signer],
-        ProtocolEventKind::EcashDeposited {
+        ProtocolEventKind::QCashWithdrawn { signer, .. } => vec![*signer],
+        ProtocolEventKind::QCashDeposited {
             signer, recipient, ..
         } => vec![*signer, *recipient],
         ProtocolEventKind::GenesisAllocation { recipient, .. } => vec![*recipient],
@@ -1042,33 +932,23 @@ fn event_addresses(kind: &ProtocolEventKind) -> Vec<Address> {
     unique.into_iter().collect()
 }
 
-fn genesis_snapshot_from_ledger(
+fn genesis_accounts_from_ledger(
     ledger: &Ledger,
     block: &Block,
-) -> Result<StateSnapshot, StorageError> {
+) -> Result<BTreeMap<Address, Account>, StorageError> {
     if block.height() != Height(0) {
         return Err(StorageError::Integrity(
-            "genesis snapshot block is not height 0",
+            "genesis account source block is not height 0",
         ));
     }
     let mut genesis_ledger = Ledger::new();
     if genesis_ledger.apply_block(block.clone()).is_err() {
         if ledger.tip_height() == Some(Height(0)) {
-            return Ok(StateSnapshot {
-                height: Height(0),
-                block_hash: block.hash(),
-                state_root: ledger.state_root().into(),
-                accounts: ledger.accounts().clone(),
-            });
+            return Ok(ledger.accounts().clone());
         }
         return Err(StorageError::Integrity("stored genesis block is invalid"));
     }
-    Ok(StateSnapshot {
-        height: Height(0),
-        block_hash: block.hash(),
-        state_root: genesis_ledger.state_root().into(),
-        accounts: genesis_ledger.accounts().clone(),
-    })
+    Ok(genesis_ledger.accounts().clone())
 }
 
 fn address_tx_key(address: &Address, height: BlockHeight, tx_index: u32, sent: bool) -> Vec<u8> {

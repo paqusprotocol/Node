@@ -1,4 +1,4 @@
-#![allow(dead_code, unused_imports)]
+#![cfg_attr(not(test), allow(dead_code))]
 
 pub mod cache;
 pub mod mempool;
@@ -6,18 +6,16 @@ pub mod miner;
 pub mod network;
 pub mod node;
 pub mod storage;
-pub mod wallet;
 
 pub mod params {
     pub use paqus::block::MAX_BLOCK_TXS;
-    pub use paqus::consensus::supply::{BLOCK_REWARD, DECIMALS, TAIL_EMISSION, XPQ};
-    pub use paqus::consensus::{
-        ASERT_HALF_LIFE, BLOCK_TIME, DIFFICULTY_ADJUSTMENT_INTERVAL, DIFFICULTY_START,
-        MAX_FUTURE_TIME, MIN_DIFFICULTY,
-    };
+    pub use paqus::consensus::BLOCK_TIME;
+    pub use paqus::consensus::DIFFICULTY_START;
     pub use paqus::crypto::{ADDRESS_SIZE, HASH_SIZE};
     pub use paqus::genesis::CURRENT_CHAIN_PARAMS;
-    pub use paqus::ledger::{BLOCK_REWARD_MATURITY, CONFIRMATION_DEPTH, FINALITY_DEPTH};
+    #[cfg(test)]
+    pub use paqus::ledger::BLOCK_REWARD_MATURITY;
+    pub use paqus::ledger::CONFIRMATION_DEPTH;
 
     pub const CHAIN_NAME: &str = CURRENT_CHAIN_PARAMS.chain_name;
     pub const CHAIN_ID: u16 = CURRENT_CHAIN_PARAMS.chain_id;

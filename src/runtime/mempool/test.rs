@@ -20,18 +20,15 @@ fn signed_transaction(nonce: u64) -> SignedTransaction {
 
 fn signed_transaction_at(nonce: u64, timestamp: u64) -> SignedTransaction {
     let keypair = generate_keypair();
-    let from = address_from_public_key(&keypair.public_key);
-    let payload = Transaction::new_at(
-        from,
+    signed_transaction_from_with_fee_at(
+        &keypair.secret_key,
+        keypair.public_key,
         address(2),
-        Amount(10),
-        Amount(BASE_FEE),
-        Nonce(nonce),
+        10,
+        BASE_FEE,
+        nonce,
         timestamp,
-    );
-    let signature = sign(&keypair.secret_key, &payload.signing_bytes());
-
-    SignedTransaction::new(payload, keypair.public_key, signature)
+    )
 }
 
 fn signed_transaction_from(
@@ -59,14 +56,39 @@ fn signed_transaction_from_with_fee(
     fee: u64,
     nonce: u64,
 ) -> SignedTransaction {
+    signed_transaction_from_with_fee_at(
+        secret_key,
+        public_key,
+        to,
+        amount,
+        fee,
+        nonce,
+        current_unix_timestamp(),
+    )
+}
+
+fn signed_transaction_from_with_fee_at(
+    secret_key: &SecretKey,
+    public_key: PublicKey,
+    to: Address,
+    amount: u64,
+    fee_rate: u64,
+    nonce: u64,
+    timestamp: u64,
+) -> SignedTransaction {
     let from = address_from_public_key(&public_key);
+    let template =
+        Transaction::new_at(from, to, Amount(amount), Amount(0), Nonce(nonce), timestamp);
+    let template_signature = sign(secret_key, &template.signing_bytes());
+    let virtual_size =
+        SignedTransaction::new(template, public_key, template_signature).virtual_size();
     let payload = Transaction::new_at(
         from,
         to,
         Amount(amount),
-        Amount(fee),
+        Amount(fee_rate.saturating_mul(virtual_size as u64)),
         Nonce(nonce),
-        current_unix_timestamp(),
+        timestamp,
     );
     let signature = sign(secret_key, &payload.signing_bytes());
 
@@ -175,7 +197,7 @@ fn replaces_same_sender_nonce_when_fee_is_higher() {
     let keypair = generate_keypair();
     let from = address_from_public_key(&keypair.public_key);
     let to = address(2);
-    let ledger = ledger_with_accounts(from, to, 100);
+    let ledger = ledger_with_accounts(from, to, 100_000);
     let original =
         signed_transaction_from_with_fee(&keypair.secret_key, keypair.public_key, to, 10, 2, 0);
     let replacement =
@@ -202,7 +224,7 @@ fn rejects_same_sender_nonce_replacement_when_fee_is_not_higher() {
     let keypair = generate_keypair();
     let from = address_from_public_key(&keypair.public_key);
     let to = address(2);
-    let ledger = ledger_with_accounts(from, to, 100);
+    let ledger = ledger_with_accounts(from, to, 100_000);
     let original =
         signed_transaction_from_with_fee(&keypair.secret_key, keypair.public_key, to, 10, 3, 0);
     let replacement =
@@ -363,7 +385,7 @@ fn inserts_transaction_validated_against_ledger_state() {
     let keypair = generate_keypair();
     let from = address_from_public_key(&keypair.public_key);
     let to = address(2);
-    let ledger = ledger_with_accounts(from, to, 100);
+    let ledger = ledger_with_accounts(from, to, 100_000);
     let transaction = signed_transaction_from(&keypair.secret_key, keypair.public_key, to, 10, 0);
     let hash = transaction.hash();
     let mut mempool = Mempool::new();
@@ -393,7 +415,7 @@ fn rejects_transaction_with_invalid_ledger_nonce() {
     let keypair = generate_keypair();
     let from = address_from_public_key(&keypair.public_key);
     let to = address(2);
-    let ledger = ledger_with_accounts(from, to, 100);
+    let ledger = ledger_with_accounts(from, to, 100_000);
     let transaction = signed_transaction_from(&keypair.secret_key, keypair.public_key, to, 10, 1);
     let mut mempool = Mempool::new();
 
@@ -410,10 +432,11 @@ fn accounts_for_pending_transactions_when_validating_ledger_state() {
     let keypair = generate_keypair();
     let from = address_from_public_key(&keypair.public_key);
     let to = address(2);
-    let ledger = ledger_with_accounts(from, to, 60);
     let first = signed_transaction_from(&keypair.secret_key, keypair.public_key, to, 10, 0);
     let second = signed_transaction_from(&keypair.secret_key, keypair.public_key, to, 10, 1);
     let too_expensive = signed_transaction_from(&keypair.secret_key, keypair.public_key, to, 10, 2);
+    let per_transaction = 10 + first.transaction.fee.0;
+    let ledger = ledger_with_accounts(from, to, per_transaction * 2);
     let mut mempool = Mempool::new();
 
     assert_eq!(
@@ -482,6 +505,8 @@ fn selects_transactions_by_fee_without_breaking_sender_nonce_order() {
         fast_fee,
         0,
     );
+    let fast_fee_amount = second_fast.transaction.fee;
+    let aggressive_fee_amount = first_aggressive.transaction.fee;
 
     mempool.insert(first_aggressive).unwrap();
     mempool.insert(first_slow).unwrap();
@@ -490,12 +515,12 @@ fn selects_transactions_by_fee_without_breaking_sender_nonce_order() {
     let selected = mempool.select_for_block(3);
 
     assert_eq!(selected[0].transaction.from, second_sender);
-    assert_eq!(selected[0].transaction.fee, Amount(fast_fee));
+    assert_eq!(selected[0].transaction.fee, fast_fee_amount);
     assert_eq!(selected[1].transaction.from, first_sender);
     assert_eq!(selected[1].transaction.nonce, Nonce(0));
     assert_eq!(selected[2].transaction.from, first_sender);
     assert_eq!(selected[2].transaction.nonce, Nonce(1));
-    assert_eq!(selected[2].transaction.fee, Amount(aggressive_fee));
+    assert_eq!(selected[2].transaction.fee, aggressive_fee_amount);
 }
 
 fn current_unix_timestamp() -> u64 {
@@ -538,7 +563,7 @@ fn creates_candidate_block_from_mempool_transactions() {
     let from = address_from_public_key(&keypair.public_key);
     let to = address(2);
     let miner = address(9);
-    let mut ledger = ledger_with_accounts(from, to, 100);
+    let mut ledger = ledger_with_accounts(from, to, 100_000);
     ledger.create_account(miner, Amount(0)).unwrap();
     ledger
         .apply_block(Block::new(
@@ -588,7 +613,9 @@ fn rejects_transaction_spending_immature_mining_reward() {
     ledger.chain.insert_block(genesis).unwrap();
     let funding_keypair = generate_keypair();
     let funding_sender = address_from_public_key(&funding_keypair.public_key);
-    ledger.create_account(funding_sender, Amount(100)).unwrap();
+    ledger
+        .create_account(funding_sender, Amount(100_000))
+        .unwrap();
     let funding = signed_transaction_from(
         &funding_keypair.secret_key,
         funding_keypair.public_key,

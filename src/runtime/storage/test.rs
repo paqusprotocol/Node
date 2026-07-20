@@ -1,4 +1,4 @@
-use super::{StateSnapshot, Storage, StorageError};
+use super::{Storage, StorageError};
 use crate::runtime::params::{DEFAULT_TRANSACTION_FEE, STORAGE_VERSION};
 use paqus::block::{Block, Height, Nonce};
 use paqus::consensus::supply::Amount;
@@ -8,9 +8,7 @@ use paqus::crypto::{
 use paqus::event::{ProtocolEvent, ProtocolEventKind};
 use paqus::ledger::Ledger;
 use paqus::state::Account;
-use paqus::transaction::{
-    SignedProtocolTransaction, SignedTransaction, Transaction, TransactionFamily,
-};
+use paqus::transaction::{SignedTransaction, Transaction};
 
 fn address(byte: u8) -> Address {
     Address([byte; 20])
@@ -359,22 +357,6 @@ fn save_ledger_rebuilds_miner_block_index() {
 }
 
 #[test]
-fn save_ledger_skips_state_snapshot_at_non_protocol_snapshot_height() {
-    let storage = Storage::temporary().unwrap();
-    let genesis = block(0, Hash([0; HASH_SIZE]));
-    let next = block(1, genesis.hash().into());
-    let mut ledger = Ledger::new();
-    ledger.chain.insert_block(genesis).unwrap();
-    ledger.chain.insert_block(next.clone()).unwrap();
-
-    storage.save_ledger(&ledger).unwrap();
-
-    assert_eq!(storage.load_tip().unwrap(), Some((Height(1), next.hash())));
-    assert!(storage.load_state_snapshot(Height(0)).unwrap().is_some());
-    assert!(storage.load_state_snapshot(Height(1)).unwrap().is_none());
-}
-
-#[test]
 fn initializes_storage_version_for_empty_database() {
     let storage = Storage::temporary().unwrap();
 
@@ -555,7 +537,7 @@ fn rejects_chain_integrity_when_previous_link_is_broken() {
 }
 
 #[test]
-fn stores_ledger_snapshot() {
+fn stores_complete_archive_ledger() {
     let storage = Storage::temporary().unwrap();
     let mut ledger = Ledger::new();
     let mut genesis = block(0, Hash([0; HASH_SIZE]));
@@ -579,7 +561,7 @@ fn stores_ledger_snapshot() {
 }
 
 #[test]
-fn loads_ledger_snapshot() {
+fn loads_complete_archive_ledger() {
     let storage = Storage::temporary().unwrap();
     let mut ledger = Ledger::new();
     let genesis = block(0, Hash([0; HASH_SIZE]));
@@ -605,55 +587,6 @@ fn stores_and_loads_genesis_accounts() {
     storage.save_genesis_accounts(&accounts).unwrap();
 
     assert_eq!(storage.load_genesis_accounts().unwrap(), Some(accounts));
-}
-
-#[test]
-fn stores_and_loads_state_snapshot() {
-    let storage = Storage::temporary().unwrap();
-    let mut ledger = Ledger::new();
-    let mut genesis = block(0, Hash([0; HASH_SIZE]));
-
-    ledger.create_account(address(1), Amount(100)).unwrap();
-    genesis.set_state_root(ledger.state_root());
-    let hash = genesis.hash();
-    ledger.chain.insert_block(genesis.clone()).unwrap();
-    storage.save_block(&genesis).unwrap();
-    storage.save_state_snapshot(&ledger).unwrap();
-
-    let snapshot = storage.load_state_snapshot(Height(0)).unwrap().unwrap();
-
-    assert_eq!(snapshot.height, Height(0));
-    assert_eq!(snapshot.block_hash, hash);
-    assert_eq!(snapshot.state_root, ledger.state_root());
-    assert_eq!(
-        snapshot
-            .accounts
-            .get(&address(1))
-            .map(|account| account.balance),
-        Some(Amount(100))
-    );
-    assert!(snapshot.verify_state_root());
-    assert!(
-        snapshot.verify_against_block(&storage.load_block_by_height(Height(0)).unwrap().unwrap())
-    );
-}
-
-#[test]
-fn rejects_state_snapshot_at_non_protocol_snapshot_height() {
-    let storage = Storage::temporary().unwrap();
-    let mut ledger = Ledger::new();
-    let genesis = block(0, Hash([0; HASH_SIZE]));
-    let next = block(1, genesis.hash().into());
-
-    ledger.chain.insert_block(genesis).unwrap();
-    ledger.chain.insert_block(next).unwrap();
-
-    assert!(matches!(
-        storage.save_state_snapshot(&ledger),
-        Err(StorageError::Integrity(
-            "state snapshot height is not a protocol snapshot height"
-        ))
-    ));
 }
 
 #[test]
@@ -693,28 +626,4 @@ fn difficulty_window_uses_configured_block_interval() {
             block(10, Hash([0; HASH_SIZE])).difficulty()
         ))
     );
-}
-
-#[test]
-fn rejects_tampered_state_snapshot_root() {
-    let storage = Storage::temporary().unwrap();
-    let mut accounts = std::collections::BTreeMap::new();
-    accounts.insert(address(1), Account::new(address(1), Amount(100)));
-    let snapshot = StateSnapshot {
-        height: Height(0),
-        block_hash: BlockHash([1; HASH_SIZE]),
-        state_root: Hash([9; HASH_SIZE]),
-        accounts,
-    };
-
-    storage
-        .test_put_state_snapshot(&Height(0).0.to_be_bytes(), &snapshot)
-        .unwrap();
-
-    assert!(matches!(
-        storage.load_state_snapshot(Height(0)),
-        Err(StorageError::Integrity(
-            "stored state snapshot root does not match accounts"
-        ))
-    ));
 }

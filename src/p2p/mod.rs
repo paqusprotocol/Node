@@ -1,7 +1,6 @@
 use crate::rpc::transport::{configure_stream, connect_peer, request_on_stream};
 
 pub mod gossip;
-pub mod libp2p;
 use crate::runtime::network::{InventoryItem, NetworkMessage, PeerInfo, TipInfo, VersionInfo};
 use crate::runtime::node::Node;
 use paqus::block::Height;
@@ -193,14 +192,28 @@ pub fn poll_peer_connection(
         .lock()
         .map_err(|_| "node state lock poisoned".to_string())?
         .tip_height()
-        .unwrap_or(Height(0))
-        .0;
+        .map(|height| height.0);
     println!(
         "peer {} tip check:: |local::{}|remote::{}|",
         peer.addr(),
-        local_height,
+        local_height
+            .map(|height| height.to_string())
+            .unwrap_or_else(|| "none".to_string()),
         tip.0
     );
+    if local_height.is_none() {
+        let sync_window = sync_window.clamp(MIN_BLOCKS_PER_SYNC, MAX_BLOCKS_PER_SYNC);
+        let start = Height(0);
+        let target = tip.0.min(sync_window.saturating_sub(1));
+        let headers = request_headers(peer, start, target, BlockHash::ZERO)?;
+        request_blocks(peer, node, start, target, headers)?;
+        request_missing_parent_blocks(peer, node)?;
+        return Ok(PeerPoll::Synced {
+            remote_tip: tip,
+            synced_blocks: target.saturating_add(1) as usize,
+        });
+    }
+    let local_height = local_height.expect("checked above");
     if tip.0 <= local_height {
         return if request_missing_parent_blocks(peer, node)? {
             Ok(PeerPoll::Synced {

@@ -1,16 +1,141 @@
 # Paqus Node
 
-Rust full node for the Paqus testnet. It handles LMDB chain storage, mining,
+Rust full node for the Paqus mainnet protocol stage. It handles LMDB chain storage, mining,
 RPC, peer sync, gateway discovery, mempool validation, and transaction indexing.
+
+Command concerns live under `src/command/`: daemon configuration, archive database
+maintenance, display formatting, and protocol input parsing. The main entry point
+dispatches CLI commands. Node bootstrap, service lifecycle, peer helpers, and mining execution
+live under `src/daemon/`.
+The `src/rpc/` boundary separates the HTTP server, explorer, protocol events, transaction
+submission, mining endpoints, and socket transport.
+
+## Install paqusd
+
+Build on the operating system where the daemon will run:
+
+```bash
+cargo build --release --locked --bin paqusd
+```
+
+### Linux (systemd)
+
+Install the daemon binary, system user, configuration, data directory, and
+systemd unit:
+
+```bash
+sudo ./daemon/linux/install.sh
+sudo systemctl enable --now paqusd
+```
+
+Or install and start it in one command:
+
+```bash
+sudo ./daemon/linux/install.sh --enable
+```
+
+Installation paths:
+
+```text
+/usr/local/bin/paqusd
+/etc/paqus/node.json
+/var/lib/paqus/
+/etc/systemd/system/paqusd.service
+```
+
+The installer preserves an existing `node.json`. Mining is disabled in the
+initial configuration; add the miner wallet settings deliberately before
+enabling it. Useful service commands:
+
+```bash
+systemctl status paqusd
+journalctl -u paqusd -f
+sudo systemctl restart paqusd
+sudo systemctl stop paqusd
+```
+
+Uninstall while preserving configuration and blockchain data:
+
+```bash
+sudo ./daemon/linux/uninstall.sh
+```
+
+Use `--purge` only when the configuration and blockchain database should also
+be permanently removed.
+
+### macOS (launchd)
+
+Install for the current user and optionally start immediately:
+
+```bash
+./daemon/macos/install.sh --start
+```
+
+The daemon is installed below `~/Library/Application Support/Paqus`, with its
+LaunchAgent at `~/Library/LaunchAgents/io.paqus.paqusd.plist`.
+
+```bash
+./daemon/macos/uninstall.sh
+```
+
+### Windows (Scheduled Task)
+
+Run PowerShell as the user who will run Paqus:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File daemon\windows\install.ps1 -Start
+```
+
+Windows installs `paqusd.exe`, configuration, and data below
+`%LOCALAPPDATA%\Paqus`. It uses the native Task Scheduler to start the daemon at
+login. This is intentionally not registered with the Windows Service Control
+Manager because `paqusd.exe` is a cross-platform console daemon rather than an
+SCM-specific service executable.
+
+```powershell
+powershell -ExecutionPolicy Bypass -File daemon\windows\stop.ps1
+powershell -ExecutionPolicy Bypass -File daemon\windows\uninstall.ps1
+```
+
+All platforms preserve configuration and blockchain data during upgrades and
+ordinary uninstall. `paqusd` handles SIGINT, SIGTERM, Ctrl+C, and its `STOP`
+file by flushing node storage before exit.
 
 ## Quick Start
 
 ```bash
-cd ../wallet-cli && cargo run -- new wallet.json
-cd ../full-node
+git clone https://github.com/paqusprotocol/wallet.git
+cd wallet && cargo run --release -- new wallet.json
+cd ..
+git clone https://github.com/paqusprotocol/Node.git
+cd Node
 cargo run -- node init ./data/paqus
-cargo run -- node run ./data/paqus --miner <PX1_MINER_ADDRESS>
+cargo run -- node run ./data/paqus --wallet ../wallet/wallet.json --mine
 ```
+
+`node init` creates empty storage. If no peer has established the chain yet, the
+first mining node creates height 0 with its miner address and current timestamp.
+Non-mining nodes obtain that genesis block through peer synchronization.
+
+## Current Consensus Timing and Economics
+
+```text
+Protocol version:          1
+Storage version:           1
+Target block time:         5 minutes
+Transaction confirmation: 5 blocks  (~25 minutes)
+Hard finality:             50 blocks (~4 hours 10 minutes)
+Block reward maturity:     100 blocks (~8 hours 20 minutes)
+QCash maturity:            50 blocks (~4 hours 10 minutes)
+Block subsidy:             25 XPQ
+Tail emission:             0.747 XPQ from height 525,600
+Genesis premine:           none
+```
+
+The first miner creates height 0 with its address and timestamp. Protocol and
+storage identifiers remain version 1; because the storage schema has evolved,
+operators should initialize fresh storage rather than reuse an older version-1
+database without an explicit migration.
 
 Check the node from another terminal:
 
@@ -21,7 +146,7 @@ curl http://127.0.0.1:6666/status
 Run with mining:
 
 ```bash
-cargo run -- node run ./data/paqus --wallet ../wallet-cli/wallet.json --mine
+cargo run -- node run ./data/paqus --wallet ../wallet/wallet.json --mine
 ```
 
 Stop the default node:
@@ -52,18 +177,18 @@ rm -rf ./data/paqus
 ## Database maintenance
 
 Stop every process using the database before backup or restore. Check integrity
-and create a validated LMDB snapshot with:
+and create a validated LMDB backup with:
 
 ```bash
-full-node node db check ./data/paqus
-full-node node db backup ./data/paqus ./backup/paqus-$(date +%Y%m%d)
+paqusd node db check ./data/paqus
+paqusd node db backup ./data/paqus ./backup/paqus-$(date +%Y%m%d)
 ```
 
 Restore always targets a new, non-existent directory and validates the restored
 chain before reporting success:
 
 ```bash
-full-node node db restore ./backup/paqus-20260717 ./data/paqus-restored
+paqusd node db restore ./backup/paqus-20260717 ./data/paqus-restored
 ```
 
 For an upgrade, back up first, deploy the new binary, run `node db check`, and
@@ -71,29 +196,41 @@ start against the existing database only when its storage version is supported.
 For rollback, stop the node and restore the pre-upgrade backup into a new path;
 never copy files over a live or existing LMDB environment.
 
-## eCash Mempool Reservations
+## QCash Mempool Reservations
 
-`runtime::mempool::ExtensionMempool` accepts eCash transactions. eCash deposit
+`runtime::mempool::ExtensionMempool` accepts QCash transactions. QCash deposit
 inputs reserve their complete
 32-byte `CashCoinId`; a second pending transaction using the same bearer coin is
 rejected even when signed by a different wallet. Removing or confirming the
-transaction releases its reservation. Reservations are node policy, while
-`PendingRedeem` in the ledger is the consensus lock after block inclusion.
+transaction releases its reservation. Reservations are node policy; after block
+inclusion the consensus transition removes the spent UTXO from the active set.
+
+The full node accepts wallet-signed QCash withdraw and deposit transactions:
+
+```text
+POST /qcash/tx        {"tx":"signed-qcash-transaction-hex"}
+GET  /qcash/mempool
+```
+
+Withdraw creates individually tracked QCash UTXOs. Deposit verifies bearer
+authorization and atomically consumes those UTXOs. The account state root and
+QCash UTXO root are committed together in the block protocol state root.
+Persisted protocol state includes the active QCash UTXO set.
 
 ## Unified Transaction Pipeline
 
 P2P and inventory messages carry `SignedProtocolTransaction`, a canonical
-envelope covering transfers and eCash. The existing
+envelope covering transfers and QCash. The existing
 transfer pool retains nonce-aware fee ordering. The extension pool permits one
 pending transaction per signer, preventing ambiguous cross-family nonce order,
 and rejects a signer already present in the transfer pool.
 
 Miner candidate construction selects both pools by fee per virtual byte, fills
-the matching block-v2 lanes without exceeding serialized-size or weight limits,
+the matching version-1 SegWit block lanes without exceeding serialized-size or weight limits,
 recomputes combined fees and both Merkle roots, and stages the complete protocol
 state root. Confirmed and disconnected transactions are removed or reinserted
 through the same family-aware path. LMDB keeps logical `txid` and exact-witness
-`wtxid` indexes; persisted protocol state includes eCash journals and events.
+`wtxid` indexes; persisted protocol state includes the QCash UTXO set and events.
 
 ## Protocol Event RPC
 
@@ -114,7 +251,7 @@ Event-list routes accept optional query parameters:
 ```text
 offset=0
 limit=100                  # 1..500
-kind=ecash_deposited
+kind=qcash_deposited
 from_height=100
 to_height=200
 ```
@@ -131,8 +268,8 @@ Explorers and wallets can subscribe with Server-Sent Events:
 ```text
 GET /events/stream
 GET /events/stream?from_height=100
-GET /events/stream?kind=ecash_deposited
-GET /events/stream?address=PAQUS1...
+GET /events/stream?kind=qcash_deposited
+GET /events/stream?address=PX1...
 ```
 
 `from_height`, `kind`, and `address` may be combined. Without `from_height`, the
@@ -153,17 +290,19 @@ cargo run
 Equivalent explicit command:
 
 ```bash
-cargo run -- menu
+cargo run -- node run
 ```
 
 ## Wallet
 
-Wallet CLI lives in `../wallet-cli`.
+The wallet is maintained separately at
+[`paqusprotocol/wallet`](https://github.com/paqusprotocol/wallet). Clone it next
+to the Node checkout for the paths in these examples.
 
 Create a wallet:
 
 ```bash
-cd ../wallet-cli
+cd ../wallet
 cargo run -- new wallet.json
 ```
 
@@ -370,7 +509,7 @@ work, state root, coinbase, checkpoint policy, and transaction validity.
 
 Coinbase-only blocks are valid, so mining continues when the mempool is empty.
 The default initial difficulty is calibrated for roughly one reference CPU core;
-per-block ASERT adjusts it toward the one-minute target.
+per-block ASERT adjusts it toward the five-minute target.
 
 External miners can request and submit canonical block jobs through RPC:
 
@@ -389,7 +528,7 @@ the private key:
 
 ```bash
 cargo run --release -- node run ./data/paqus \
-  --wallet ../wallet-cli/wallet.json \
+  --wallet ../wallet/wallet.json \
   --mine
 ```
 
@@ -468,7 +607,7 @@ curl http://127.0.0.1:6666/mempool
 To expose RPC on IPv6 for a remote wallet, bind to all IPv6 interfaces:
 
 ```bash
-full-node node run ./data/paqus --rpc-listen '[::]:6666'
+paqusd node run ./data/paqus --rpc-listen '[::]:6666'
 ```
 
 Check that the node is listening publicly:
@@ -506,11 +645,11 @@ curl -X POST http://127.0.0.1:6666/tx \
 Block, address, mempool, and transaction responses use one family-aware
 transaction shape. It includes `family`, `operation`, `txid`, `wtxid`, signer,
 witness addresses, validity window, and SegWit size accounting for transfers
-and eCash transactions.
+and QCash transactions.
 
 ## Recent Changes
 
-- Uses the local `../core` crate path.
+- Pins the `paqus` core Git revision so this repository builds independently.
 - Exposes `confirmation_depth` and `finality_depth` separately through node info.
 - Uses `CONFIRMATION_DEPTH` for available balance, while hard finality remains a reorg boundary.
 - Validates canonical blocks again when storing or loading them from LMDB.
@@ -526,17 +665,17 @@ POST /protocol/transaction
 ```
 
 The accepted envelope is announced through the unified P2P transaction gossip
-message. Existing `/tx`, `/transaction`, and `/ecash/tx` routes remain available
+message. Existing `/tx`, `/transaction`, and `/qcash/tx` routes remain available
 for compatibility.
 
-# eCash RPC
+# QCash RPC
 
-The node validates signed eCash v1 transactions in the unified extension pool, which
+The node validates signed QCash v1 transactions in the unified extension pool, which
 reserves every deposit `coin_id` against competing deposits:
 
 ```text
-POST /ecash/tx       {"tx":"signed-ecash-transaction-hex"}
-GET  /ecash/mempool
+POST /qcash/tx       {"tx":"signed-qcash-transaction-hex"}
+GET  /qcash/mempool
 ```
 
 Deposit authorization is verified by `core` and is bound to the intended

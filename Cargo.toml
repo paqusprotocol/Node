@@ -3,18 +3,27 @@ name = "full-node"
 version = "0.2.2"
 edition = "2024"
 license = "MIT"
+description = "Full node, miner, and RPC server for the Paqus blockchain"
+readme = "README.md"
+repository = "https://github.com/paqusprotocol/Node"
+autobins = false
+
+[[bin]]
+name = "paqusd"
+path = "src/main.rs"
 
 [dependencies]
 axum = "0.8.9"
 borsh = { version = "1.6", features = ["derive"] }
+ctrlc = "3.4"
 hex = "0.4"
 futures-util = "0.3"
-libp2p = { version = "0.56", default-features = false, features = ["gossipsub", "identify", "json", "macros", "noise", "ping", "request-response", "tcp", "tokio", "yamux"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 socket2 = "0.6.4"
 lmdb = { package = "lmdb-rkv", version = "0.14" }
 tokio = { version = "1", features = ["full"] }
-tracing = "0.1"
-tracing-subscriber = "0.3"
-paqus = { version = "=0.2.6", path = "../core" }
+paqus = { git = "https://github.com/paqusprotocol/paqus.git", rev = "9eb63eda2e863cb887dcc04e80955182bf6ec226" }
+
+[workspace]
+resolver = "3"

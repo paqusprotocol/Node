@@ -1,0 +1,14 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+pid=${1:-}
+touch /var/lib/paqus/STOP
+
+if [[ -n "$pid" ]]; then
+    for _ in $(seq 1 25); do
+        if ! kill -0 "$pid" 2>/dev/null; then
+            exit 0
+        fi
+        sleep 1
+    done
+fi

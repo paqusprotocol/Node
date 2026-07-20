@@ -1,7 +1,6 @@
 use paqus::block::Block;
-use paqus::block::{BlockHeight, Height};
-use paqus::consensus::supply::Amount;
-use paqus::crypto::{Address, BlockHash, HASH_SIZE, Hash, PublicKey};
+use paqus::block::BlockHeight;
+use paqus::crypto::{Address, BlockHash, PublicKey};
 use paqus::crypto::{CachedVerifyingKey, cached_verifying_key, try_address_from_public_key};
 use paqus::ledger::Ledger;
 use paqus::state::Account;
@@ -81,22 +80,6 @@ impl CoreCache {
         self.verify_transaction_signature(transaction)
     }
 
-    pub fn validate_signed_transaction_for_height(
-        &mut self,
-        transaction: &SignedTransaction,
-        height: BlockHeight,
-    ) -> Result<(), TransactionError> {
-        transaction.validate_for_height(height)?;
-
-        if self.address_for_public_key(&transaction.witness.public_key)?
-            != transaction.transaction.from
-        {
-            return Err(TransactionError::SenderAddressMismatch);
-        }
-
-        self.verify_transaction_signature(transaction)
-    }
-
     pub fn validate_signed_transaction_at(
         &mut self,
         transaction: &SignedTransaction,
@@ -108,23 +91,6 @@ impl CoreCache {
         {
             return Err(TransactionError::SenderAddressMismatch);
         }
-        self.verify_transaction_signature(transaction)
-    }
-
-    pub fn validate_signed_transaction_at_height(
-        &mut self,
-        transaction: &SignedTransaction,
-        now: u64,
-        height: BlockHeight,
-    ) -> Result<(), TransactionError> {
-        transaction.validate_at_height(now, height)?;
-
-        if self.address_for_public_key(&transaction.witness.public_key)?
-            != transaction.transaction.from
-        {
-            return Err(TransactionError::SenderAddressMismatch);
-        }
-
         self.verify_transaction_signature(transaction)
     }
 
@@ -162,16 +128,6 @@ impl CoreCache {
 
     pub fn tip_hash(&self) -> Option<BlockHash> {
         self.tip_hash
-    }
-
-    pub fn clear(&mut self) {
-        self.accounts.clear();
-        self.blocks_by_height.clear();
-        self.blocks_by_hash.clear();
-        self.addresses_by_public_key.clear();
-        self.verifying_keys_by_public_key.clear();
-        self.tip_height = None;
-        self.tip_hash = None;
     }
 }
 
@@ -248,7 +204,7 @@ mod test {
     }
 
     #[test]
-    fn builds_from_ledger_snapshot() {
+    fn builds_from_ledger_state() {
         let mut ledger = Ledger::new();
         let block = Block::new(
             Height(0),

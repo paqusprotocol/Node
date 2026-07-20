@@ -3,7 +3,9 @@ pub mod error;
 pub mod node;
 
 pub use error::NodeError;
-pub use node::{AccountView, Node};
+#[cfg(test)]
+pub use node::AccountView;
+pub use node::Node;
 
 #[cfg(test)]
 mod test;

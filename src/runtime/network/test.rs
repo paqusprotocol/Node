@@ -1,6 +1,6 @@
 use super::{
-    InventoryItem, NetworkEnvelope, NetworkError, NetworkMessage, Peer, PeerInfo, RejectReason,
-    TipInfo, VersionInfo, handle_message, read_message, write_message,
+    InventoryItem, NetworkEnvelope, NetworkError, NetworkMessage, PeerInfo, RejectReason, TipInfo,
+    VersionInfo, handle_message, read_message, write_message,
 };
 use crate::runtime::node::Node;
 use crate::runtime::params::BASE_FEE;
@@ -14,7 +14,7 @@ use paqus::crypto::{
 };
 use paqus::ledger::Ledger;
 use paqus::transaction::{SignedTransaction, Transaction};
-use std::io::{Cursor, Read, Write};
+use std::io::Cursor;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 fn address(byte: u8) -> Address {
@@ -347,7 +347,7 @@ fn handler_returns_mempool_inventory_and_data_by_hash() {
     let hash = transaction.hash();
     let sender = transaction.transaction.from;
     let mut ledger = Ledger::new();
-    ledger.create_account(sender, Amount(100)).unwrap();
+    ledger.create_account(sender, Amount(100_000)).unwrap();
     ledger.create_account(address(2), Amount(0)).unwrap();
     let mut node = Node::temporary(
         ledger,
@@ -380,7 +380,7 @@ fn handler_submits_transaction_to_node_mempool() {
     let hash = transaction.hash();
     let sender = transaction.transaction.from;
     let mut ledger = Ledger::new();
-    ledger.create_account(sender, Amount(100)).unwrap();
+    ledger.create_account(sender, Amount(100_000)).unwrap();
     ledger.create_account(address(2), Amount(0)).unwrap();
     let mut node = Node::temporary(
         ledger,
@@ -395,31 +395,6 @@ fn handler_submits_transaction_to_node_mempool() {
         None
     );
     assert!(node.mempool.contains(&hash));
-}
-
-#[test]
-fn peer_sends_and_receives_messages() {
-    let stream = MemoryStream::default();
-    let info = PeerInfo {
-        address: "127.0.0.1:5555".to_string(),
-    };
-    let mut peer = Peer::new(stream, info.clone());
-
-    assert_eq!(peer.info(), &info);
-
-    peer.send(NetworkMessage::Ping { nonce: 99 }).unwrap();
-    peer.stream_mut().rewind();
-
-    assert_eq!(
-        peer.recv().unwrap(),
-        NetworkMessage::Ping { nonce: 99 }.to_envelope()
-    );
-}
-
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-struct MemoryStream {
-    bytes: Vec<u8>,
-    read_position: usize,
 }
 
 fn test_node_with_genesis() -> Node {
@@ -438,11 +413,22 @@ fn test_node_with_genesis() -> Node {
 fn signed_transaction_to(to: Address, amount: u64, nonce: u64) -> SignedTransaction {
     let keypair = generate_keypair();
     let from = address_from_public_key(&keypair.public_key);
+    let template = Transaction::new_at(
+        from,
+        to,
+        Amount(amount),
+        Amount(0),
+        Nonce(nonce),
+        current_unix_timestamp(),
+    );
+    let template_signature = sign(&keypair.secret_key, &template.signing_bytes());
+    let virtual_size =
+        SignedTransaction::new(template, keypair.public_key, template_signature).virtual_size();
     let payload = Transaction::new_at(
         from,
         to,
         Amount(amount),
-        Amount(BASE_FEE),
+        Amount(BASE_FEE.saturating_mul(virtual_size as u64)),
         Nonce(nonce),
         current_unix_timestamp(),
     );
@@ -455,32 +441,4 @@ fn current_unix_timestamp() -> u64 {
         .duration_since(UNIX_EPOCH)
         .map(|duration| duration.as_secs())
         .unwrap_or(0)
-}
-
-impl MemoryStream {
-    fn rewind(&mut self) {
-        self.read_position = 0;
-    }
-}
-
-impl Read for MemoryStream {
-    fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
-        let remaining = self.bytes.len().saturating_sub(self.read_position);
-        let count = remaining.min(buffer.len());
-        buffer[..count]
-            .copy_from_slice(&self.bytes[self.read_position..self.read_position + count]);
-        self.read_position += count;
-        Ok(count)
-    }
-}
-
-impl Write for MemoryStream {
-    fn write(&mut self, buffer: &[u8]) -> std::io::Result<usize> {
-        self.bytes.extend_from_slice(buffer);
-        Ok(buffer.len())
-    }
-
-    fn flush(&mut self) -> std::io::Result<()> {
-        Ok(())
-    }
 }

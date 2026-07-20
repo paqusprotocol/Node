@@ -2,6 +2,7 @@ use crate::runtime::mempool::{ExtensionMempool, Mempool};
 use paqus::block::{Block, Nonce};
 use paqus::consensus::{Consensus, ConsensusError};
 use paqus::crypto::Address;
+use paqus::genesis::{GenesisConfig, create_genesis_block};
 use paqus::ledger::Ledger;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -52,6 +53,14 @@ pub fn prepare_candidate_block(
     min_fee_rate: u64,
     difficulty: u32,
 ) -> Result<Block, ConsensusError> {
+    if ledger.tip_height().is_none() {
+        let mut genesis = create_genesis_block(GenesisConfig {
+            miner_address,
+            timestamp,
+        });
+        genesis.header.difficulty = difficulty;
+        return Ok(genesis);
+    }
     let mut block = mempool
         .create_candidate_block_with_min_fee_rate(
             ledger,

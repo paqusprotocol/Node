@@ -4,10 +4,9 @@ use paqus::block::{Block, BlockError, Height, Nonce};
 use paqus::consensus::supply::Amount;
 use paqus::consensus::{Consensus, ConsensusConfig, ConsensusError, DIFFICULTY_START};
 use paqus::crypto::{
-    Address, HASH_SIZE, Hash, KeyPair, PreviousHash, PublicKey, Signature, address_from_public_key,
-    generate_keypair, sign,
+    Address, HASH_SIZE, Hash, KeyPair, PreviousHash, address_from_public_key, generate_keypair,
+    sign,
 };
-use paqus::genesis::GENESIS_MINER_ADDRESS;
 use paqus::ledger::Ledger;
 use paqus::state::Account;
 use paqus::transaction::{SignedTransaction, Transaction};
@@ -30,31 +29,27 @@ fn signed_transaction_from_keypair(
     nonce: u64,
 ) -> SignedTransaction {
     let from = address_from_public_key(&keypair.public_key);
+    let template = Transaction::new_at(
+        from,
+        to,
+        Amount(amount),
+        Amount(0),
+        Nonce(nonce),
+        current_unix_timestamp(),
+    );
+    let template_signature = sign(&keypair.secret_key, &template.signing_bytes());
+    let virtual_size =
+        SignedTransaction::new(template, keypair.public_key, template_signature).virtual_size();
     let payload = Transaction::new_at(
         from,
         to,
         Amount(amount),
-        Amount(BASE_FEE),
+        Amount(BASE_FEE.saturating_mul(virtual_size as u64)),
         Nonce(nonce),
         current_unix_timestamp(),
     );
     let signature = sign(&keypair.secret_key, &payload.signing_bytes());
     SignedTransaction::new(payload, keypair.public_key, signature)
-}
-
-fn dummy_signed_transaction(nonce: u64) -> SignedTransaction {
-    SignedTransaction::new(
-        Transaction::new_at(
-            address(1),
-            address(2),
-            Amount(10),
-            Amount(BASE_FEE),
-            Nonce(nonce),
-            current_unix_timestamp(),
-        ),
-        PublicKey([1; 2592]),
-        Signature([1; 4627]),
-    )
 }
 
 fn current_unix_timestamp() -> u64 {
@@ -96,7 +91,7 @@ fn submits_transaction_to_mempool() {
     let transaction = signed_transaction_to(address(2), 10, 0);
     let sender = transaction.transaction.from;
     let mut ledger = Ledger::new();
-    ledger.create_account(sender, Amount(100)).unwrap();
+    ledger.create_account(sender, Amount(100_000)).unwrap();
     ledger.create_account(address(2), Amount(0)).unwrap();
     let mut node = Node::temporary(
         ledger,
@@ -118,7 +113,7 @@ fn mines_and_applies_block_from_mempool() {
     let sender = transaction.transaction.from;
     let miner = address(9);
     let mut ledger = Ledger::new();
-    ledger.create_account(sender, Amount(100)).unwrap();
+    ledger.create_account(sender, Amount(100_000)).unwrap();
     ledger.create_account(address(2), Amount(0)).unwrap();
     ledger.create_account(miner, Amount(0)).unwrap();
     ledger
@@ -145,18 +140,31 @@ fn mines_and_applies_block_from_mempool() {
     assert_eq!(result.block.height(), Height(1));
     assert_eq!(node.tip_height(), Some(Height(1)));
     assert!(node.mempool.is_empty());
-    assert_eq!(node.balance(&sender), Some(Amount(74)));
+    let expected_sender = 100_000_u64
+        .saturating_sub(10)
+        .saturating_sub(result.block.transactions[0].transaction.fee.0);
+    assert_eq!(node.balance(&sender), Some(Amount(expected_sender)));
     assert_eq!(node.balance(&address(2)), Some(Amount(10)));
 }
 
 #[test]
-fn initializes_empty_genesis_when_storage_is_empty() {
+fn leaves_new_storage_empty_until_first_miner_creates_genesis() {
     let dir = tempfile_dir();
-    let node = Node::init_or_load(&dir, Consensus::with_default_config()).unwrap();
+    let consensus = Consensus {
+        config: ConsensusConfig { difficulty: 0 },
+    };
+    let mut node = Node::init_or_load(&dir, consensus).unwrap();
+    let miner = address(7);
+    let timestamp = 1_700_000_123;
 
-    assert_eq!(node.tip_height(), Some(Height(0)));
-    assert_eq!(node.balance(&GENESIS_MINER_ADDRESS), None);
+    assert_eq!(node.tip_height(), None);
     assert_eq!(node.next_difficulty().unwrap(), DIFFICULTY_START);
+
+    let result = node.mine_block(miner, timestamp, 100, 10).unwrap();
+    assert!(result.block.is_genesis());
+    assert_eq!(result.block.miner_address(), miner);
+    assert_eq!(result.block.timestamp(), timestamp);
+    assert_eq!(node.tip_height(), Some(Height(0)));
 }
 
 #[test]
@@ -273,8 +281,8 @@ fn reorgs_state_when_side_fork_becomes_best_tip() {
         block_with_transactions(1, genesis.hash(), 1, 1, vec![active_transaction.clone()]);
     let mut side = block_with_transactions(1, genesis.hash(), 4, 2, vec![side_transaction]);
     let mut genesis_accounts = BTreeMap::new();
-    genesis_accounts.insert(active_sender, Account::new(active_sender, Amount(100)));
-    genesis_accounts.insert(side_sender, Account::new(side_sender, Amount(100)));
+    genesis_accounts.insert(active_sender, Account::new(active_sender, Amount(100_000)));
+    genesis_accounts.insert(side_sender, Account::new(side_sender, Amount(100_000)));
     genesis_accounts.insert(active_receiver, Account::new(active_receiver, Amount(0)));
     genesis_accounts.insert(side_receiver, Account::new(side_receiver, Amount(0)));
     genesis_accounts.insert(address(9), Account::new(address(9), Amount(0)));
@@ -300,9 +308,18 @@ fn reorgs_state_when_side_fork_becomes_best_tip() {
         Some(side_hash)
     );
     assert_eq!(node.tip_hash(), Some(side_hash));
-    assert_eq!(node.balance(&active_sender), Some(Amount(100)));
+    assert_eq!(node.balance(&active_sender), Some(Amount(100_000)));
     assert_eq!(node.balance(&active_receiver), Some(Amount(0)));
-    assert_eq!(node.balance(&side_sender), Some(Amount(74)));
+    let expected_side_sender = 100_000_u64.saturating_sub(10).saturating_sub(
+        node.ledger.block(&Height(1)).unwrap().transactions[0]
+            .transaction
+            .fee
+            .0,
+    );
+    assert_eq!(
+        node.balance(&side_sender),
+        Some(Amount(expected_side_sender))
+    );
     assert_eq!(node.balance(&side_receiver), Some(Amount(10)));
     assert!(node.mempool.contains(&active_transaction.hash()));
 }
@@ -322,7 +339,12 @@ fn reports_confirmed_available_and_pending_balances() {
     let receiver = address(2);
     let miner = address(9);
     let mut genesis_accounts = BTreeMap::new();
-    genesis_accounts.insert(sender, Account::new(sender, Amount(300)));
+    let fee_per_transaction = signed_transaction_from_keypair(&keypair, receiver, 1, 0)
+        .transaction
+        .fee
+        .0;
+    let initial_sender_balance = 1_000_000;
+    genesis_accounts.insert(sender, Account::new(sender, Amount(initial_sender_balance)));
     genesis_accounts.insert(receiver, Account::new(receiver, Amount(0)));
     genesis_accounts.insert(miner, Account::new(miner, Amount(0)));
 
@@ -354,22 +376,33 @@ fn reports_confirmed_available_and_pending_balances() {
 
     node.submit_transaction(pending_transaction).unwrap();
 
-    assert_eq!(node.confirmed_balance(&sender), Some(Amount(113)));
+    let confirmed_sender = initial_sender_balance - 11 * (1 + fee_per_transaction);
+    assert_eq!(
+        node.confirmed_balance(&sender),
+        Some(Amount(confirmed_sender))
+    );
     assert_eq!(node.confirmed_balance(&receiver), Some(Amount(11)));
-    assert_eq!(node.available_balance(&sender), Some(Amount(113)));
-    assert_eq!(node.available_balance(&receiver), Some(Amount(1)));
+    assert_eq!(
+        node.available_balance(&sender),
+        Some(Amount(confirmed_sender))
+    );
+    let available_receiver = 11_u64.saturating_sub(CONFIRMATION_DEPTH as u64);
+    assert_eq!(
+        node.available_balance(&receiver),
+        Some(Amount(available_receiver))
+    );
     assert_eq!(
         node.account_view(&receiver),
         Some(crate::runtime::node::AccountView {
-            balance: Amount(1),
-            unspendable: Amount(10),
+            balance: Amount(available_receiver),
+            unspendable: Amount(11 - available_receiver),
             nonce: Nonce(0),
         })
     );
 
     let sender_pending = node.pending_balance(&sender);
     assert_eq!(sender_pending.incoming, Amount(0));
-    assert_eq!(sender_pending.outgoing, Amount(21));
+    assert_eq!(sender_pending.outgoing, Amount(5 + fee_per_transaction));
 
     let receiver_pending = node.pending_balance(&receiver);
     assert_eq!(receiver_pending.incoming, Amount(5));
@@ -378,7 +411,7 @@ fn reports_confirmed_available_and_pending_balances() {
     assert_eq!(
         node.account_view(&sender),
         Some(crate::runtime::node::AccountView {
-            balance: Amount(113),
+            balance: Amount(confirmed_sender),
             unspendable: Amount(0),
             nonce: Nonce(11),
         })
@@ -400,7 +433,11 @@ fn keeps_mining_rewards_unspendable_until_maturity() {
     let receiver = address(2);
     let miner = address(9);
     let mut genesis_accounts = BTreeMap::new();
-    genesis_accounts.insert(sender, Account::new(sender, Amount(2_500)));
+    let fee_per_transaction = signed_transaction_from_keypair(&keypair, receiver, 1, 0)
+        .transaction
+        .fee
+        .0;
+    genesis_accounts.insert(sender, Account::new(sender, Amount(10_000_000)));
     genesis_accounts.insert(receiver, Account::new(receiver, Amount(0)));
     genesis_accounts.insert(miner, Account::new(miner, Amount(0)));
 
@@ -434,7 +471,8 @@ fn keeps_mining_rewards_unspendable_until_maturity() {
     let matured_rewards_at_120 = (1..=matured_at_120)
         .map(|height| paqus::consensus::block_reward(Height(height)).0)
         .sum::<u64>();
-    let matured_fees_at_120 = 120_u64.saturating_sub(CONFIRMATION_DEPTH as u64) * BASE_FEE;
+    let matured_fees_at_120 =
+        120_u64.saturating_sub(CONFIRMATION_DEPTH as u64) * fee_per_transaction;
     assert_eq!(
         miner_view.balance,
         Amount(matured_rewards_at_120 + matured_fees_at_120)
@@ -453,7 +491,7 @@ fn keeps_mining_rewards_unspendable_until_maturity() {
             (1..=121_u64.saturating_sub(BLOCK_REWARD_MATURITY as u64))
                 .map(|height| paqus::consensus::block_reward(Height(height)).0)
                 .sum::<u64>()
-                + 121_u64.saturating_sub(CONFIRMATION_DEPTH as u64) * BASE_FEE
+                + 121_u64.saturating_sub(CONFIRMATION_DEPTH as u64) * fee_per_transaction
         )
     );
 }

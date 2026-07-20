@@ -1,6 +1,8 @@
 use crate::runtime::cache::CoreCache;
 use crate::runtime::mempool::{ExtensionMempool, Mempool};
-use crate::runtime::miner::{MiningConfig, MiningResult, mine_candidate_block};
+use crate::runtime::miner::{
+    MiningConfig, MiningResult, mine_candidate_block, mine_prepared_block,
+};
 use crate::runtime::node::error::NodeError;
 use crate::runtime::params::HASH_SIZE;
 use crate::runtime::storage::Storage;
@@ -8,11 +10,11 @@ use paqus::block::{Block, BlockHeight, Height};
 use paqus::consensus::supply::{Amount, Balance};
 use paqus::consensus::{Consensus, ConsensusConfig, MIN_DIFFICULTY};
 use paqus::crypto::{Address, BlockHash, Hash, TransactionHash};
-use paqus::genesis::{CURRENT_CHAIN_PARAMS, genesis_block, validate_genesis_identity};
+use paqus::genesis::{GenesisConfig, create_genesis_block};
 use paqus::ledger::fork_choice::ForkChoice;
-use paqus::ledger::{Chain, Ledger};
+use paqus::ledger::{Chain, FINALITY_DEPTH, Ledger};
 use paqus::transaction::{
-    AccountNonce, SignedEcashTransaction, SignedProtocolTransaction, SignedTransaction,
+    AccountNonce, SignedProtocolTransaction, SignedQCashTransaction, SignedTransaction,
 };
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::path::Path;
@@ -137,11 +139,11 @@ impl Node {
         self.reorgs_total
     }
 
-    pub fn submit_ecash_transaction(
+    pub fn submit_qcash_transaction(
         &mut self,
-        transaction: SignedEcashTransaction,
+        transaction: SignedQCashTransaction,
     ) -> Result<TransactionHash, NodeError> {
-        self.submit_protocol_transaction(SignedProtocolTransaction::Ecash(transaction))
+        self.submit_protocol_transaction(SignedProtocolTransaction::QCash(transaction))
     }
 
     pub fn temporary(ledger: Ledger, consensus: Consensus) -> Result<Self, NodeError> {
@@ -149,24 +151,18 @@ impl Node {
     }
 
     pub fn init_or_load(path: impl AsRef<Path>, consensus: Consensus) -> Result<Self, NodeError> {
-        validate_genesis_identity(CURRENT_CHAIN_PARAMS)?;
         let storage = Storage::open(path)?;
         let ledger = if storage.load_tip()?.is_some() {
             storage.load_ledger()?
         } else {
-            let genesis = genesis_block();
-            let mut ledger = Ledger::new();
-            ledger.apply_block(genesis)?;
-            storage.save_ledger(&ledger)?;
-            storage.save_genesis_accounts(ledger.accounts())?;
-            ledger
+            Ledger::new()
         };
 
         let genesis_accounts = match storage.load_genesis_accounts()? {
             Some(accounts) => accounts,
             None => {
-                let accounts = if let Some(snapshot) = storage.load_state_snapshot(Height(0))? {
-                    snapshot.accounts
+                let accounts = if ledger.tip_height().is_none() {
+                    BTreeMap::new()
                 } else if ledger.tip_height() == Some(Height(0)) {
                     ledger.accounts().clone()
                 } else {
@@ -274,6 +270,10 @@ impl Node {
                 .expect("validated active block should apply");
             ledger
         });
+        if block.is_genesis() {
+            self.genesis_accounts = self.ledger.accounts().clone();
+            self.storage.save_genesis_accounts(&self.genesis_accounts)?;
+        }
         self.mempool.remove_confirmed(&block);
         self.extension_mempool.remove_confirmed(&block);
         self.cache.insert_block(block.clone());
@@ -291,6 +291,7 @@ impl Node {
             self.cache.insert_account(miner.clone());
         }
         self.storage.save_ledger(&self.ledger)?;
+        self.prune_finalized_forks()?;
         Ok(())
     }
 
@@ -517,7 +518,7 @@ impl Node {
             for transaction in old_block.transactions {
                 let _ = self.submit_protocol_transaction(transaction.into());
             }
-            for transaction in old_block.ecash_transactions {
+            for transaction in old_block.qcash_transactions {
                 let _ = self.submit_protocol_transaction(transaction.into());
             }
         }
@@ -526,6 +527,7 @@ impl Node {
         // winning branch starts at genesis.
         let _ = winning_branch;
         self.reorgs_total = self.reorgs_total.saturating_add(1);
+        self.prune_finalized_forks()?;
         Ok(())
     }
 
@@ -582,7 +584,20 @@ impl Node {
             blocks = remaining;
         }
 
+        self.prune_finalized_forks()?;
+
         Ok(())
+    }
+
+    fn prune_finalized_forks(&mut self) -> Result<usize, NodeError> {
+        let Some(tip_height) = self.ledger.tip_height() else {
+            return Ok(0);
+        };
+        let finalized_height = Height(tip_height.0.saturating_sub(FINALITY_DEPTH as u64));
+        let Some(finalized_block) = self.ledger.block(&finalized_height) else {
+            return Ok(0);
+        };
+        Ok(self.fork_choice.prune_finalized(finalized_block.hash())?)
     }
 
     fn common_ancestor(&self, old_tip: Option<BlockHash>, new_tip: BlockHash) -> Option<BlockHash> {
@@ -634,6 +649,27 @@ impl Node {
     ) -> Result<MiningResult, NodeError> {
         self.mempool.prune_expired(timestamp);
         let difficulty = self.next_difficulty()?;
+        if self.ledger.tip_height().is_none() {
+            let mut genesis = create_genesis_block(GenesisConfig {
+                miner_address,
+                timestamp,
+            });
+            genesis.header.difficulty = difficulty;
+            let result = mine_prepared_block(
+                genesis,
+                &self.consensus,
+                MiningConfig {
+                    difficulty,
+                    start_nonce: 0,
+                    max_attempts,
+                    transaction_limit: 0,
+                    min_fee_rate: 0,
+                },
+            )?
+            .ok_or(NodeError::MiningExhausted)?;
+            self.apply_block(result.block.clone())?;
+            return Ok(result);
+        }
         let result = mine_candidate_block(
             &self.mempool,
             &self.extension_mempool,

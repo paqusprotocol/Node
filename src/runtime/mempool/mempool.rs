@@ -105,19 +105,6 @@ impl Mempool {
         self.insert_unchecked(transaction, now, None)
     }
 
-    pub fn insert_at_with_cache(
-        &mut self,
-        transaction: SignedTransaction,
-        now: u64,
-        cache: &mut CoreCache,
-    ) -> Result<TransactionHash, MempoolError> {
-        self.prune_expired(now);
-        self.validate_timestamp_policy(&transaction, now)?;
-        cache.validate_signed_transaction_at(&transaction, now)?;
-        self.validate_fee_policy(&transaction)?;
-        self.insert_unchecked(transaction, now, None)
-    }
-
     pub fn insert_validated(
         &mut self,
         ledger: &Ledger,
@@ -295,27 +282,6 @@ impl Mempool {
             ));
         }
         Ok(())
-    }
-
-    pub fn validate_against_ledger(
-        &self,
-        ledger: &Ledger,
-        transaction: &SignedTransaction,
-    ) -> Result<(), MempoolError> {
-        transaction.validate_signed()?;
-        self.validate_fee_policy(transaction)?;
-        self.validate_against_ledger_excluding(ledger, transaction, None)
-    }
-
-    pub fn validate_against_ledger_with_cache(
-        &self,
-        ledger: &Ledger,
-        transaction: &SignedTransaction,
-        cache: &mut CoreCache,
-    ) -> Result<(), MempoolError> {
-        cache.validate_signed_transaction(transaction)?;
-        self.validate_fee_policy(transaction)?;
-        self.validate_against_ledger_excluding_with_cache(ledger, transaction, None, cache)
     }
 
     fn validate_against_ledger_excluding(
@@ -497,10 +463,6 @@ impl Mempool {
 
     pub fn len(&self) -> usize {
         self.transactions.len()
-    }
-
-    pub fn total_bytes(&self) -> usize {
-        self.total_bytes
     }
 
     pub fn mempool_pressure_bps(&self) -> u64 {
@@ -759,24 +721,6 @@ mod tests {
         Address([byte; 20])
     }
 
-    fn signed_transaction_from(
-        secret_key: &SecretKey,
-        public_key: PublicKey,
-        to: Address,
-        amount: u64,
-        nonce: u64,
-    ) -> SignedTransaction {
-        signed_transaction_from_with_fee_at(
-            secret_key,
-            public_key,
-            to,
-            amount,
-            crate::runtime::params::DEFAULT_TRANSACTION_FEE,
-            nonce,
-            current_unix_timestamp(),
-        )
-    }
-
     fn signed_transaction_from_with_fee_at(
         secret_key: &SecretKey,
         public_key: PublicKey,
@@ -936,7 +880,7 @@ mod tests {
         let keypair = generate_keypair();
         let sender = address_from_public_key(&keypair.public_key);
         let mut ledger = Ledger::new();
-        ledger.create_account(sender, Amount(100)).unwrap();
+        ledger.create_account(sender, Amount(100_000)).unwrap();
 
         let mut mempool = Mempool::with_config(MempoolConfig {
             min_relay_fee: 1,
@@ -1090,15 +1034,31 @@ mod tests {
     fn candidate_selection_respects_block_height_validity_window() {
         let keypair = generate_keypair();
         let sender = address_from_public_key(&keypair.public_key);
+        let validity = ValidityWindow::new(Height(5), Height(7)).unwrap();
+        let template = Transaction::new_at(
+            sender,
+            address(2),
+            Amount(1),
+            Amount(0),
+            Nonce(0),
+            current_unix_timestamp(),
+        )
+        .with_validity_window(validity);
+        let template_signature = sign(&keypair.secret_key, &template.signing_bytes());
+        let template = SignedTransaction::new(template, keypair.public_key, template_signature);
+        let fee = required_fee_for_rate(
+            crate::runtime::params::DEFAULT_MIN_RELAY_FEE,
+            template.virtual_size(),
+        );
         let payload = Transaction::new_at(
             sender,
             address(2),
             Amount(1),
-            Amount(crate::runtime::params::DEFAULT_TRANSACTION_FEE),
+            Amount(fee),
             Nonce(0),
             current_unix_timestamp(),
         )
-        .with_validity_window(ValidityWindow::new(Height(5), Height(7)).unwrap());
+        .with_validity_window(validity);
         let signature = sign(&keypair.secret_key, &payload.signing_bytes());
         let signed = SignedTransaction::new(payload, keypair.public_key, signature);
         let mut mempool = Mempool::new();
@@ -1133,8 +1093,8 @@ mod tests {
         let to = address(2);
         let miner = address(9);
         let mut ledger = Ledger::new();
-        ledger.create_account(low_sender, Amount(100)).unwrap();
-        ledger.create_account(high_sender, Amount(100)).unwrap();
+        ledger.create_account(low_sender, Amount(100_000)).unwrap();
+        ledger.create_account(high_sender, Amount(100_000)).unwrap();
         ledger.create_account(to, Amount(0)).unwrap();
         ledger.create_account(miner, Amount(0)).unwrap();
         ledger
