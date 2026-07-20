@@ -23,7 +23,7 @@ serde_json = "1"
 socket2 = "0.6.4"
 lmdb = { package = "lmdb-rkv", version = "0.14" }
 tokio = { version = "1", features = ["full"] }
-paqus = { git = "https://github.com/paqusprotocol/paqus.git", rev = "9eb63eda2e863cb887dcc04e80955182bf6ec226" }
+paqus = "=0.2.8"
 
 [workspace]
 resolver = "3"

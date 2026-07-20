@@ -120,8 +120,8 @@ Non-mining nodes obtain that genesis block through peer synchronization.
 ## Current Consensus Timing and Economics
 
 ```text
-Protocol version:          1
-Storage version:           1
+Protocol version:          2
+Storage version:           2
 Target block time:         5 minutes
 Transaction confirmation: 5 blocks  (~25 minutes)
 Hard finality:             50 blocks (~4 hours 10 minutes)
@@ -133,9 +133,8 @@ Genesis premine:           none
 ```
 
 The first miner creates height 0 with its address and timestamp. Protocol and
-storage identifiers remain version 1; because the storage schema has evolved,
-operators should initialize fresh storage rather than reuse an older version-1
-database without an explicit migration.
+storage identifiers are version 2. Operators must initialize fresh storage
+rather than reuse a version-1 database without an explicit migration.
 
 Check the node from another terminal:
 
@@ -259,7 +258,7 @@ to_height=200
 Filters may be combined. List responses contain `total`, `offset`, `limit`, and
 the paginated `events`; each event includes its canonical ID and typed payload.
 Unknown event kinds, invalid height ranges, and out-of-range limits return HTTP
-400. Storage schema version 1 is required.
+400. Storage schema version 2 is required.
 
 ### Finalized event stream
 
@@ -649,7 +648,7 @@ and QCash transactions.
 
 ## Recent Changes
 
-- Pins the `paqus` core Git revision so this repository builds independently.
+- Uses the published `paqus` 0.2.8 core crate so this repository builds independently.
 - Exposes `confirmation_depth` and `finality_depth` separately through node info.
 - Uses `CONFIRMATION_DEPTH` for available balance, while hard finality remains a reorg boundary.
 - Validates canonical blocks again when storing or loading them from LMDB.

@@ -29,7 +29,7 @@ pub mod params {
     const DAY: u64 = 24 * 60 * MINUTE;
 
     // Initial storage schema for the SHA3-512 chain with per-block ASERT difficulty.
-    pub const STORAGE_VERSION: u8 = 1;
+    pub const STORAGE_VERSION: u8 = 2;
     pub const MAX_RELAY_TRANSACTION_AGE_SECS: u64 = DAY;
     pub const MAX_RELAY_TRANSACTION_FUTURE_SECS: u64 = BLOCK_TIME as u64;
     pub const LOW_FEE_EXPIRY_SECS: u64 = 30 * MINUTE;

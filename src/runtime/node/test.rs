@@ -2,7 +2,7 @@ use super::Node;
 use crate::runtime::params::{BASE_FEE, BLOCK_REWARD_MATURITY, CONFIRMATION_DEPTH};
 use paqus::block::{Block, BlockError, Height, Nonce};
 use paqus::consensus::supply::Amount;
-use paqus::consensus::{Consensus, ConsensusConfig, ConsensusError, DIFFICULTY_START};
+use paqus::consensus::{Consensus, ConsensusConfig, ConsensusError, MIN_DIFFICULTY};
 use paqus::crypto::{
     Address, HASH_SIZE, Hash, KeyPair, PreviousHash, address_from_public_key, generate_keypair,
     sign,
@@ -158,7 +158,7 @@ fn leaves_new_storage_empty_until_first_miner_creates_genesis() {
     let timestamp = 1_700_000_123;
 
     assert_eq!(node.tip_height(), None);
-    assert_eq!(node.next_difficulty().unwrap(), DIFFICULTY_START);
+    assert_eq!(node.next_difficulty().unwrap(), MIN_DIFFICULTY);
 
     let result = node.mine_block(miner, timestamp, 100, 10).unwrap();
     assert!(result.block.is_genesis());
