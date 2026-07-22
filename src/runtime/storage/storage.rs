@@ -926,6 +926,7 @@ fn event_addresses(kind: &ProtocolEventKind) -> Vec<Address> {
         } => vec![*signer, *recipient],
         ProtocolEventKind::GenesisAllocation { recipient, .. } => vec![*recipient],
         ProtocolEventKind::CoinbasePaid { miner, .. } => vec![*miner],
+        ProtocolEventKind::MinerFeeRevenue { miner, .. } => vec![*miner],
     };
     let mut unique = std::collections::BTreeSet::new();
     unique.extend(addresses);

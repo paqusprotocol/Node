@@ -151,6 +151,48 @@ async fn rpc_qcash_mempool(State(state): State<RpcState>) -> impl IntoResponse {
     }
 }
 
+async fn rpc_qcash_coin(
+    State(state): State<RpcState>,
+    AxumPath(coin_id): AxumPath<String>,
+) -> impl IntoResponse {
+    let bytes = match hex::decode(&coin_id) {
+        Ok(bytes) => bytes,
+        Err(_) => return rpc_error(StatusCode::BAD_REQUEST, "invalid_coin_id"),
+    };
+    let Ok(bytes) = <[u8; paqus::crypto::HASH_SIZE]>::try_from(bytes.as_slice()) else {
+        return rpc_error(StatusCode::BAD_REQUEST, "invalid_coin_id");
+    };
+    let id = paqus::state::CashCoinId(bytes);
+    match state.node.lock() {
+        Ok(node) => {
+            let tip_height = node.tip_height().unwrap_or(Height(0));
+            let Some(coin) = node.ledger.qcash_utxos.coin(id) else {
+                return Json(serde_json::json!({
+                    "coin_id": coin_id,
+                    "status": "spent_or_unknown",
+                    "height": tip_height.0,
+                }))
+                .into_response();
+            };
+            let status = match coin.status_at(tip_height) {
+                paqus::state::QCashUtxoStatus::Pending => "pending",
+                paqus::state::QCashUtxoStatus::Spendable => "spendable",
+            };
+            Json(serde_json::json!({
+                "coin_id": coin_id,
+                "status": status,
+                "height": tip_height.0,
+                "issued_height": coin.issued_height.0,
+                "maturity_height": coin.issued_height.0.saturating_add(QCASH_WITHDRAW_MATURITY as u64),
+                "denomination": coin.denomination.xpq(),
+                "withdrawer": address_to_string(&coin.withdrawer),
+            }))
+            .into_response()
+        }
+        Err(_) => rpc_error(StatusCode::INTERNAL_SERVER_ERROR, "state_lock_failed"),
+    }
+}
+
 
 fn block_response(node: &Node, block: &Block, status: Option<&'static str>) -> BlockResponse {
     let block_hash = block.hash();
@@ -506,6 +548,25 @@ fn chain_stats(node: &Node) -> Result<ChainStatsResponse, String> {
     let average_transfer_amount = total_transfer_volume
         .checked_div(total_transactions)
         .unwrap_or(0);
+    let onchain_supply = node
+        .ledger
+        .total_supply()
+        .map_err(|error| format!("failed to calculate on-chain supply: {error}"))?
+        .0;
+    let qcash_offchain_supply = node
+        .ledger
+        .qcash_utxos
+        .total_value()
+        .map_err(|error| format!("failed to calculate QCash supply: {error}"))?
+        .0;
+    let qcash_spendable_supply = node
+        .ledger
+        .qcash_utxos
+        .spendable_balance_at(Height(tip))
+        .map_err(|error| format!("failed to calculate spendable QCash supply: {error}"))?
+        .0;
+    let qcash_pending_supply = qcash_offchain_supply.saturating_sub(qcash_spendable_supply);
+    let total_known_supply = onchain_supply.saturating_add(qcash_offchain_supply);
     let current_supply = GENESIS_PREMINE.saturating_add(mined_supply);
     let average_block_time_secs = total_block_time_secs.checked_div(block_time_samples);
 
@@ -518,6 +579,11 @@ fn chain_stats(node: &Node) -> Result<ChainStatsResponse, String> {
         target_block_time_secs: BLOCK_TIME,
         genesis_premine: GENESIS_PREMINE,
         mined_supply,
+        onchain_supply,
+        qcash_offchain_supply,
+        qcash_spendable_supply,
+        qcash_pending_supply,
+        total_known_supply,
         current_supply,
         total_coinbase_rewards,
         total_fees_collected,

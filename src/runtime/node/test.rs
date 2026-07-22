@@ -95,9 +95,7 @@ fn submits_transaction_to_mempool() {
     ledger.create_account(address(2), Amount(0)).unwrap();
     let mut node = Node::temporary(
         ledger,
-        Consensus {
-            config: ConsensusConfig { difficulty: 0 },
-        },
+        Consensus::new(ConsensusConfig::new(paqus::consensus::MIN_DIFFICULTY)).unwrap(),
     )
     .unwrap();
 
@@ -128,9 +126,7 @@ fn mines_and_applies_block_from_mempool() {
         .unwrap();
     let mut node = Node::temporary(
         ledger,
-        Consensus {
-            config: ConsensusConfig { difficulty: 0 },
-        },
+        Consensus::new(ConsensusConfig::new(paqus::consensus::MIN_DIFFICULTY)).unwrap(),
     )
     .unwrap();
 
@@ -150,9 +146,7 @@ fn mines_and_applies_block_from_mempool() {
 #[test]
 fn leaves_new_storage_empty_until_first_miner_creates_genesis() {
     let dir = tempfile_dir();
-    let consensus = Consensus {
-        config: ConsensusConfig { difficulty: 0 },
-    };
+    let consensus = Consensus::new(ConsensusConfig::new(paqus::consensus::MIN_DIFFICULTY)).unwrap();
     let mut node = Node::init_or_load(&dir, consensus).unwrap();
     let miner = address(7);
     let timestamp = 1_700_000_123;
@@ -190,9 +184,7 @@ fn stores_side_fork_without_changing_active_tip_when_work_is_lower() {
     let mut node = Node::with_genesis_accounts(
         ledger,
         crate::runtime::storage::Storage::temporary().unwrap(),
-        Consensus {
-            config: ConsensusConfig { difficulty: 0 },
-        },
+        Consensus::new(ConsensusConfig::new(paqus::consensus::MIN_DIFFICULTY)).unwrap(),
         genesis_accounts,
     );
 
@@ -240,9 +232,7 @@ fn rejects_block_timestamp_too_far_in_future() {
     ledger.chain.insert_block(genesis.clone()).unwrap();
     let mut node = Node::temporary(
         ledger,
-        Consensus {
-            config: ConsensusConfig { difficulty: 0 },
-        },
+        Consensus::new(ConsensusConfig::new(paqus::consensus::MIN_DIFFICULTY)).unwrap(),
     )
     .unwrap();
     let mut block = block(1, genesis.hash(), 1, 1);
@@ -296,9 +286,7 @@ fn reorgs_state_when_side_fork_becomes_best_tip() {
     let mut node = Node::with_genesis_accounts(
         ledger,
         crate::runtime::storage::Storage::temporary().unwrap(),
-        Consensus {
-            config: ConsensusConfig { difficulty: 0 },
-        },
+        Consensus::new(ConsensusConfig::new(paqus::consensus::MIN_DIFFICULTY)).unwrap(),
         genesis_accounts,
     );
 
@@ -367,9 +355,7 @@ fn reports_confirmed_available_and_pending_balances() {
     let mut node = Node::with_genesis_accounts(
         ledger,
         crate::runtime::storage::Storage::temporary().unwrap(),
-        Consensus {
-            config: ConsensusConfig { difficulty: 0 },
-        },
+        Consensus::new(ConsensusConfig::new(paqus::consensus::MIN_DIFFICULTY)).unwrap(),
         genesis_accounts,
     );
     let pending_transaction = signed_transaction_from_keypair(&keypair, receiver, 5, 11);
@@ -460,9 +446,7 @@ fn keeps_mining_rewards_unspendable_until_maturity() {
     let mut node = Node::with_genesis_accounts(
         ledger,
         crate::runtime::storage::Storage::temporary().unwrap(),
-        Consensus {
-            config: ConsensusConfig { difficulty: 0 },
-        },
+        Consensus::new(ConsensusConfig::new(paqus::consensus::MIN_DIFFICULTY)).unwrap(),
         genesis_accounts,
     );
 

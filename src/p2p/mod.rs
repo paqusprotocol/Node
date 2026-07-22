@@ -184,9 +184,9 @@ pub fn poll_peer_connection(
     public_addrs: &[SocketAddr],
     sync_window: u64,
 ) -> Result<PeerPoll, String> {
-    println!("peer {} handshake start", peer.addr());
+    println!("[P2P] handshake_start peer={}", peer.addr());
     handshake_peer(peer, node, public_addrs)?;
-    println!("peer {} handshake ok; requesting tip", peer.addr());
+    println!("[P2P] handshake_ok peer={}", peer.addr());
     let tip = request_tip(peer)?;
     let local_height = node
         .lock()
@@ -194,7 +194,7 @@ pub fn poll_peer_connection(
         .tip_height()
         .map(|height| height.0);
     println!(
-        "peer {} tip check:: |local::{}|remote::{}|",
+        "[P2P] tip_check peer={} local={} remote={}",
         peer.addr(),
         local_height
             .map(|height| height.to_string())
@@ -229,7 +229,7 @@ pub fn poll_peer_connection(
     let sync_window = sync_window.clamp(MIN_BLOCKS_PER_SYNC, MAX_BLOCKS_PER_SYNC);
     let target = tip.0.min(ancestor.height.0.saturating_add(sync_window));
     println!(
-        "peer {} sync plan:: |ancestor::{}|target::{}|remote_tip::{}|window::{}|",
+        "[SYNC] plan peer={} ancestor={} target={} remote_tip={} window={}",
         peer.addr(),
         ancestor.height.0,
         target,
@@ -241,14 +241,14 @@ pub fn poll_peer_connection(
     }
     let start = Height(ancestor.height.0.saturating_add(1));
     println!(
-        "peer {} requesting headers:: |start::{}|target::{}|",
+        "[SYNC] request_headers peer={} start={} target={}",
         peer.addr(),
         start.0,
         target
     );
     let headers = request_headers(peer, start, target, ancestor.hash)?;
     println!(
-        "peer {} headers ok:: |count::{}|start::{}|target::{}|",
+        "[SYNC] headers_ok peer={} count={} start={} target={}",
         peer.addr(),
         headers.len(),
         start.0,
@@ -280,18 +280,18 @@ pub fn sync_from_peers_parallel(
         let mut peer = match PeerConnection::connect(addr) {
             Ok(peer) => peer,
             Err(error) => {
-                eprintln!("parallel sync candidate {addr} connect failed: {error}");
+                eprintln!("[SYNC] candidate_connect_failed peer={addr} error=\"{error}\"");
                 continue;
             }
         };
         if let Err(error) = handshake_peer(&mut peer, node, public_addrs) {
-            eprintln!("parallel sync candidate {addr} handshake failed: {error}");
+            eprintln!("[SYNC] candidate_handshake_failed peer={addr} error=\"{error}\"");
             continue;
         }
         match request_tip(&mut peer) {
             Ok(tip) if tip.0 > local_height => candidates.push((addr, tip)),
             Ok(_) => {}
-            Err(error) => eprintln!("parallel sync candidate {addr} tip failed: {error}"),
+            Err(error) => eprintln!("[SYNC] candidate_tip_failed peer={addr} error=\"{error}\""),
         }
     }
 
@@ -389,7 +389,7 @@ pub fn sync_from_peers_parallel(
     }
 
     println!(
-        "parallel synced blocks through height {} |peers::{}|tip::{}|",
+        "[SYNC] applied through_height={} peers={} tip={}",
         expected_height.saturating_sub(1),
         used_peers.len(),
         node.tip_hash()
@@ -849,7 +849,7 @@ fn request_block_by_hash(
         )
     })?;
     println!(
-        "synced missing parent {} from {} |tip::{}|",
+        "[SYNC] missing_parent hash={} peer={} tip={}",
         hex::encode(hash.0),
         peer.addr(),
         node.tip_hash()

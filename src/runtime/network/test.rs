@@ -351,9 +351,7 @@ fn handler_returns_mempool_inventory_and_data_by_hash() {
     ledger.create_account(address(2), Amount(0)).unwrap();
     let mut node = Node::temporary(
         ledger,
-        Consensus {
-            config: ConsensusConfig { difficulty: 0 },
-        },
+        Consensus::new(ConsensusConfig::new(paqus::consensus::MIN_DIFFICULTY)).unwrap(),
     )
     .unwrap();
     node.submit_transaction(transaction.clone()).unwrap();
@@ -384,9 +382,7 @@ fn handler_submits_transaction_to_node_mempool() {
     ledger.create_account(address(2), Amount(0)).unwrap();
     let mut node = Node::temporary(
         ledger,
-        Consensus {
-            config: ConsensusConfig { difficulty: 0 },
-        },
+        Consensus::new(ConsensusConfig::new(paqus::consensus::MIN_DIFFICULTY)).unwrap(),
     )
     .unwrap();
 
@@ -403,9 +399,7 @@ fn test_node_with_genesis() -> Node {
     ledger.chain.insert_block(block).unwrap();
     Node::temporary(
         ledger,
-        Consensus {
-            config: ConsensusConfig { difficulty: 0 },
-        },
+        Consensus::new(ConsensusConfig::new(paqus::consensus::MIN_DIFFICULTY)).unwrap(),
     )
     .unwrap()
 }

@@ -84,7 +84,7 @@ pub fn broadcast_to_peers(
     let peers = match peers.lock() {
         Ok(peers) => peers.keys().copied().collect::<Vec<_>>(),
         Err(_) => {
-            eprintln!("peer state lock poisoned");
+            eprintln!("[P2P] peer_state_lock_poisoned");
             return BroadcastReport::default();
         }
     };
@@ -104,7 +104,7 @@ pub fn broadcast_to_peers(
                 Ok(connections) => connections,
                 Err(_) => {
                     report.failed += 1;
-                    eprintln!("peer connection lock poisoned");
+                    eprintln!("[P2P] peer_connection_lock_poisoned");
                     continue;
                 }
             };
@@ -112,7 +112,7 @@ pub fn broadcast_to_peers(
                 if let std::collections::hash_map::Entry::Vacant(e) = connections.entry(peer) {
                     match PeerConnection::connect(peer) {
                         Ok(connection) => {
-                            println!("p2p outbound:: |peer::{peer}|event::connected|");
+                            println!("[P2P] connected peer={peer}");
                             e.insert(connection);
                             Ok(())
                         }
@@ -135,14 +135,14 @@ pub fn broadcast_to_peers(
                 if let Ok(mut connections) = peer_connections.lock() {
                     connections.remove(&peer);
                 }
-                eprintln!("broadcast to {peer} failed: {error}");
+                eprintln!("[P2P] broadcast_failed peer={peer} error=\"{error}\"");
             }
         }
     }
     let inbound_peers = match inbound_connections.lock() {
         Ok(connections) => connections.keys().copied().collect::<Vec<_>>(),
         Err(_) => {
-            eprintln!("inbound connection lock poisoned");
+            eprintln!("[P2P] inbound_connection_lock_poisoned");
             Vec::new()
         }
     };
@@ -156,7 +156,7 @@ pub fn broadcast_to_peers(
                 Ok(connections) => connections,
                 Err(_) => {
                     report.failed += 1;
-                    eprintln!("inbound connection lock poisoned");
+                    eprintln!("[P2P] inbound_connection_lock_poisoned");
                     continue;
                 }
             };
@@ -172,7 +172,7 @@ pub fn broadcast_to_peers(
                 if let Ok(mut connections) = inbound_connections.lock() {
                     connections.remove(&peer);
                 }
-                eprintln!("broadcast to inbound {peer} failed: {error}");
+                eprintln!("[P2P] broadcast_inbound_failed peer={peer} error=\"{error}\"");
             }
         }
     }

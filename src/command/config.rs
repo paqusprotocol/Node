@@ -1,6 +1,6 @@
 use crate::command::parse::{address, address_string, secret_key};
 use crate::runtime;
-use paqus::crypto::{Address, SecretKey};
+use paqus::crypto::{Address, SecretKey, address_from_public_key, derive_public_key};
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::fs;
@@ -113,8 +113,8 @@ impl Default for RunConfig {
             miner_secret_key: None,
             miner_min_fee_rate: None,
             mine: false,
-            mine_interval: Duration::ZERO,
-            mine_attempts: 100_000,
+            mine_interval: Duration::from_secs(1),
+            mine_attempts: 1_000_000,
         }
     }
 }
@@ -267,8 +267,7 @@ pub fn parse(args: &[String]) -> Result<RunConfig, String> {
             }
             "--wallet" => {
                 index += 1;
-                config.miner_address =
-                    encrypted_wallet_address(required(&args, index, "--wallet")?)?;
+                config.miner_address = wallet_address(required(&args, index, "--wallet")?)?;
             }
             "--miner-secret-key" => {
                 index += 1;
@@ -382,7 +381,7 @@ fn apply_file(config: &mut RunConfig, file: RunConfigFile) -> Result<(), String>
     config.mine_interval = Duration::from_secs(file.mine_interval_secs);
     config.mine_attempts = file.mine_attempts;
     if let Some(path) = file.wallet {
-        config.miner_address = encrypted_wallet_address(&path)?;
+        config.miner_address = wallet_address(&path)?;
     }
     if let Some(value) = file.miner_address {
         config.miner_address = address(Some(&value))?;
@@ -421,20 +420,30 @@ fn normalize(config: &mut RunConfig) {
 }
 
 #[derive(Deserialize)]
-struct EncryptedMiningWalletFile {
+struct WalletFile {
     version: u8,
     address: String,
-    kdf: String,
+    secret_key: String,
 }
 
-pub fn encrypted_wallet_address(path: &str) -> Result<Address, String> {
+pub fn wallet_address(path: &str) -> Result<Address, String> {
     let bytes = fs::read(path)
         .map_err(|error| format!("failed to read mining wallet `{path}`: {error}"))?;
-    let wallet: EncryptedMiningWalletFile = serde_json::from_slice(&bytes)
-        .map_err(|error| format!("invalid encrypted mining wallet `{path}`: {error}"))?;
-    if wallet.version != 1 || wallet.kdf != "argon2id" {
-        return Err(format!("unsupported encrypted mining wallet `{path}`"));
+    let wallet: WalletFile = serde_json::from_slice(&bytes)
+        .map_err(|error| format!("invalid plaintext mining wallet `{path}`: {error}"))?;
+    if wallet.version != 1 {
+        return Err(format!("unsupported plaintext mining wallet `{path}`"));
     }
-    address_string(&wallet.address)
-        .map_err(|_| format!("invalid address in mining wallet `{path}`"))
+    let address = address_string(&wallet.address)
+        .map_err(|_| format!("invalid address in mining wallet `{path}`"))?;
+    let secret_key = secret_key(Some(&wallet.secret_key))
+        .map_err(|error| format!("invalid secret_key in mining wallet `{path}`: {error}"))?;
+    let public_key = derive_public_key(&secret_key);
+    let derived_address = address_from_public_key(&public_key);
+    if derived_address != address {
+        return Err(format!(
+            "mining wallet `{path}` address does not match secret_key"
+        ));
+    }
+    Ok(address)
 }

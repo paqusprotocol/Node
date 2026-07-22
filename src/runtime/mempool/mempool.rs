@@ -666,8 +666,8 @@ impl Mempool {
             }
             block.refresh_commitments();
         }
-        let state_root = ledger.state_root_after_block(&block)?;
-        block.set_state_root(state_root);
+        let (_, execution) = ledger.execute_block(&block)?;
+        block.set_state_root(execution.state_root_after);
         Ok(block)
     }
 

@@ -11,13 +11,19 @@ fn protocol_event_kind_name(kind: &ProtocolEventKind) -> &'static str {
         ProtocolEventKind::QCashDeposited { .. } => "qcash_deposited",
         ProtocolEventKind::GenesisAllocation { .. } => "genesis_allocation",
         ProtocolEventKind::CoinbasePaid { .. } => "coinbase_paid",
+        ProtocolEventKind::MinerFeeRevenue { .. } => "miner_fee_revenue",
     }
 }
 
 fn is_protocol_event_kind(kind: &str) -> bool {
     matches!(
         kind,
-        "transfer" | "qcash_withdrawn" | "qcash_deposited" | "genesis_allocation" | "coinbase_paid"
+        "transfer"
+            | "qcash_withdrawn"
+            | "qcash_deposited"
+            | "genesis_allocation"
+            | "coinbase_paid"
+            | "miner_fee_revenue"
     )
 }
 
@@ -86,6 +92,7 @@ pub(crate) fn protocol_event_involves_address(kind: &ProtocolEventKind, address:
         } => signer == address || recipient == address,
         ProtocolEventKind::GenesisAllocation { recipient, .. } => recipient == address,
         ProtocolEventKind::CoinbasePaid { miner, .. } => miner == address,
+        ProtocolEventKind::MinerFeeRevenue { miner, .. } => miner == address,
     }
 }
 
@@ -301,4 +308,3 @@ async fn rpc_address_events(
         Err(_) => rpc_error(StatusCode::INTERNAL_SERVER_ERROR, "state_lock_failed"),
     }
 }
-

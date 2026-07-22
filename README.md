@@ -402,6 +402,9 @@ Common `node run` options:
 --miner-secret-key <secret-key-hex>
 ```
 
+Set `--mine-attempts 0` to mine continuously and rebuild the candidate every
+`--mine-interval-secs` seconds so new mempool transactions can be included.
+
 `--listen` and `--public-addr` can be repeated. Use one IPv4 address and one
 IPv6 address when the node should accept and announce both address families.
 

@@ -126,6 +126,11 @@ struct ChainStatsResponse {
     target_block_time_secs: u32,
     genesis_premine: u64,
     mined_supply: u64,
+    onchain_supply: u64,
+    qcash_offchain_supply: u64,
+    qcash_spendable_supply: u64,
+    qcash_pending_supply: u64,
+    total_known_supply: u64,
     current_supply: u64,
     total_coinbase_rewards: u64,
     total_fees_collected: u64,
@@ -316,6 +321,7 @@ pub(crate) fn start_rpc_server(
         .route("/accounts", get(rpc_accounts))
         .route("/mempool", get(rpc_mempool))
         .route("/qcash/mempool", get(rpc_qcash_mempool))
+        .route("/qcash/coin/{coin_id}", get(rpc_qcash_coin))
         .route("/mining/template", get(rpc_mining_template))
         .route("/mining/submit", post(rpc_submit_mined_block))
         .route("/tx", post(rpc_submit_tx))
@@ -331,7 +337,7 @@ pub(crate) fn start_rpc_server(
             let runtime = match tokio::runtime::Runtime::new() {
                 Ok(runtime) => runtime,
                 Err(error) => {
-                    eprintln!("failed to start rpc runtime: {error}");
+                    eprintln!("[RPC] runtime_failed error=\"{error}\"");
                     return;
                 }
             };
@@ -339,13 +345,13 @@ pub(crate) fn start_rpc_server(
                 let listener = match tokio::net::TcpListener::bind(addr).await {
                     Ok(listener) => listener,
                     Err(error) => {
-                        eprintln!("failed to bind rpc {addr}: {error}");
+                        eprintln!("[RPC] bind_failed addr={addr} error=\"{error}\"");
                         return;
                     }
                 };
-                println!("rpc listening on {addr}");
+                println!("[RPC] listening addr={addr}");
                 if let Err(error) = axum::serve(listener, app).await {
-                    eprintln!("rpc server failed: {error}");
+                    eprintln!("[RPC] server_failed error=\"{error}\"");
                 }
             });
         })

@@ -50,9 +50,10 @@ pub fn print_help() {
 paqusd
 
 Usage:
-  paqusd                         Run the node daemon with default config
+  paqusd                         Run the node; auto-mines when ../wallet.json or wallet.json exists
   paqusd --help
   paqusd version
+  paqusd mine [wallet-path] [db-path]
   paqusd node info
   paqusd node config [config-path]
   paqusd node init [db-path] [miner-address]
@@ -82,9 +83,8 @@ RPC:
 
 To bootstrap mining with your own account:
   1. Create a wallet: wallet-cli new wallet.json
-  2. Create config: paqusd node config
-  3. Edit ./data/paqus/node.json once
-  4. Run: paqusd
+  2. Run from node/: cargo run
+  3. Or explicitly: cargo run -- mine ../wallet.json ./data/paqus
 "
     );
 }

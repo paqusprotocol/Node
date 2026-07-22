@@ -1,5 +1,5 @@
 use super::MempoolError;
-use crate::runtime::params::MAX_MEMPOOL_TXS;
+use crate::runtime::params::{DEFAULT_MIN_RELAY_FEE, FEE_RATE_UNIT_BYTES, MAX_MEMPOOL_TXS};
 use paqus::block::{Block, BlockHeight, MAX_BLOCK_SIZE, MAX_BLOCK_WEIGHT};
 use paqus::crypto::{Address, TransactionHash};
 use paqus::ledger::Ledger;
@@ -33,6 +33,11 @@ impl ExtensionMempool {
         }
         if self.transactions.len() >= MAX_MEMPOOL_TXS {
             return Err(MempoolError::MempoolFull);
+        }
+        if transaction.fee().0
+            < required_fee_for_rate(DEFAULT_MIN_RELAY_FEE, transaction.virtual_size())
+        {
+            return Err(MempoolError::FeeTooLow);
         }
         let hash = transaction.hash();
         let signer = transaction.signer();
@@ -174,6 +179,16 @@ fn fee_rate(fee: u64, virtual_size: usize) -> u64 {
     fee.saturating_mul(crate::runtime::params::FEE_RATE_UNIT_BYTES as u64) / virtual_size as u64
 }
 
+fn required_fee_for_rate(rate: u64, virtual_size: usize) -> u64 {
+    if rate == 0 || virtual_size == 0 {
+        return 0;
+    }
+    (virtual_size as u64)
+        .saturating_mul(rate)
+        .saturating_add(FEE_RATE_UNIT_BYTES as u64 - 1)
+        / FEE_RATE_UNIT_BYTES as u64
+}
+
 fn refresh_block_fees_and_commitments(block: &mut Block) {
     if let Ok(fees) = block.checked_total_fees()
         && let Some(coinbase) = &mut block.coinbase
@@ -230,17 +245,23 @@ mod tests {
         Address, TransactionHash, address_from_public_key, generate_keypair, sign,
     };
     use paqus::qcash::{
-        CashCoinFile, CashDenomination, DepositCashMetadata, WithdrawCashMetadata,
-        cash_coin_commitment,
+        CashCoinFile, CashDenomination, WithdrawCashMetadata, cash_coin_commitment,
     };
     use paqus::transaction::{QCashTransaction, SignedQCashTransaction};
 
     fn signed_deposit(
         keypair: &paqus::crypto::KeyPair,
-        metadata: DepositCashMetadata,
+        file: &CashCoinFile,
     ) -> SignedProtocolTransaction {
         let signer = address_from_public_key(&keypair.public_key);
-        let transaction = QCashTransaction::deposit(signer, signer, Amount(0), Nonce(0), metadata);
+        let transaction = QCashTransaction::deposit_from_files(
+            signer,
+            signer,
+            Amount(0),
+            Nonce(0),
+            &[file.clone()],
+        )
+        .unwrap();
         let signature = sign(&keypair.secret_key, &transaction.signing_bytes());
         SignedQCashTransaction::new(transaction, keypair.public_key, signature).into()
     }
@@ -269,14 +290,8 @@ mod tests {
         let second_signer = address_from_public_key(&second_keypair.public_key);
         ledger.create_account(first_signer, Amount(0)).unwrap();
         ledger.create_account(second_signer, Amount(0)).unwrap();
-        let first = signed_deposit(
-            &first_keypair,
-            DepositCashMetadata::new(&[file], first_signer).unwrap(),
-        );
-        let second = signed_deposit(
-            &second_keypair,
-            DepositCashMetadata::new(&[file], second_signer).unwrap(),
-        );
+        let first = signed_deposit(&first_keypair, &file);
+        let second = signed_deposit(&second_keypair, &file);
         let mut pool = ExtensionMempool::new();
         let first_hash = pool.insert_validated(&ledger, first).unwrap();
         assert_eq!(

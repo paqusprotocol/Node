@@ -383,12 +383,6 @@ impl Node {
         );
     }
 
-    pub fn has_pending_sync_work(&self) -> bool {
-        !self.orphan_blocks.is_empty()
-            || !self.missing_parent_requests.is_empty()
-            || !self.missing_parent_retry_at.is_empty()
-    }
-
     fn orphan_is_too_far_ahead(&self, block: &Block) -> bool {
         let tip_height = self.ledger.tip_height().map(|height| height.0).unwrap_or(0);
         block.height().0 > tip_height.saturating_add(MAX_ORPHAN_HEIGHT_DISTANCE)
@@ -625,14 +619,12 @@ impl Node {
             .fork_choice
             .get(&BlockHash::from(block.previous_hash().as_hash()))
             .ok_or(paqus::ledger::fork_choice::ForkChoiceError::MissingParent)?;
-        let validation_consensus = if self.consensus.config.difficulty != 0 {
+        let validation_consensus = if self.consensus.difficulty() != 0 {
             let expected_difficulty = self.next_difficulty_after_branch_tip(parent.hash)?;
             if block.difficulty() != expected_difficulty {
                 return Err(paqus::consensus::ConsensusError::UnexpectedDifficulty.into());
             }
-            Consensus::new(ConsensusConfig {
-                difficulty: expected_difficulty,
-            })?
+            Consensus::new(ConsensusConfig::new(expected_difficulty))?
         } else {
             self.consensus
         };
@@ -692,11 +684,11 @@ impl Node {
     }
 
     pub fn next_difficulty(&self) -> Result<u32, NodeError> {
-        if self.consensus.config.difficulty == 0 {
+        if self.consensus.difficulty() == 0 {
             return Ok(MIN_DIFFICULTY);
         }
         let Some(tip_height) = self.ledger.tip_height() else {
-            return Ok(self.consensus.config.difficulty.max(MIN_DIFFICULTY));
+            return Ok(self.consensus.difficulty().max(MIN_DIFFICULTY));
         };
 
         self.next_difficulty_after_tip(tip_height)
@@ -705,7 +697,7 @@ impl Node {
 
     fn next_difficulty_after_tip(&self, tip_height: BlockHeight) -> Result<u32, NodeError> {
         if tip_height == Height(0) {
-            return Ok(self.consensus.config.difficulty.max(MIN_DIFFICULTY));
+            return Ok(self.consensus.difficulty().max(MIN_DIFFICULTY));
         }
         let tip = self
             .ledger
@@ -731,7 +723,7 @@ impl Node {
             .get(&tip_hash)
             .ok_or(paqus::ledger::fork_choice::ForkChoiceError::MissingParent)?;
         if tip.height == Height(0) {
-            return Ok(self.consensus.config.difficulty.max(MIN_DIFFICULTY));
+            return Ok(self.consensus.difficulty().max(MIN_DIFFICULTY));
         }
         let anchor_hash = self
             .fork_choice
@@ -899,9 +891,7 @@ mod tests {
         let mut node = Node::with_genesis_accounts(
             ledger,
             Storage::temporary().unwrap(),
-            Consensus {
-                config: ConsensusConfig { difficulty: 0 },
-            },
+            Consensus::new(ConsensusConfig::new(paqus::consensus::MIN_DIFFICULTY)).unwrap(),
             genesis_accounts,
         );
 
@@ -950,9 +940,7 @@ mod tests {
         let mut node = Node::with_genesis_accounts(
             ledger,
             Storage::temporary().unwrap(),
-            Consensus {
-                config: ConsensusConfig { difficulty: 0 },
-            },
+            Consensus::new(ConsensusConfig::new(paqus::consensus::MIN_DIFFICULTY)).unwrap(),
             genesis_accounts,
         );
 
@@ -990,9 +978,7 @@ mod tests {
         let mut node = Node::with_genesis_accounts(
             ledger,
             Storage::temporary().unwrap(),
-            Consensus {
-                config: ConsensusConfig { difficulty: 0 },
-            },
+            Consensus::new(ConsensusConfig::new(paqus::consensus::MIN_DIFFICULTY)).unwrap(),
             BTreeMap::new(),
         );
 
@@ -1007,9 +993,7 @@ mod tests {
     fn branch_difficulty_uses_asert_anchor_on_parent_branch() {
         let mut node = Node::temporary(
             Ledger::new(),
-            Consensus {
-                config: ConsensusConfig { difficulty: 1 },
-            },
+            Consensus::new(ConsensusConfig::new(paqus::consensus::MIN_DIFFICULTY)).unwrap(),
         )
         .unwrap();
         let genesis = Block::with_difficulty(
@@ -1052,7 +1036,7 @@ mod tests {
             Nonce(0),
             vec![],
         );
-        let difficulty_two = Consensus::new(ConsensusConfig { difficulty: 2 }).unwrap();
+        let difficulty_two = Consensus::new(ConsensusConfig::new(2)).unwrap();
         while difficulty_two.validate_proof_of_work(&candidate).is_err() {
             candidate.header.nonce = Nonce(candidate.header.nonce.0 + 1);
         }
@@ -1097,9 +1081,7 @@ mod tests {
         let mut node = Node::new(
             ledger,
             storage,
-            Consensus {
-                config: ConsensusConfig { difficulty: 0 },
-            },
+            Consensus::new(ConsensusConfig::new(paqus::consensus::MIN_DIFFICULTY)).unwrap(),
         );
 
         node.index_stored_blocks().unwrap();
@@ -1146,9 +1128,7 @@ mod tests {
         let mut node = Node::with_genesis_accounts(
             ledger,
             Storage::temporary().unwrap(),
-            Consensus {
-                config: ConsensusConfig { difficulty: 0 },
-            },
+            Consensus::new(ConsensusConfig::new(paqus::consensus::MIN_DIFFICULTY)).unwrap(),
             BTreeMap::new(),
         );
 
@@ -1191,9 +1171,7 @@ mod tests {
         let mut node = Node::with_genesis_accounts(
             ledger,
             Storage::temporary().unwrap(),
-            Consensus {
-                config: ConsensusConfig { difficulty: 0 },
-            },
+            Consensus::new(ConsensusConfig::new(paqus::consensus::MIN_DIFFICULTY)).unwrap(),
             BTreeMap::new(),
         );
 
@@ -1239,9 +1217,7 @@ mod tests {
         let mut node = Node::with_genesis_accounts(
             ledger,
             Storage::temporary().unwrap(),
-            Consensus {
-                config: ConsensusConfig { difficulty: 0 },
-            },
+            Consensus::new(ConsensusConfig::new(paqus::consensus::MIN_DIFFICULTY)).unwrap(),
             BTreeMap::new(),
         );
 
@@ -1271,9 +1247,7 @@ mod tests {
         let mut node = Node::with_genesis_accounts(
             ledger,
             Storage::temporary().unwrap(),
-            Consensus {
-                config: ConsensusConfig { difficulty: 0 },
-            },
+            Consensus::new(ConsensusConfig::new(paqus::consensus::MIN_DIFFICULTY)).unwrap(),
             BTreeMap::new(),
         );
 
@@ -1315,9 +1289,7 @@ mod tests {
         let mut node = Node::with_genesis_accounts(
             ledger,
             Storage::temporary().unwrap(),
-            Consensus {
-                config: ConsensusConfig { difficulty: 0 },
-            },
+            Consensus::new(ConsensusConfig::new(paqus::consensus::MIN_DIFFICULTY)).unwrap(),
             BTreeMap::new(),
         );
 

@@ -25,27 +25,22 @@ fn parse_address_accepts_legacy_hex() {
 }
 
 #[test]
-fn mining_reads_only_address_from_encrypted_wallet() {
-    let address = Address([0xcd; 20]);
+fn mining_reads_address_from_plaintext_wallet() {
+    let keypair = paqus::crypto::generate_keypair();
+    let address = address_from_public_key(&keypair.public_key);
     let path = std::env::temp_dir().join(format!(
-        "paqus-mining-wallet-address-only-{}.json",
+        "paqus-mining-wallet-plaintext-{}.json",
         std::process::id()
     ));
     let contents = serde_json::json!({
         "version": 1,
         "address": address_to_string(&address),
-        "public_key": "not-read-by-node",
-        "kdf": "argon2id",
-        "salt": "not-read-by-node",
-        "nonce": "not-read-by-node",
-        "ciphertext": "not-read-by-node"
+        "public_key": hex::encode(keypair.public_key.0),
+        "secret_key": hex::encode(keypair.secret_key.0)
     });
     fs::write(&path, serde_json::to_vec(&contents).unwrap()).unwrap();
 
-    assert_eq!(
-        load_encrypted_wallet_address(path.to_str().unwrap()),
-        Ok(address)
-    );
+    assert_eq!(load_wallet_address(path.to_str().unwrap()), Ok(address));
     fs::remove_file(path).unwrap();
 }
 
@@ -141,7 +136,6 @@ fn protocol_event_query_filters_height_kind_and_paginates() {
             ProtocolEventKind::CoinbasePaid {
                 miner: owner,
                 subsidy: Amount(1),
-                fees: Amount(0),
             },
         ),
         ProtocolEvent::new(
@@ -162,7 +156,6 @@ fn protocol_event_query_filters_height_kind_and_paginates() {
             ProtocolEventKind::CoinbasePaid {
                 miner: owner,
                 subsidy: Amount(1),
-                fees: Amount(0),
             },
         ),
     ];

@@ -3,7 +3,7 @@ use paqus::block::{Block, Nonce};
 use paqus::consensus::{Consensus, ConsensusError};
 use paqus::crypto::Address;
 use paqus::genesis::{GenesisConfig, create_genesis_block};
-use paqus::ledger::Ledger;
+use paqus::ledger::{Ledger, LedgerError};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct MiningConfig {
@@ -70,31 +70,73 @@ pub fn prepare_candidate_block(
             transaction_limit,
             min_fee_rate,
         )
-        .map_err(|_| ConsensusError::InvalidBlock(paqus::block::BlockError::InvalidStateRoot))?;
+        .map_err(ledger_to_consensus_error)?;
     if !extension_mempool.is_empty() {
         extension_mempool.append_selected_to_block(&mut block, transaction_limit, min_fee_rate);
         block.set_state_root(paqus::crypto::StateRoot::ZERO);
-        let state_root = ledger.state_root_after_block(&block).map_err(|_| {
-            ConsensusError::InvalidBlock(paqus::block::BlockError::InvalidStateRoot)
-        })?;
-        block.set_state_root(state_root);
     }
     block.header.difficulty = difficulty;
+    block.set_state_root(paqus::crypto::StateRoot::ZERO);
+    let (_, execution) = ledger
+        .execute_block(&block)
+        .map_err(ledger_to_consensus_error)?;
+    block.set_state_root(execution.state_root_after);
     Ok(block)
 }
 
+fn ledger_to_consensus_error(error: LedgerError) -> ConsensusError {
+    match error {
+        LedgerError::InvalidConsensus(error) => error,
+        LedgerError::InvalidBlock(error) => ConsensusError::InvalidBlock(error),
+        LedgerError::InvalidBlockHeight => ConsensusError::InvalidHeight,
+        LedgerError::InvalidPreviousHash | LedgerError::InvalidParent => {
+            ConsensusError::InvalidPreviousHash
+        }
+        LedgerError::InvalidTimestamp => ConsensusError::InvalidTimestamp,
+        LedgerError::InvalidStateRoot => {
+            ConsensusError::InvalidBlock(paqus::block::BlockError::InvalidStateRoot)
+        }
+        _ => ConsensusError::InvalidBlock(paqus::block::BlockError::InvalidStateRoot),
+    }
+}
+
 pub fn mine_prepared_block(
-    mut block: Block,
+    block: Block,
     consensus: &Consensus,
     config: MiningConfig,
 ) -> Result<Option<MiningResult>, ConsensusError> {
-    for attempt in 0..config.max_attempts {
+    mine_prepared_block_until(block, consensus, config, || false)
+}
+
+pub fn mine_prepared_block_until(
+    block: Block,
+    consensus: &Consensus,
+    config: MiningConfig,
+    should_stop: impl Fn() -> bool,
+) -> Result<Option<MiningResult>, ConsensusError> {
+    mine_prepared_block_until_with_attempts(block, consensus, config, should_stop)
+        .map(|(result, _attempts)| result)
+}
+
+pub fn mine_prepared_block_until_with_attempts(
+    mut block: Block,
+    consensus: &Consensus,
+    config: MiningConfig,
+    should_stop: impl Fn() -> bool,
+) -> Result<(Option<MiningResult>, u64), ConsensusError> {
+    let max_attempts = if config.max_attempts == 0 {
+        u64::MAX
+    } else {
+        config.max_attempts
+    };
+    for attempt in 0..max_attempts {
+        if attempt % 1024 == 0 && should_stop() {
+            return Ok((None, attempt));
+        }
         block.header.nonce = Nonce(config.start_nonce.wrapping_add(attempt));
         if config.difficulty == 0 {
-            return Ok(Some(MiningResult {
-                block,
-                attempts: attempt.saturating_add(1),
-            }));
+            let attempts = attempt.saturating_add(1);
+            return Ok((Some(MiningResult { block, attempts }), attempts));
         }
 
         let hash = consensus.proof_of_work_hash(&block)?;
@@ -102,12 +144,10 @@ pub fn mine_prepared_block(
             .validate_proof_of_work_hash_with_difficulty(&hash, config.difficulty)
             .is_ok()
         {
-            return Ok(Some(MiningResult {
-                block,
-                attempts: attempt.saturating_add(1),
-            }));
+            let attempts = attempt.saturating_add(1);
+            return Ok((Some(MiningResult { block, attempts }), attempts));
         }
     }
 
-    Ok(None)
+    Ok((None, max_attempts))
 }

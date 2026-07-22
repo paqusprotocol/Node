@@ -15,9 +15,7 @@ fn address(byte: u8) -> Address {
 
 #[test]
 fn mines_coinbase_only_candidate_without_user_transactions() {
-    let consensus = Consensus {
-        config: ConsensusConfig { difficulty: 0 },
-    };
+    let consensus = Consensus::new(ConsensusConfig::new(paqus::consensus::MIN_DIFFICULTY)).unwrap();
     let mut ledger = Ledger::new();
     let miner = address(9);
     ledger.create_account(miner, Amount(0)).unwrap();
@@ -59,9 +57,7 @@ fn mines_coinbase_only_candidate_without_user_transactions() {
 
 #[test]
 fn mines_candidate_block_until_pow_is_valid() {
-    let consensus = Consensus {
-        config: ConsensusConfig { difficulty: 0 },
-    };
+    let consensus = Consensus::new(ConsensusConfig::new(paqus::consensus::MIN_DIFFICULTY)).unwrap();
     let keypair = generate_keypair();
     let sender = address_from_public_key(&keypair.public_key);
     let receiver = address(2);
