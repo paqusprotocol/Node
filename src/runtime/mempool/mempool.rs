@@ -477,7 +477,6 @@ impl Mempool {
         let pressure_premium = base_rate
             .saturating_mul(DYNAMIC_MARKET_FEE_MAX_MULTIPLIER)
             .saturating_mul(pressure_bps)
-            .saturating_add(9_999)
             / 10_000;
         base_rate.saturating_add(pressure_premium)
     }
@@ -873,6 +872,33 @@ mod tests {
             1
         );
         assert!(!mempool.contains(&second_hash));
+    }
+
+    #[test]
+    fn dynamic_market_fee_rate_does_not_round_up_tiny_pressure() {
+        let keypair = generate_keypair();
+        let transaction = signed_transaction_from_with_fee_rate_at(
+            &keypair.secret_key,
+            keypair.public_key,
+            address(2),
+            10,
+            1,
+            0,
+            1_000,
+        );
+        let mut mempool = Mempool::with_config(MempoolConfig {
+            max_transactions: 1_000,
+            min_relay_fee: 1,
+            market_fee: 1,
+            low_fee_ttl_secs: crate::runtime::params::LOW_FEE_EXPIRY_SECS,
+            transaction_ttl_secs: crate::runtime::params::MEMPOOL_EXPIRY_SECS,
+            ..MempoolConfig::default()
+        });
+
+        mempool.insert_at(transaction, 1_000).unwrap();
+
+        assert_eq!(mempool.mempool_pressure_bps(), 10);
+        assert_eq!(mempool.dynamic_market_fee_rate(), 1);
     }
 
     #[test]
