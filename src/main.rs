@@ -91,7 +91,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 const DEFAULT_NODE_DB: &str = "./data/paqus";
 const DEFAULT_CONFIG_FILE: &str = "./data/paqus/node.json";
 const DEFAULT_WALLET_CANDIDATES: &[&str] = &["../wallet.json", "wallet.json"];
-const MAX_PEER_FAILURES: u32 = 3;
+const MAX_PEER_FAILURES: u32 = 8;
 const ACTIVITY_LOG_INTERVAL: Duration = Duration::from_secs(15);
 static SHUTDOWN_REQUESTED: AtomicBool = AtomicBool::new(false);
 
@@ -453,11 +453,29 @@ fn interruptible_sleep(duration: Duration) {
     }
 }
 
-fn spawn_inbound_peer(addr: SocketAddr, mut stream: TcpStream, node: Arc<Mutex<Node>>) {
+fn spawn_inbound_peer(
+    addr: SocketAddr,
+    mut stream: TcpStream,
+    node: Arc<Mutex<Node>>,
+    inbound_connections: Arc<Mutex<HashMap<SocketAddr, PeerConnection>>>,
+) {
     thread::spawn(move || {
         if let Err(error) = configure_stream(&stream, Duration::from_secs(30)) {
             eprintln!("[P2P] inbound_config_failed peer={addr} error=\"{error}\"");
             return;
+        }
+        match stream
+            .try_clone()
+            .map_err(|error| error.to_string())
+            .and_then(|stream| PeerConnection::from_stream(addr, stream))
+        {
+            Ok(connection) => {
+                if let Ok(mut connections) = inbound_connections.lock() {
+                    connections.insert(addr, connection);
+                }
+                println!("[P2P] inbound_connected peer={addr}");
+            }
+            Err(error) => eprintln!("[P2P] inbound_track_failed peer={addr} error=\"{error}\""),
         }
         loop {
             let envelope = match read_message(&mut stream) {
@@ -498,6 +516,10 @@ fn spawn_inbound_peer(addr: SocketAddr, mut stream: TcpStream, node: Arc<Mutex<N
                 break;
             }
         }
+        if let Ok(mut connections) = inbound_connections.lock() {
+            connections.remove(&addr);
+        }
+        println!("[P2P] inbound_disconnected peer={addr}");
     });
 }
 
@@ -507,13 +529,13 @@ fn service_network_once(
     config: &RunConfig,
     peers: &Arc<Mutex<HashMap<SocketAddr, PeerState>>>,
     peer_connections: &Arc<Mutex<HashMap<SocketAddr, PeerConnection>>>,
-    _inbound_connections: &Arc<Mutex<HashMap<SocketAddr, PeerConnection>>>,
+    inbound_connections: &Arc<Mutex<HashMap<SocketAddr, PeerConnection>>>,
 ) {
     for listener in listeners {
         loop {
             match listener.accept() {
                 Ok((stream, addr)) => {
-                    spawn_inbound_peer(addr, stream, node.clone());
+                    spawn_inbound_peer(addr, stream, node.clone(), inbound_connections.clone());
                 }
                 Err(error) if error.kind() == ErrorKind::WouldBlock => break,
                 Err(error) => {
@@ -528,18 +550,37 @@ fn service_network_once(
         Ok(peers) => peers.keys().copied().collect::<Vec<_>>(),
         Err(_) => return,
     };
-    if !addrs.is_empty() {
+    let has_outbound = peer_connections
+        .lock()
+        .map(|connections| !connections.is_empty())
+        .unwrap_or(false);
+    if !addrs.is_empty() && !has_outbound {
         let sync_window = addrs
             .iter()
             .filter_map(|addr| peers.lock().ok()?.get(addr).map(|peer| peer.sync_window))
             .max()
             .unwrap_or(64);
         match sync_from_peers_parallel(addrs.clone(), node, &config.public_addrs, sync_window) {
-            Ok(report) if report.applied_blocks > 0 => println!(
-                "[SYNC] remote_tip={} applied={} peers={}",
-                report.remote_tip.0, report.applied_blocks, report.used_peers
-            ),
-            Ok(_) => {}
+            Ok(report) => {
+                if report.applied_blocks > 0 {
+                    println!(
+                        "[SYNC] remote_tip={} applied={} peers={}",
+                        report.remote_tip.0, report.applied_blocks, report.used_peers
+                    );
+                }
+                if let Ok(mut peers) = peers.lock() {
+                    for addr in report.used_peer_addrs {
+                        if let Some(peer) = peers.get_mut(&addr) {
+                            peer.mark_synced(report.remote_tip, report.applied_blocks);
+                        }
+                    }
+                    for addr in report.failed_peer_addrs {
+                        if let Some(peer) = peers.get_mut(&addr) {
+                            peer.mark_failed();
+                        }
+                    }
+                }
+            }
             Err(error) => eprintln!("[SYNC] failed error=\"{error}\""),
         }
     }
@@ -598,6 +639,11 @@ fn service_network_once(
                 if let Ok(mut peers) = peers.lock() {
                     for info in discovered {
                         if let Ok(addr) = info.address.parse::<SocketAddr>() {
+                            if config.public_addrs.contains(&addr)
+                                || config.listen_addrs.contains(&addr)
+                            {
+                                continue;
+                            }
                             peers.entry(addr).or_insert_with(|| PeerState::new(addr));
                         }
                     }

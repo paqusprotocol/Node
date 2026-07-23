@@ -109,6 +109,11 @@ impl PeerConnection {
         Ok(Self { addr, stream })
     }
 
+    pub fn from_stream(addr: SocketAddr, stream: TcpStream) -> Result<Self, String> {
+        configure_stream(&stream, PERSISTENT_PEER_TIMEOUT)?;
+        Ok(Self { addr, stream })
+    }
+
     pub fn addr(&self) -> SocketAddr {
         self.addr
     }
