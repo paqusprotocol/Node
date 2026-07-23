@@ -18,7 +18,7 @@ pub struct MiningStats {
     next_nonce: AtomicU64,
 }
 
-const UNLIMITED_MINE_NONCE_RESERVATION: u64 = u64::MAX;
+const UNLIMITED_MINE_NONCE_EPOCH_SIZE: u64 = 1 << 48;
 
 pub fn mine_once(
     node_state: &Arc<Mutex<Node>>,
@@ -63,9 +63,7 @@ pub fn mine_once(
             node.consensus,
             MiningConfig {
                 difficulty,
-                start_nonce: mining_stats
-                    .next_nonce
-                    .fetch_add(nonce_reservation(config.mine_attempts), Ordering::Relaxed),
+                start_nonce: next_start_nonce(mining_stats, config.mine_attempts),
                 max_attempts: config.mine_attempts,
                 transaction_limit: MAX_BLOCK_TXS,
                 min_fee_rate: miner_min_fee_rate,
@@ -155,11 +153,16 @@ fn update_stats(mining_stats: &MiningStats, attempts: u64, elapsed: Duration) {
         .store(attempts, Ordering::Relaxed);
 }
 
-fn nonce_reservation(mine_attempts: u64) -> u64 {
+fn next_start_nonce(mining_stats: &MiningStats, mine_attempts: u64) -> u64 {
     if mine_attempts == 0 {
-        UNLIMITED_MINE_NONCE_RESERVATION
+        mining_stats
+            .next_nonce
+            .fetch_add(1, Ordering::Relaxed)
+            .wrapping_mul(UNLIMITED_MINE_NONCE_EPOCH_SIZE)
     } else {
-        mine_attempts
+        mining_stats
+            .next_nonce
+            .fetch_add(mine_attempts, Ordering::Relaxed)
     }
 }
 
@@ -168,4 +171,30 @@ fn unix_timestamp() -> Result<u64, String> {
         .duration_since(UNIX_EPOCH)
         .map(|duration| duration.as_secs())
         .map_err(|_| "system clock is before unix epoch".to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn unlimited_mining_uses_stable_nonce_epochs() {
+        let stats = MiningStats::default();
+
+        assert_eq!(next_start_nonce(&stats, 0), 0);
+        assert_eq!(next_start_nonce(&stats, 0), UNLIMITED_MINE_NONCE_EPOCH_SIZE);
+        assert_eq!(
+            next_start_nonce(&stats, 0),
+            UNLIMITED_MINE_NONCE_EPOCH_SIZE * 2
+        );
+    }
+
+    #[test]
+    fn bounded_mining_reserves_attempt_ranges() {
+        let stats = MiningStats::default();
+
+        assert_eq!(next_start_nonce(&stats, 100), 0);
+        assert_eq!(next_start_nonce(&stats, 100), 100);
+        assert_eq!(next_start_nonce(&stats, 25), 200);
+    }
 }
