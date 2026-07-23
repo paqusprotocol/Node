@@ -22,14 +22,19 @@ fn address(byte: u8) -> Address {
 }
 
 fn block() -> Block {
-    Block::new(
+    let mut block = Block::new(
         Height(0),
         Hash([0; HASH_SIZE]),
         Address([9; 20]),
         1_700_000_000,
         Nonce(0),
         vec![],
-    )
+    );
+    let consensus = Consensus::with_default_config();
+    while consensus.validate_proof_of_work(&block).is_err() {
+        block.header.nonce = Nonce(block.header.nonce.0.saturating_add(1));
+    }
+    block
 }
 
 #[test]
@@ -46,6 +51,7 @@ fn roundtrips_tip_and_block_messages() {
     let tip = NetworkMessage::Tip(TipInfo {
         height: block.height(),
         hash: block.hash(),
+        work: [1; 8],
     })
     .to_envelope();
     let block_message = NetworkMessage::Block(block).to_envelope();
@@ -78,6 +84,7 @@ fn roundtrips_version_handshake_messages() {
     let version = VersionInfo::local(Some(TipInfo {
         height: Height(7),
         hash: Hash([7; HASH_SIZE]).into(),
+        work: [7; 8],
     }));
     let messages = [
         NetworkMessage::Version(version.clone()),
@@ -171,7 +178,8 @@ fn handler_responds_to_ping_and_tip_requests() {
         handle_message(&mut node, NetworkMessage::GetTip).unwrap(),
         Some(NetworkMessage::Tip(TipInfo {
             height: Height(0),
-            hash: node.tip_hash().unwrap()
+            hash: node.tip_hash().unwrap(),
+            work: node.tip_work().unwrap(),
         }))
     );
 }
@@ -294,7 +302,13 @@ fn handler_returns_common_ancestor_from_locator() {
         .unwrap(),
         Some(NetworkMessage::CommonAncestor(Some(TipInfo {
             height: Height(0),
-            hash: block.hash()
+            hash: block.hash(),
+            work: node
+                .fork_choice
+                .get(&block.hash())
+                .unwrap()
+                .cumulative_work
+                .to_be_limbs(),
         })))
     );
 

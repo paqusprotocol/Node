@@ -762,6 +762,13 @@ impl Node {
         self.ledger.tip_hash()
     }
 
+    pub fn tip_work(&self) -> Option<[u64; 8]> {
+        self.ledger
+            .tip_hash()
+            .and_then(|hash| self.fork_choice.get(&hash))
+            .map(|node| node.cumulative_work.to_be_limbs())
+    }
+
     pub fn balance(&self, address: &Address) -> Option<Balance> {
         self.ledger.balance(address)
     }

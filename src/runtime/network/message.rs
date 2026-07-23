@@ -14,6 +14,7 @@ pub struct PeerInfo {
 pub struct TipInfo {
     pub height: BlockHeight,
     pub hash: BlockHash,
+    pub work: [u64; 8],
 }
 
 #[derive(BorshSerialize, BorshDeserialize, Clone, Debug, PartialEq, Eq)]

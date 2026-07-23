@@ -21,10 +21,7 @@ pub fn handle_message(
         NetworkMessage::Reject { .. } => Ok(None),
         NetworkMessage::Ping { nonce } => Ok(Some(NetworkMessage::Pong { nonce })),
         NetworkMessage::Pong { .. } => Ok(None),
-        NetworkMessage::GetTip => Ok(node
-            .tip_height()
-            .zip(node.tip_hash())
-            .map(|(height, hash)| NetworkMessage::Tip(TipInfo { height, hash }))),
+        NetworkMessage::GetTip => Ok(local_tip(node).map(NetworkMessage::Tip)),
         NetworkMessage::Tip(_) => Ok(None),
         NetworkMessage::GetBlockByHeight { height } => Ok(node
             .ledger
@@ -53,6 +50,11 @@ pub fn handle_message(
                 Some(TipInfo {
                     height: block.height(),
                     hash,
+                    work: node
+                        .fork_choice
+                        .get(&hash)
+                        .map(|node| node.cumulative_work.to_be_limbs())
+                        .unwrap_or([0; 8]),
                 })
             });
             Ok(Some(NetworkMessage::CommonAncestor(ancestor)))
@@ -148,9 +150,13 @@ pub fn handle_message(
 }
 
 fn local_version(node: &Node) -> VersionInfo {
-    VersionInfo::local(
-        node.tip_height()
-            .zip(node.tip_hash())
-            .map(|(height, hash)| TipInfo { height, hash }),
-    )
+    VersionInfo::local(local_tip(node))
+}
+
+fn local_tip(node: &Node) -> Option<TipInfo> {
+    Some(TipInfo {
+        height: node.tip_height()?,
+        hash: node.tip_hash()?,
+        work: node.tip_work()?,
+    })
 }

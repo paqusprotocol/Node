@@ -7,6 +7,7 @@ use paqus::block::Height;
 use paqus::block::{Block, BlockHeader};
 use paqus::crypto::BlockHash;
 use serde::{Deserialize, Serialize};
+use std::cmp::Ordering;
 use std::collections::{BTreeMap, HashSet};
 use std::fs;
 use std::io;
@@ -187,57 +188,61 @@ pub fn poll_peer_connection(
     println!("[P2P] handshake_start peer={}", peer.addr());
     handshake_peer(peer, node, public_addrs)?;
     println!("[P2P] handshake_ok peer={}", peer.addr());
-    let tip = request_tip(peer)?;
-    let local_height = node
-        .lock()
-        .map_err(|_| "node state lock poisoned".to_string())?
-        .tip_height()
-        .map(|height| height.0);
+    let remote_tip = request_tip(peer)?;
+    let local_tip = local_tip_info(node)?;
     println!(
-        "[P2P] tip_check peer={} local={} remote={}",
+        "[P2P] tip_check peer={} local={} remote={} remote_work={}",
         peer.addr(),
-        local_height
-            .map(|height| height.to_string())
+        local_tip
+            .map(|tip| tip.height.0.to_string())
             .unwrap_or_else(|| "none".to_string()),
-        tip.0
+        remote_tip.height.0,
+        work_hex(remote_tip.work)
     );
-    if local_height.is_none() {
+    if local_tip.is_none() {
         let sync_window = sync_window.clamp(MIN_BLOCKS_PER_SYNC, MAX_BLOCKS_PER_SYNC);
         let start = Height(0);
-        let target = tip.0.min(sync_window.saturating_sub(1));
+        let target = remote_tip.height.0.min(sync_window.saturating_sub(1));
         let headers = request_headers(peer, start, target, BlockHash::ZERO)?;
         request_blocks(peer, node, start, target, headers)?;
         request_missing_parent_blocks(peer, node)?;
         return Ok(PeerPoll::Synced {
-            remote_tip: tip,
+            remote_tip: remote_tip.height,
             synced_blocks: target.saturating_add(1) as usize,
         });
     }
-    let local_height = local_height.expect("checked above");
-    if tip.0 <= local_height {
+    let local_tip = local_tip.expect("checked above");
+    if !is_remote_tip_better(&local_tip, &remote_tip) {
         return if request_missing_parent_blocks(peer, node)? {
             Ok(PeerPoll::Synced {
-                remote_tip: tip,
+                remote_tip: remote_tip.height,
                 synced_blocks: 0,
             })
         } else {
-            Ok(PeerPoll::Idle { remote_tip: tip })
+            Ok(PeerPoll::Idle {
+                remote_tip: remote_tip.height,
+            })
         };
     }
 
     let ancestor = request_common_ancestor(peer, node)?;
     let sync_window = sync_window.clamp(MIN_BLOCKS_PER_SYNC, MAX_BLOCKS_PER_SYNC);
-    let target = tip.0.min(ancestor.height.0.saturating_add(sync_window));
+    let target = remote_tip
+        .height
+        .0
+        .min(ancestor.height.0.saturating_add(sync_window));
     println!(
         "[SYNC] plan peer={} ancestor={} target={} remote_tip={} window={}",
         peer.addr(),
         ancestor.height.0,
         target,
-        tip.0,
+        remote_tip.height.0,
         sync_window
     );
     if target <= ancestor.height.0 {
-        return Ok(PeerPoll::Idle { remote_tip: tip });
+        return Ok(PeerPoll::Idle {
+            remote_tip: remote_tip.height,
+        });
     }
     let start = Height(ancestor.height.0.saturating_add(1));
     println!(
@@ -257,7 +262,7 @@ pub fn poll_peer_connection(
     request_blocks(peer, node, start, target, headers)?;
     request_missing_parent_blocks(peer, node)?;
     Ok(PeerPoll::Synced {
-        remote_tip: tip,
+        remote_tip: remote_tip.height,
         synced_blocks: target.saturating_sub(start.0).saturating_add(1) as usize,
     })
 }
@@ -268,12 +273,8 @@ pub fn sync_from_peers_parallel(
     public_addrs: &[SocketAddr],
     sync_window: u64,
 ) -> Result<ParallelSyncReport, String> {
-    let local_height = node
-        .lock()
-        .map_err(|_| "node state lock poisoned".to_string())?
-        .tip_height()
-        .unwrap_or(Height(0))
-        .0;
+    let local_tip = local_tip_info(node)?;
+    let local_height = local_tip.map(|tip| tip.height.0).unwrap_or(0);
 
     let mut candidates = Vec::new();
     for addr in peers {
@@ -289,13 +290,19 @@ pub fn sync_from_peers_parallel(
             continue;
         }
         match request_tip(&mut peer) {
-            Ok(tip) if tip.0 > local_height => candidates.push((addr, tip)),
+            Ok(tip) if local_tip.is_none_or(|local| is_remote_tip_better(&local, &tip)) => {
+                candidates.push((addr, tip))
+            }
             Ok(_) => {}
             Err(error) => eprintln!("[SYNC] candidate_tip_failed peer={addr} error=\"{error}\""),
         }
     }
 
-    let Some((leader, remote_tip)) = candidates.iter().copied().max_by_key(|(_, tip)| tip.0) else {
+    let Some((leader, remote_tip)) = candidates
+        .iter()
+        .copied()
+        .max_by(|(_, left), (_, right)| compare_tips(left, right))
+    else {
         return Ok(ParallelSyncReport {
             remote_tip: Height(local_height),
             applied_blocks: 0,
@@ -310,11 +317,12 @@ pub fn sync_from_peers_parallel(
     let ancestor = request_common_ancestor(&mut leader_connection, node)?;
     let sync_window = sync_window.clamp(MIN_BLOCKS_PER_SYNC, MAX_BLOCKS_PER_SYNC);
     let target = remote_tip
+        .height
         .0
         .min(ancestor.height.0.saturating_add(sync_window));
     if target <= ancestor.height.0 {
         return Ok(ParallelSyncReport {
-            remote_tip,
+            remote_tip: remote_tip.height,
             applied_blocks: 0,
             used_peers: 0,
             used_peer_addrs: Vec::new(),
@@ -326,7 +334,7 @@ pub fn sync_from_peers_parallel(
     let ranges = plan_parallel_ranges(start, target, &headers, &candidates);
     if ranges.is_empty() {
         return Ok(ParallelSyncReport {
-            remote_tip,
+            remote_tip: remote_tip.height,
             applied_blocks: 0,
             used_peers: 0,
             used_peer_addrs: Vec::new(),
@@ -398,7 +406,7 @@ pub fn sync_from_peers_parallel(
     );
 
     Ok(ParallelSyncReport {
-        remote_tip,
+        remote_tip: remote_tip.height,
         applied_blocks,
         used_peers: used_peers.len(),
         used_peer_addrs,
@@ -470,9 +478,7 @@ fn handshake_peer(
         let node = node
             .lock()
             .map_err(|_| "node state lock poisoned".to_string())?;
-        node.tip_height()
-            .zip(node.tip_hash())
-            .map(|(height, hash)| TipInfo { height, hash })
+        local_tip_from_node(&node)
     };
     let version = VersionInfo::local(tip);
     match peer.request(NetworkMessage::Version(version))? {
@@ -499,10 +505,49 @@ fn handshake_peer(
     }
 }
 
-fn request_tip(peer: &mut PeerConnection) -> Result<Height, String> {
+fn request_tip(peer: &mut PeerConnection) -> Result<TipInfo, String> {
     match peer.request(NetworkMessage::GetTip)? {
-        NetworkMessage::Tip(tip) => Ok(tip.height),
+        NetworkMessage::Tip(tip) => Ok(tip),
         _ => Err("peer returned unexpected tip response".to_string()),
+    }
+}
+
+fn local_tip_info(node: &Arc<Mutex<Node>>) -> Result<Option<TipInfo>, String> {
+    let node = node
+        .lock()
+        .map_err(|_| "node state lock poisoned".to_string())?;
+    Ok(local_tip_from_node(&node))
+}
+
+fn local_tip_from_node(node: &Node) -> Option<TipInfo> {
+    Some(TipInfo {
+        height: node.tip_height()?,
+        hash: node.tip_hash()?,
+        work: node.tip_work()?,
+    })
+}
+
+fn is_remote_tip_better(local: &TipInfo, remote: &TipInfo) -> bool {
+    compare_tips(remote, local).is_gt()
+}
+
+fn compare_tips(left: &TipInfo, right: &TipInfo) -> Ordering {
+    left.work
+        .cmp(&right.work)
+        .then_with(|| right.hash.0.cmp(&left.hash.0))
+}
+
+fn work_hex(work: [u64; 8]) -> String {
+    let mut bytes = Vec::with_capacity(64);
+    for limb in work {
+        bytes.extend_from_slice(&limb.to_be_bytes());
+    }
+    let encoded = hex::encode(bytes);
+    let trimmed = encoded.trim_start_matches('0');
+    if trimmed.is_empty() {
+        "0".to_string()
+    } else {
+        trimmed.to_string()
     }
 }
 
@@ -611,7 +656,7 @@ struct SyncRange {
 
 fn fetch_range_with_retries(
     range: SyncRange,
-    candidates: Vec<(SocketAddr, Height)>,
+    candidates: Vec<(SocketAddr, TipInfo)>,
     node: &Arc<Mutex<Node>>,
     public_addrs: &[SocketAddr],
 ) -> Result<(u64, SocketAddr, Vec<Block>, Vec<SocketAddr>), String> {
@@ -620,7 +665,7 @@ fn fetch_range_with_retries(
     peers.extend(
         candidates
             .into_iter()
-            .filter(|(addr, tip)| *addr != range.peer && tip.0 >= range.target)
+            .filter(|(addr, tip)| *addr != range.peer && tip.height.0 >= range.target)
             .map(|(addr, _)| addr),
     );
 
@@ -672,12 +717,12 @@ fn plan_parallel_ranges(
     start: Height,
     target: u64,
     headers: &[BlockHeader],
-    candidates: &[(SocketAddr, Height)],
+    candidates: &[(SocketAddr, TipInfo)],
 ) -> Vec<SyncRange> {
     let available = candidates
         .iter()
         .copied()
-        .filter(|(_, tip)| tip.0 >= target)
+        .filter(|(_, tip)| tip.height.0 >= target)
         .map(|(addr, _)| addr)
         .collect::<Vec<_>>();
     if available.is_empty() {
@@ -857,4 +902,34 @@ fn request_block_by_hash(
             .unwrap_or_else(|| "none".to_string())
     );
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use paqus::crypto::HASH_SIZE;
+
+    fn tip(height: u64, work: [u64; 8], hash_byte: u8) -> TipInfo {
+        TipInfo {
+            height: Height(height),
+            hash: BlockHash([hash_byte; HASH_SIZE]),
+            work,
+        }
+    }
+
+    #[test]
+    fn tip_comparison_prefers_chainwork_over_height() {
+        let local = tip(100, [0, 0, 0, 0, 0, 0, 0, 20], 2);
+        let remote = tip(90, [0, 0, 0, 0, 0, 0, 0, 21], 3);
+
+        assert!(is_remote_tip_better(&local, &remote));
+    }
+
+    #[test]
+    fn tip_comparison_uses_lower_hash_as_equal_work_tiebreaker() {
+        let local = tip(100, [0, 0, 0, 0, 0, 0, 0, 20], 9);
+        let remote = tip(101, [0, 0, 0, 0, 0, 0, 0, 20], 1);
+
+        assert!(is_remote_tip_better(&local, &remote));
+    }
 }
