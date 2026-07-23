@@ -618,9 +618,9 @@ checksum = "9f7c3e4beb33f85d45ae3e3a1792185706c8e16d043238c593331cc7cd313b50"
 
 [[package]]
 name = "paqus"
-version = "0.2.10"
+version = "0.2.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "debafa3bd584f40a75f85eaff08264715e62f63a2e3edc00349d3966cb82a95d"
+checksum = "ca5ab33d76b77e7ca30ba0b1d6760b2772735f7f4002f8faa1e91cfa8195e15e"
 dependencies = [
  "bech32",
  "borsh",
