@@ -64,10 +64,10 @@ use paqus::transaction::SignedProtocolTransaction;
 #[cfg(test)]
 use paqus::transaction::{SignedTransaction, Transaction};
 use rpc::api::{LogCounters, RpcMetrics, RpcState, start_rpc_server};
-use rpc::transport::bind_nonblocking;
+use rpc::transport::{bind_nonblocking, configure_stream};
 use runtime::mempool::MempoolConfig;
 use runtime::miner::prepare_candidate_block;
-use runtime::network::NetworkMessage;
+use runtime::network::{NetworkError, NetworkMessage, handle_message, read_message, write_message};
 use runtime::node::Node;
 use runtime::params::{
     BLOCK_TIME, CHAIN_ID, CHAIN_NAME, COIN_NAME, GENESIS_PREMINE, MAX_BLOCK_TXS, NETWORK_MAGIC,
@@ -79,7 +79,7 @@ use std::convert::Infallible;
 use std::env;
 use std::fs;
 use std::io::ErrorKind;
-use std::net::{SocketAddr, TcpListener};
+use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::process::ExitCode;
 use std::sync::{
     Arc, Mutex,
@@ -453,25 +453,68 @@ fn interruptible_sleep(duration: Duration) {
     }
 }
 
+fn spawn_inbound_peer(addr: SocketAddr, mut stream: TcpStream, node: Arc<Mutex<Node>>) {
+    thread::spawn(move || {
+        if let Err(error) = configure_stream(&stream, Duration::from_secs(30)) {
+            eprintln!("[P2P] inbound_config_failed peer={addr} error=\"{error}\"");
+            return;
+        }
+        loop {
+            let envelope = match read_message(&mut stream) {
+                Ok(envelope) => envelope,
+                Err(NetworkError::Io(error))
+                    if matches!(
+                        error.kind(),
+                        ErrorKind::WouldBlock | ErrorKind::TimedOut | ErrorKind::UnexpectedEof
+                    ) =>
+                {
+                    break;
+                }
+                Err(error) => {
+                    eprintln!("[P2P] inbound_read_failed peer={addr} error=\"{error}\"");
+                    break;
+                }
+            };
+            let response = {
+                let mut node = match node.lock() {
+                    Ok(node) => node,
+                    Err(_) => {
+                        eprintln!("[P2P] inbound_node_lock_poisoned peer={addr}");
+                        break;
+                    }
+                };
+                match handle_message(&mut node, envelope.message) {
+                    Ok(response) => response,
+                    Err(error) => {
+                        eprintln!("[P2P] inbound_handle_failed peer={addr} error=\"{error}\"");
+                        break;
+                    }
+                }
+            };
+            if let Some(response) = response
+                && let Err(error) = write_message(&mut stream, &response.to_envelope())
+            {
+                eprintln!("[P2P] inbound_write_failed peer={addr} error=\"{error}\"");
+                break;
+            }
+        }
+    });
+}
+
 fn service_network_once(
     listeners: &[TcpListener],
     node: &Arc<Mutex<Node>>,
     config: &RunConfig,
     peers: &Arc<Mutex<HashMap<SocketAddr, PeerState>>>,
     peer_connections: &Arc<Mutex<HashMap<SocketAddr, PeerConnection>>>,
-    inbound_connections: &Arc<Mutex<HashMap<SocketAddr, PeerConnection>>>,
+    _inbound_connections: &Arc<Mutex<HashMap<SocketAddr, PeerConnection>>>,
 ) {
     for listener in listeners {
         loop {
             match listener.accept() {
-                Ok((stream, addr)) => match PeerConnection::from_stream(addr, stream) {
-                    Ok(connection) => {
-                        if let Ok(mut inbound) = inbound_connections.lock() {
-                            inbound.insert(addr, connection);
-                        }
-                    }
-                    Err(error) => eprintln!("[P2P] inbound_rejected peer={addr} error=\"{error}\""),
-                },
+                Ok((stream, addr)) => {
+                    spawn_inbound_peer(addr, stream, node.clone());
+                }
                 Err(error) if error.kind() == ErrorKind::WouldBlock => break,
                 Err(error) => {
                     eprintln!("[P2P] accept_failed error=\"{error}\"");
