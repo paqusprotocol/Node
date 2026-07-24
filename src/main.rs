@@ -67,7 +67,9 @@ use rpc::api::{LogCounters, RpcMetrics, RpcState, start_rpc_server};
 use rpc::transport::{bind_nonblocking, configure_stream};
 use runtime::mempool::MempoolConfig;
 use runtime::miner::prepare_candidate_block;
-use runtime::network::{NetworkError, NetworkMessage, handle_message, read_message, write_message};
+use runtime::network::{
+    InventoryItem, NetworkError, NetworkMessage, handle_message, read_message, write_message,
+};
 use runtime::node::Node;
 use runtime::params::{
     BLOCK_TIME, CHAIN_ID, CHAIN_NAME, COIN_NAME, GENESIS_PREMINE, MAX_BLOCK_TXS, NETWORK_MAGIC,
@@ -396,7 +398,24 @@ fn run_node(args: &[String]) -> Result<(), String> {
             bound_addrs.first().copied(),
         );
         if config.mine {
-            let _ = mine_once_unlocked(&node, &config, &mining_stats, &SHUTDOWN_REQUESTED)?;
+            if let Some(block) =
+                mine_once_unlocked(&node, &config, &mining_stats, &SHUTDOWN_REQUESTED)?
+            {
+                let report = broadcast_to_peers(
+                    &peers,
+                    &peer_connections,
+                    &inbound_connections,
+                    NetworkMessage::Inventory(vec![InventoryItem::Block(block.hash())]),
+                );
+                println!(
+                    "[P2P] announced_block height={} hash={} attempted={} sent={} failed={}",
+                    block.height().0,
+                    short_hash(Some(block.hash())),
+                    report.attempted,
+                    report.sent,
+                    report.failed
+                );
+            }
             if SHUTDOWN_REQUESTED.load(Ordering::SeqCst) {
                 break;
             }
