@@ -174,23 +174,126 @@ async fn rpc_qcash_coin(
                 }))
                 .into_response();
             };
-            let status = match coin.status_at(tip_height) {
-                paqus::state::QCashUtxoStatus::Pending => "pending",
-                paqus::state::QCashUtxoStatus::Spendable => "spendable",
-            };
-            Json(serde_json::json!({
-                "coin_id": coin_id,
-                "status": status,
-                "height": tip_height.0,
-                "issued_height": coin.issued_height.0,
-                "maturity_height": coin.issued_height.0.saturating_add(QCASH_WITHDRAW_MATURITY as u64),
-                "denomination": coin.denomination.xpq(),
-                "withdrawer": address_to_string(&coin.withdrawer),
-            }))
-            .into_response()
+            Json(qcash_coin_json(id, coin, tip_height, None)).into_response()
         }
         Err(_) => rpc_error(StatusCode::INTERNAL_SERVER_ERROR, "state_lock_failed"),
     }
+}
+
+async fn rpc_qcash_file(
+    State(state): State<RpcState>,
+    AxumPath(name): AxumPath<String>,
+) -> impl IntoResponse {
+    let lookup = match qcash_file_lookup_prefix(&name) {
+        Ok(prefix) => prefix,
+        Err(error) => return rpc_error(StatusCode::BAD_REQUEST, error),
+    };
+    match state.node.lock() {
+        Ok(node) => {
+            let tip_height = node.tip_height().unwrap_or(Height(0));
+            let matches = node
+                .ledger
+                .qcash_utxos
+                .coins()
+                .filter_map(|coin| {
+                    let coin_id = hex::encode(coin.id.0);
+                    coin_id.starts_with(&lookup).then_some((coin_id, coin))
+                })
+                .collect::<Vec<_>>();
+            match matches.as_slice() {
+                [] => Json(serde_json::json!({
+                    "lookup": name,
+                    "coin_id_prefix": lookup,
+                    "status": "spent_or_unknown",
+                    "height": tip_height.0,
+                    "matches": 0,
+                }))
+                .into_response(),
+                [(coin_id, coin)] => {
+                    Json(qcash_coin_json(
+                        paqus::state::CashCoinId(coin.id.0),
+                        coin,
+                        tip_height,
+                        Some(serde_json::json!({
+                            "lookup": name,
+                            "coin_id_prefix": lookup,
+                            "matched_coin_id": coin_id,
+                            "matches": 1,
+                        })),
+                    ))
+                    .into_response()
+                }
+                _ => rpc_error(
+                    StatusCode::CONFLICT,
+                    format!(
+                        "qcash file prefix is ambiguous; matched {} active coins",
+                        matches.len()
+                    ),
+                ),
+            }
+        }
+        Err(_) => rpc_error(StatusCode::INTERNAL_SERVER_ERROR, "state_lock_failed"),
+    }
+}
+
+pub(crate) fn qcash_file_lookup_prefix(name: &str) -> Result<String, String> {
+    let file_name = name
+        .rsplit('/')
+        .next()
+        .unwrap_or(name)
+        .trim()
+        .trim_end_matches(".XPQ")
+        .trim_end_matches(".xpq");
+    let candidate = file_name.rsplit_once('_').map(|(_, id)| id).unwrap_or(file_name);
+    if candidate.is_empty() {
+        return Err("missing_qcash_coin_id_prefix".to_string());
+    }
+    if !candidate.chars().all(|c| c.is_ascii_hexdigit()) {
+        return Err("invalid_qcash_coin_id_prefix".to_string());
+    }
+    if candidate.len() > paqus::crypto::HASH_SIZE * 2 {
+        return Err("qcash_coin_id_prefix_too_long".to_string());
+    }
+    Ok(candidate.to_ascii_lowercase())
+}
+
+fn qcash_coin_json(
+    id: paqus::state::CashCoinId,
+    coin: &paqus::state::QCashUtxo,
+    tip_height: Height,
+    extra: Option<serde_json::Value>,
+) -> serde_json::Value {
+    let status = match coin.status_at(tip_height) {
+        paqus::state::QCashUtxoStatus::Pending => "pending",
+        paqus::state::QCashUtxoStatus::Spendable => "spendable",
+    };
+    let maturity_height = coin
+        .issued_height
+        .0
+        .saturating_add(QCASH_WITHDRAW_MATURITY as u64);
+    let remaining_maturity_blocks = maturity_height.saturating_sub(tip_height.0);
+    let mut value = serde_json::json!({
+        "coin_id": hex::encode(id.0),
+        "short_coin_id": id.short_id(),
+        "file_name": id.file_name(coin.denomination),
+        "status": status,
+        "height": tip_height.0,
+        "issued_height": coin.issued_height.0,
+        "maturity_height": maturity_height,
+        "remaining_maturity_blocks": remaining_maturity_blocks,
+        "denomination": coin.denomination.xpq(),
+        "withdrawer": address_to_string(&coin.withdrawer),
+        "withdraw_tx_hash": hex::encode(coin.outpoint.transaction_hash.0),
+        "output_index": coin.outpoint.output_index,
+    });
+    if let Some(extra) = extra
+        && let (Some(object), Some(extra_object)) = (value.as_object_mut(), extra.as_object())
+    {
+        for (key, value) in extra_object {
+            object.insert(key.clone(), value.clone());
+        }
+    }
+    value
 }
 
 

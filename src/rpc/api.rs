@@ -321,6 +321,7 @@ pub(crate) fn start_rpc_server(
         .route("/accounts", get(rpc_accounts))
         .route("/mempool", get(rpc_mempool))
         .route("/qcash/mempool", get(rpc_qcash_mempool))
+        .route("/qcash/file/{name}", get(rpc_qcash_file))
         .route("/qcash/coin/{coin_id}", get(rpc_qcash_coin))
         .route("/mining/template", get(rpc_mining_template))
         .route("/mining/submit", post(rpc_submit_mined_block))

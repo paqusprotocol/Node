@@ -1,7 +1,7 @@
 use super::*;
 use crate::rpc::api::{
     EventQuery, finalized_event_height, protocol_event_involves_address, protocol_event_list,
-    protocol_tx_response,
+    protocol_tx_response, qcash_file_lookup_prefix,
 };
 
 fn args(values: &[&str]) -> Vec<String> {
@@ -83,6 +83,19 @@ fn run_config_defaults_to_local_rpc_without_bootstrap_peer() {
 
     assert_eq!(config.rpc_addr, "127.0.0.1:6666".parse().unwrap());
     assert!(config.peers.is_empty());
+}
+
+#[test]
+fn qcash_file_lookup_accepts_file_names_and_prefixes() {
+    assert_eq!(
+        qcash_file_lookup_prefix("100_E5D6217A74B06B8E.XPQ").unwrap(),
+        "e5d6217a74b06b8e"
+    );
+    assert_eq!(
+        qcash_file_lookup_prefix("E5D6217A74B06B8E").unwrap(),
+        "e5d6217a74b06b8e"
+    );
+    assert!(qcash_file_lookup_prefix("100_not-hex.XPQ").is_err());
 }
 
 #[test]
